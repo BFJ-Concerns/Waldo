@@ -74,6 +74,20 @@ pub enum ClientMessage {
     },
 }
 
+impl ClientMessage {
+    /// Correlates a response without depending on the operation variant.
+    pub const fn request_id(&self) -> RequestId {
+        match self {
+            Self::Hello { request_id, .. }
+            | Self::Observe { request_id, .. }
+            | Self::Act { request_id, .. }
+            | Self::Query { request_id, .. }
+            | Self::Stop { request_id, .. }
+            | Self::Handover { request_id, .. } => *request_id,
+        }
+    }
+}
+
 /// The backend route actually used for one action.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +209,21 @@ pub enum ServerMessage {
         request_id: Option<RequestId>,
         error: ProtocolError,
     },
+}
+
+impl ServerMessage {
+    /// Correlates this response with a client request when one was decoded.
+    pub const fn request_id(&self) -> Option<RequestId> {
+        match self {
+            Self::Connected { request_id, .. }
+            | Self::Observed { request_id, .. }
+            | Self::Acted { request_id, .. }
+            | Self::Queried { request_id, .. }
+            | Self::Stopped { request_id, .. }
+            | Self::HandedOver { request_id, .. } => Some(*request_id),
+            Self::Error { request_id, .. } => *request_id,
+        }
+    }
 }
 
 impl ProtocolError {

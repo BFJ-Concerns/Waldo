@@ -11,6 +11,17 @@ pub struct BackendCapability {
     pub limitation: Option<String>,
 }
 
+impl BackendCapability {
+    /// Describes a backend which the current controller cannot use.
+    pub fn unavailable(limitation: impl Into<String>) -> Self {
+        Self {
+            available: false,
+            version: None,
+            limitation: Some(limitation.into()),
+        }
+    }
+}
+
 /// The concrete operations enabled in the active desktop session.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct Capabilities {
@@ -22,6 +33,23 @@ pub struct Capabilities {
     pub clipboard: BackendCapability,
     pub physical_input_detection: BackendCapability,
     pub driving_indicator: BackendCapability,
+}
+
+impl Capabilities {
+    /// A truthful baseline for a controller with no desktop backends attached.
+    pub fn unavailable() -> Self {
+        let limitation = || BackendCapability::unavailable("backend not initialised");
+        Self {
+            screencopy: limitation(),
+            virtual_pointer: limitation(),
+            virtual_keyboard: limitation(),
+            niri_ipc: limitation(),
+            accessibility: limitation(),
+            clipboard: limitation(),
+            physical_input_detection: limitation(),
+            driving_indicator: limitation(),
+        }
+    }
 }
 
 /// One output in the active Niri layout.
