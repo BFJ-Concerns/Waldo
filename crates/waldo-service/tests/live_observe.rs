@@ -9,7 +9,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::sync::oneshot;
 use waldo_protocol::{
     ActRequest, Action, ClientId, ClientMessage, ObserveRequest, OutputId, ReceiptStatus,
-    RequestId, ServerMessage, SourceSelector, StopReason,
+    RequestId, ServerMessage, SourceSelector, StopReason, WindowId, WindowOperation,
 };
 use waldo_service::ControllerService;
 use waldo_socket::ControllerClient;
@@ -107,6 +107,27 @@ async fn observation_grounding_reaches_the_fail_closed_action_pipeline() {
             .unwrap()
             .starts_with(b"\x89PNG\r\n\x1a\n")
     );
+
+    // A deliberately absent target proves that live Niri state is rechecked
+    // before dispatch without disturbing any real window in the session.
+    let response = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(4),
+            request: ActRequest {
+                observation_id: resulting_observation.id,
+                actions: vec![Action::Window {
+                    window_id: WindowId(u64::MAX.to_string()),
+                    operation: WindowOperation::Focus,
+                }],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Error { error, .. } = response else {
+        panic!("a vanished Niri target was not rejected during grounding");
+    };
+    assert_eq!(error.code, waldo_protocol::ErrorCode::TargetLost);
     drop(client);
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();

@@ -652,6 +652,9 @@ name = "waldo-niri"
 version = "0.1.0"
 dependencies = [
  "niri-ipc",
+ "serde_json",
+ "waldo-action",
+ "waldo-controller",
  "waldo-protocol",
  "wayland-client",
 ]

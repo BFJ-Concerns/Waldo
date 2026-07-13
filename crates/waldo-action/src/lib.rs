@@ -3,7 +3,8 @@
 use waldo_controller::{ExecutionToken, ObservationGrounding};
 use waldo_protocol::{
     Action, ActionReceipt, ActionRoute, ErrorCode, LogicalPoint, LogicalRect, OutputState,
-    ProtocolError, ReceiptStatus, StopReason, WindowId,
+    ProtocolError, ReceiptStatus, StopReason, WindowId, WindowOperation, WindowState,
+    WorkspaceState,
 };
 
 /// Backend seam beneath the controller-owned ordering and safety policy.
@@ -12,7 +13,29 @@ pub trait ActionExecutor: Send + Sync {
         &self,
         action: &Action,
         cancellation: &ExecutionToken,
-    ) -> Result<ActionRoute, ProtocolError>;
+    ) -> Result<ActionRoute, ActionExecutionFailure>;
+}
+
+/// A backend failure with an honest statement about whether mutation may have occurred.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ActionExecutionFailure {
+    NotExecuted {
+        error: ProtocolError,
+    },
+    Indeterminate {
+        route: ActionRoute,
+        error: ProtocolError,
+    },
+}
+
+impl ActionExecutionFailure {
+    pub fn not_executed(error: ProtocolError) -> Self {
+        Self::NotExecuted { error }
+    }
+
+    pub fn indeterminate(route: ActionRoute, error: ProtocolError) -> Self {
+        Self::Indeterminate { route, error }
+    }
 }
 
 /// Explicit fail-closed executor used until a live action route passes its gate.
@@ -24,12 +47,12 @@ impl ActionExecutor for UnavailableActionExecutor {
         &self,
         _action: &Action,
         _cancellation: &ExecutionToken,
-    ) -> Result<ActionRoute, ProtocolError> {
-        Err(ProtocolError {
+    ) -> Result<ActionRoute, ActionExecutionFailure> {
+        Err(ActionExecutionFailure::not_executed(ProtocolError {
             code: ErrorCode::UnsupportedCapability,
             message: "no desktop action backend is initialised".into(),
             retryable: false,
-        })
+        }))
     }
 }
 
@@ -66,12 +89,21 @@ pub fn execute_batch(
                 route: Some(route),
                 error: None,
             }),
-            Err(error) => {
-                first_not_executed = Some(index);
+            Err(failure) => {
+                let (status, route, error) = match failure {
+                    ActionExecutionFailure::NotExecuted { error } => {
+                        first_not_executed = Some(index);
+                        (ReceiptStatus::Failed, None, error)
+                    }
+                    ActionExecutionFailure::Indeterminate { route, error } => {
+                        first_not_executed = (index + 1 < actions.len()).then_some(index + 1);
+                        (ReceiptStatus::Indeterminate, Some(route), error)
+                    }
+                };
                 receipts.push(ActionReceipt {
                     index,
-                    status: ReceiptStatus::Failed,
-                    route: None,
+                    status,
+                    route,
                     error: Some(error),
                 });
                 receipts.extend((index + 1..actions.len()).map(|index| ActionReceipt {
@@ -84,16 +116,26 @@ pub fn execute_batch(
             }
         }
     }
+    let completed = receipts.len() == actions.len()
+        && receipts
+            .iter()
+            .all(|receipt| receipt.status == ReceiptStatus::Executed);
+    let stop_reason = if completed {
+        StopReason::Completed
+    } else if cancellation.is_cancelled() {
+        StopReason::Cancelled
+    } else if receipts
+        .iter()
+        .any(|receipt| receipt.status != ReceiptStatus::Executed)
+    {
+        StopReason::ExecutionFailed
+    } else {
+        StopReason::Completed
+    };
     BatchExecution {
         receipts,
         first_not_executed,
-        stop_reason: if cancellation.is_cancelled() {
-            StopReason::Cancelled
-        } else if first_not_executed.is_some() {
-            StopReason::ExecutionFailed
-        } else {
-            StopReason::Completed
-        },
+        stop_reason,
     }
 }
 
@@ -131,7 +173,7 @@ impl GroundingFailure {
     pub fn protocol_error(self) -> ProtocolError {
         let message = match self {
             Self::UnknownObservation => "the cited observation is no longer retained",
-            Self::TargetLost => "the observed output is no longer available",
+            Self::TargetLost => "an observed action target or destination is no longer available",
             Self::GeometryChanged => {
                 "the observed output geometry or coordinate transform has changed"
             }
@@ -152,6 +194,8 @@ impl GroundingFailure {
 pub fn validate_grounding(
     recorded: Option<&ObservationGrounding>,
     outputs: &[OutputState],
+    windows: &[WindowState],
+    workspaces: &[WorkspaceState],
     focused_window: Option<&WindowId>,
     actions: &[Action],
 ) -> Result<(), GroundingFailure> {
@@ -165,6 +209,31 @@ pub fn validate_grounding(
         || output.transform != recorded.transform
     {
         return Err(GroundingFailure::GeometryChanged);
+    }
+    if actions.iter().any(|action| {
+        let Action::Window { window_id, .. } = action else {
+            return false;
+        };
+        !windows.iter().any(|window| &window.id == window_id)
+    }) {
+        return Err(GroundingFailure::TargetLost);
+    }
+    if actions.iter().any(|action| match action {
+        Action::Window {
+            operation: WindowOperation::MoveToWorkspace { workspace },
+            ..
+        } => !workspaces
+            .iter()
+            .any(|candidate| candidate.name.as_ref() == Some(workspace)),
+        Action::Window {
+            operation: WindowOperation::MoveToOutput { output },
+            ..
+        } => !outputs
+            .iter()
+            .any(|candidate| candidate.id.0 == *output || candidate.name == *output),
+        _ => false,
+    }) {
+        return Err(GroundingFailure::TargetLost);
     }
     if actions_require_stable_focus(actions) && focused_window != recorded.focused_window.as_ref() {
         return Err(GroundingFailure::FocusChanged);
@@ -267,26 +336,59 @@ fn actions_require_stable_focus(actions: &[Action]) -> bool {
 mod tests {
     use waldo_protocol::{
         LogicalDelta, LogicalPoint, LogicalRect, OutputId, OutputTransform, SourceSelector,
+        WindowState,
     };
 
     use super::*;
 
     struct SequencedExecutor;
 
+    struct IndeterminateExecutor;
+
+    struct SuccessfulAfterCancellationExecutor;
+
     impl ActionExecutor for SequencedExecutor {
         fn execute(
             &self,
             action: &Action,
             _cancellation: &ExecutionToken,
-        ) -> Result<ActionRoute, ProtocolError> {
+        ) -> Result<ActionRoute, ActionExecutionFailure> {
             match action {
                 Action::Capture { .. } => Ok(ActionRoute::Screencopy),
-                _ => Err(ProtocolError {
+                _ => Err(ActionExecutionFailure::not_executed(ProtocolError {
                     code: ErrorCode::BackendFailure,
                     message: "deliberate test failure".into(),
                     retryable: false,
-                }),
+                })),
             }
+        }
+    }
+
+    impl ActionExecutor for IndeterminateExecutor {
+        fn execute(
+            &self,
+            _action: &Action,
+            _cancellation: &ExecutionToken,
+        ) -> Result<ActionRoute, ActionExecutionFailure> {
+            Err(ActionExecutionFailure::indeterminate(
+                ActionRoute::NiriIpc,
+                ProtocolError {
+                    code: ErrorCode::BackendFailure,
+                    message: "acknowledgement lost after dispatch".into(),
+                    retryable: true,
+                },
+            ))
+        }
+    }
+
+    impl ActionExecutor for SuccessfulAfterCancellationExecutor {
+        fn execute(
+            &self,
+            _action: &Action,
+            cancellation: &ExecutionToken,
+        ) -> Result<ActionRoute, ActionExecutionFailure> {
+            cancellation.cancel();
+            Ok(ActionRoute::NiriIpc)
         }
     }
 
@@ -326,14 +428,37 @@ mod tests {
         }
     }
 
+    fn window(id: &str) -> WindowState {
+        WindowState {
+            id: WindowId(id.into()),
+            title: None,
+            application_id: None,
+            logical_bounds: None,
+            focused: false,
+            workspace_id: None,
+            output_id: None,
+        }
+    }
+
+    fn workspace(name: &str) -> WorkspaceState {
+        WorkspaceState {
+            id: waldo_protocol::WorkspaceId::new(3),
+            index: 3,
+            name: Some(name.into()),
+            output_id: Some(OutputId("DP-1".into())),
+            active: true,
+            focused: true,
+        }
+    }
+
     #[test]
     fn missing_observations_and_outputs_fail_distinctly() {
         assert_eq!(
-            validate_grounding(None, &[output()], None, &[]),
+            validate_grounding(None, &[output()], &[], &[], None, &[]),
             Err(GroundingFailure::UnknownObservation)
         );
         assert_eq!(
-            validate_grounding(Some(&grounding()), &[], None, &[]),
+            validate_grounding(Some(&grounding()), &[], &[], &[], None, &[]),
             Err(GroundingFailure::TargetLost)
         );
     }
@@ -344,14 +469,14 @@ mod tests {
         let mut moved = output();
         moved.logical_bounds.origin.x = 1920.0;
         assert_eq!(
-            validate_grounding(Some(&recorded), &[moved], None, &[]),
+            validate_grounding(Some(&recorded), &[moved], &[], &[], None, &[]),
             Err(GroundingFailure::GeometryChanged)
         );
 
         let mut rescaled = output();
         rescaled.scale = 2.0;
         assert_eq!(
-            validate_grounding(Some(&recorded), &[rescaled], None, &[]),
+            validate_grounding(Some(&recorded), &[rescaled], &[], &[], None, &[]),
             Err(GroundingFailure::GeometryChanged)
         );
     }
@@ -367,6 +492,8 @@ mod tests {
             validate_grounding(
                 Some(&grounding()),
                 &[output()],
+                &[],
+                &[],
                 Some(&changed_focus),
                 &[action]
             ),
@@ -382,8 +509,67 @@ mod tests {
         };
 
         assert_eq!(
-            validate_grounding(Some(&grounding()), &[output()], None, &[action]),
+            validate_grounding(
+                Some(&grounding()),
+                &[output()],
+                &[window("17")],
+                &[],
+                None,
+                &[action]
+            ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn niri_window_operations_require_the_target_to_still_exist() {
+        let action = Action::Window {
+            window_id: WindowId("17".into()),
+            operation: waldo_protocol::WindowOperation::Focus,
+        };
+
+        assert_eq!(
+            validate_grounding(Some(&grounding()), &[output()], &[], &[], None, &[action]),
+            Err(GroundingFailure::TargetLost)
+        );
+    }
+
+    #[test]
+    fn niri_window_moves_require_the_destination_to_still_exist() {
+        let to_workspace = Action::Window {
+            window_id: WindowId("17".into()),
+            operation: WindowOperation::MoveToWorkspace {
+                workspace: "missing".into(),
+            },
+        };
+        let to_output = Action::Window {
+            window_id: WindowId("17".into()),
+            operation: WindowOperation::MoveToOutput {
+                output: "DP-2".into(),
+            },
+        };
+
+        assert_eq!(
+            validate_grounding(
+                Some(&grounding()),
+                &[output()],
+                &[window("17")],
+                &[workspace("research")],
+                None,
+                &[to_workspace]
+            ),
+            Err(GroundingFailure::TargetLost)
+        );
+        assert_eq!(
+            validate_grounding(
+                Some(&grounding()),
+                &[output()],
+                &[window("17")],
+                &[workspace("research")],
+                None,
+                &[to_output]
+            ),
+            Err(GroundingFailure::TargetLost)
         );
     }
 
@@ -408,6 +594,42 @@ mod tests {
         assert_eq!(execution.receipts[0].route, Some(ActionRoute::Screencopy));
         assert_eq!(execution.receipts[1].status, ReceiptStatus::Failed);
         assert_eq!(execution.receipts[2].status, ReceiptStatus::NotExecuted);
+    }
+
+    #[test]
+    fn uncertain_dispatch_is_distinct_from_the_definitely_unattempted_tail() {
+        let action = Action::Window {
+            window_id: WindowId("17".into()),
+            operation: WindowOperation::Focus,
+        };
+        let execution = execute_batch(
+            &IndeterminateExecutor,
+            &[action.clone(), action],
+            &test_token(),
+        );
+
+        assert_eq!(execution.stop_reason, StopReason::ExecutionFailed);
+        assert_eq!(execution.first_not_executed, Some(1));
+        assert_eq!(execution.receipts[0].status, ReceiptStatus::Indeterminate);
+        assert_eq!(execution.receipts[0].route, Some(ActionRoute::NiriIpc));
+        assert_eq!(execution.receipts[1].status, ReceiptStatus::NotExecuted);
+    }
+
+    #[test]
+    fn acknowledged_final_action_completes_even_if_cancellation_arrived_in_flight() {
+        let action = Action::Window {
+            window_id: WindowId("17".into()),
+            operation: WindowOperation::Focus,
+        };
+        let execution = execute_batch(
+            &SuccessfulAfterCancellationExecutor,
+            &[action],
+            &test_token(),
+        );
+
+        assert_eq!(execution.stop_reason, StopReason::Completed);
+        assert_eq!(execution.first_not_executed, None);
+        assert_eq!(execution.receipts[0].status, ReceiptStatus::Executed);
     }
 
     #[test]
@@ -441,6 +663,8 @@ mod tests {
             validate_grounding(
                 Some(&grounding()),
                 &[output()],
+                &[],
+                &[],
                 Some(&WindowId("41".into())),
                 &[action]
             ),
@@ -460,6 +684,8 @@ mod tests {
             validate_grounding(
                 Some(&grounding()),
                 &[output()],
+                &[],
+                &[],
                 Some(&WindowId("41".into())),
                 &[action]
             ),
@@ -482,6 +708,8 @@ mod tests {
             validate_grounding(
                 Some(&grounding()),
                 &[output()],
+                &[],
+                &[],
                 Some(&WindowId("41".into())),
                 &actions
             ),
@@ -508,6 +736,8 @@ mod tests {
             validate_grounding(
                 Some(&grounding()),
                 &[output()],
+                &[],
+                &[],
                 Some(&WindowId("41".into())),
                 &actions
             ),

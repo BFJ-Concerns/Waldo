@@ -108,6 +108,8 @@ pub enum ActionRoute {
 pub enum ReceiptStatus {
     Executed,
     Failed,
+    /// The backend may have acted, but its authoritative acknowledgement was lost.
+    Indeterminate,
     NotExecuted,
 }
 
@@ -142,6 +144,7 @@ pub struct ActionReceipt {
 pub struct ActResult {
     pub driving_session: DrivingSessionId,
     pub receipts: Vec<ActionReceipt>,
+    /// First action known not to have run; skips an earlier indeterminate dispatch.
     pub first_not_executed: Option<usize>,
     pub stop_reason: StopReason,
     /// Fresh settled evidence, absent only when post-action capture itself failed.

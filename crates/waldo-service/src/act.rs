@@ -52,12 +52,17 @@ pub(crate) async fn act(
     let validation_actions = actions.clone();
     let validation_grounding = grounding.clone();
     let checked = tokio::task::spawn_blocking(move || {
+        let include_windows = validation_actions
+            .iter()
+            .any(|action| matches!(action, waldo_protocol::Action::Window { .. }));
         let snapshot = inspector
-            .inspect(false)
+            .inspect(include_windows)
             .map_err(|error| backend_error(error.to_string()))?;
         validate_grounding(
             Some(&validation_grounding),
             &snapshot.outputs,
+            &snapshot.windows,
+            &snapshot.workspaces,
             snapshot.focused_window.as_ref(),
             &validation_actions,
         )

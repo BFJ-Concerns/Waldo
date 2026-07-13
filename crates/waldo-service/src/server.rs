@@ -16,7 +16,7 @@ use tokio::{
 };
 use waldo_action::{ActionExecutor, UnavailableActionExecutor};
 use waldo_controller::Controller;
-use waldo_niri::{NiriInspector, SessionInspector};
+use waldo_niri::{NiriActionExecutor, NiriInspector, SessionInspector};
 use waldo_protocol::{
     Capabilities, ClientMessage, ProtocolError, SCHEMA_MAJOR_VERSION, ServerMessage,
 };
@@ -113,7 +113,7 @@ impl ControllerService {
             idle_timeout,
             Arc::new(NiriInspector),
             Arc::new(Screencopy),
-            Arc::new(UnavailableActionExecutor),
+            Arc::new(NiriActionExecutor),
         )
     }
 

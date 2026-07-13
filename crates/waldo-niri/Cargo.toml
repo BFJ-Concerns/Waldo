@@ -6,7 +6,10 @@ rust-version.workspace = true
 
 [dependencies]
 niri-ipc.workspace = true
+serde_json.workspace = true
 wayland-client.workspace = true
+waldo-action = { path = "../waldo-action" }
+waldo-controller = { path = "../waldo-controller" }
 waldo-protocol = { path = "../waldo-protocol" }
 
 [lib]

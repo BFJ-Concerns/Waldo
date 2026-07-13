@@ -9,7 +9,7 @@ use std::{
 };
 
 use tokio::{io::AsyncWriteExt, sync::oneshot};
-use waldo_action::ActionExecutor;
+use waldo_action::{ActionExecutionFailure, ActionExecutor};
 use waldo_controller::ExecutionToken;
 use waldo_niri::{NiriSnapshot, SessionInspector, UnavailableInspector};
 use waldo_protocol::{
@@ -134,7 +134,7 @@ impl ActionExecutor for SuccessfulExecutor {
         &self,
         _action: &Action,
         _cancellation: &ExecutionToken,
-    ) -> Result<ActionRoute, ProtocolError> {
+    ) -> Result<ActionRoute, ActionExecutionFailure> {
         Ok(ActionRoute::Screencopy)
     }
 }
@@ -144,17 +144,17 @@ impl ActionExecutor for BlockingExecutor {
         &self,
         _action: &Action,
         cancellation: &ExecutionToken,
-    ) -> Result<ActionRoute, ProtocolError> {
+    ) -> Result<ActionRoute, ActionExecutionFailure> {
         let _ = self.started.send(());
         while !cancellation.is_cancelled() {
             std::thread::sleep(Duration::from_millis(2));
         }
         self.finished.store(true, Ordering::Release);
-        Err(ProtocolError {
+        Err(ActionExecutionFailure::not_executed(ProtocolError {
             code: ErrorCode::Cancelled,
             message: "cancelled by test Stop request".into(),
             retryable: true,
-        })
+        }))
     }
 }
 
