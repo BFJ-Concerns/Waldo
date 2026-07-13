@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/waldo-action",
     "crates/waldo-cli",
     "crates/waldo-controller",
     "crates/waldo-niri",
@@ -24,6 +25,6 @@ niri-ipc = { version = "=26.4.0" }
 schemars = { version = "=1.2.1" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150" }
-tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 wayland-client = { version = "=0.31.14" }
 wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }

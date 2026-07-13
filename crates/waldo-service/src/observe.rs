@@ -1,4 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use waldo_controller::ObservationGrounding;
 use waldo_protocol::{
     CoordinateMapping, ErrorCode, FocusState, ImageData, Observation, ProtocolError, RequestId,
     ServerMessage, SourceSelector,
@@ -10,12 +11,30 @@ pub(crate) async fn observe(
     request_id: RequestId,
     source: SourceSelector,
     state: &ServiceState,
+    connection_id: waldo_protocol::ConnectionId,
 ) -> ServerMessage {
+    match capture_observation(source, state, connection_id).await {
+        Ok(observation) => ServerMessage::Observed {
+            request_id,
+            observation,
+        },
+        Err(error) => ServerMessage::Error {
+            request_id: Some(request_id),
+            error,
+        },
+    }
+}
+
+pub(crate) async fn capture_observation(
+    source: SourceSelector,
+    state: &ServiceState,
+    connection_id: waldo_protocol::ConnectionId,
+) -> Result<Observation, ProtocolError> {
     let (output_id, requested_region) = match &source {
         SourceSelector::Output { output_id } => (output_id.clone(), None),
         SourceSelector::Region { output_id, region } => (output_id.clone(), Some(*region)),
         SourceSelector::Window { .. } => {
-            return unsupported(request_id, "foreground-window crop");
+            return Err(unsupported_error("foreground-window crop"));
         }
     };
     let inspector = std::sync::Arc::clone(&state.inspector);
@@ -44,42 +63,51 @@ pub(crate) async fn observe(
     .await;
     let (focused_window, output, logical_bounds, capture) = match captured {
         Ok(Ok(captured)) => captured,
-        Ok(Err(error)) => return backend_error(request_id, error),
-        Err(error) => return backend_error(request_id, error.to_string()),
+        Ok(Err(error)) => return Err(backend_error(error)),
+        Err(error) => return Err(backend_error(error.to_string())),
     };
-    let observation_id = state.controller.lock().await.next_observation_id();
+    let observation_id = state.controller.lock().await.record_observation(
+        connection_id,
+        ObservationGrounding {
+            source: source.clone(),
+            output_id: output.id.clone(),
+            output_logical_bounds: output.logical_bounds,
+            observed_logical_bounds: logical_bounds,
+            scale: output.scale,
+            transform: output.transform,
+            focused_window: focused_window.clone(),
+            cursor_position: None,
+        },
+    );
     let pixel_size = waldo_protocol::PixelSize {
         width: capture.width,
         height: capture.height,
     };
 
-    ServerMessage::Observed {
-        request_id,
-        observation: Observation {
-            id: observation_id,
-            captured_at_unix_ms: capture.captured_at_unix_ms,
-            source,
-            stable_output_id: output.id,
-            image: ImageData {
-                mime_type: "image/png".into(),
-                data_base64: BASE64.encode(capture.png),
-            },
-            coordinates: CoordinateMapping {
-                source_pixels: pixel_size,
-                model_image_pixels: pixel_size,
-                logical_bounds,
-                scale: output.scale,
-                transform: output.transform,
-            },
-            cursor: None,
-            focus: FocusState {
-                window_id: focused_window,
-                element: None,
-            },
-            accessibility: Vec::new(),
-            accessibility_available: false,
+    Ok(Observation {
+        id: observation_id,
+        captured_at_unix_ms: capture.captured_at_unix_ms,
+        source,
+        stable_output_id: output.id,
+        image: ImageData {
+            mime_type: "image/png".into(),
+            data_base64: BASE64.encode(capture.png),
         },
-    }
+        coordinates: CoordinateMapping {
+            source_pixels: pixel_size,
+            model_image_pixels: pixel_size,
+            logical_bounds,
+            scale: output.scale,
+            transform: output.transform,
+        },
+        cursor: None,
+        focus: FocusState {
+            window_id: focused_window,
+            element: None,
+        },
+        accessibility: Vec::new(),
+        accessibility_available: false,
+    })
 }
 
 fn region_coordinates(
@@ -116,25 +144,19 @@ fn region_coordinates(
     ))
 }
 
-fn backend_error(request_id: RequestId, message: String) -> ServerMessage {
-    ServerMessage::Error {
-        request_id: Some(request_id),
-        error: ProtocolError {
-            code: ErrorCode::BackendFailure,
-            message,
-            retryable: true,
-        },
+fn backend_error(message: String) -> ProtocolError {
+    ProtocolError {
+        code: ErrorCode::BackendFailure,
+        message,
+        retryable: true,
     }
 }
 
-fn unsupported(request_id: RequestId, capability: &str) -> ServerMessage {
-    ServerMessage::Error {
-        request_id: Some(request_id),
-        error: ProtocolError {
-            code: ErrorCode::UnsupportedCapability,
-            message: format!("{capability} is not initialised"),
-            retryable: false,
-        },
+fn unsupported_error(capability: &str) -> ProtocolError {
+    ProtocolError {
+        code: ErrorCode::UnsupportedCapability,
+        message: format!("{capability} is not initialised"),
+        retryable: false,
     }
 }
 

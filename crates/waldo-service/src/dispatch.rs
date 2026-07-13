@@ -5,6 +5,7 @@ use waldo_protocol::{
 };
 
 use crate::{
+    act::act,
     observe::observe,
     server::{ServiceState, enable_capture_capability},
 };
@@ -13,15 +14,25 @@ pub(crate) async fn dispatch(
     message: ClientMessage,
     state: &ServiceState,
     connection_id: ConnectionId,
+    act_ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> ServerMessage {
     let request_id = message.request_id();
+    state
+        .controller
+        .lock()
+        .await
+        .expire_idle_lease(state.elapsed());
     match message {
         ClientMessage::Hello { .. } => ServerMessage::Error {
             request_id: Some(request_id),
             error: invalid_request("hello is only valid as the first message"),
         },
-        ClientMessage::Observe { request, .. } => observe(request_id, request.source, state).await,
-        ClientMessage::Act { .. } => unsupported(request_id, "desktop action backends"),
+        ClientMessage::Observe { request, .. } => {
+            observe(request_id, request.source, state, connection_id).await
+        }
+        ClientMessage::Act { request, .. } => {
+            act(request_id, request, state, connection_id, act_ready).await
+        }
         ClientMessage::Query { request, .. } => {
             let inspector = std::sync::Arc::clone(&state.inspector);
             let mut snapshot = match tokio::task::spawn_blocking(move || {
@@ -87,18 +98,24 @@ async fn stop(
     state: &ServiceState,
     connection_id: ConnectionId,
 ) -> ServerMessage {
-    let mut controller = state.controller.lock().await;
-    let released = controller
-        .driving_session()
-        .filter(|session| session.owner() == connection_id)
-        .map(|session| session.id());
-    match controller.stop(connection_id) {
-        Ok(()) | Err(LeaseError::NoActiveLease) => ServerMessage::Stopped {
-            request_id,
-            result: StopResult {
-                released_session: released,
-            },
-        },
+    let (released, stopped) = {
+        let mut controller = state.controller.lock().await;
+        let released = controller
+            .driving_session()
+            .filter(|session| session.owner() == connection_id)
+            .map(|session| session.id());
+        (released, controller.stop(connection_id))
+    };
+    match stopped {
+        Ok(()) | Err(LeaseError::NoActiveLease) => {
+            state.wait_for_execution(connection_id).await;
+            ServerMessage::Stopped {
+                request_id,
+                result: StopResult {
+                    released_session: released,
+                },
+            }
+        }
         Err(error) => lease_error(request_id, error),
     }
 }
@@ -111,22 +128,12 @@ pub(crate) fn invalid_request(message: impl Into<String>) -> ProtocolError {
     }
 }
 
-fn unsupported(request_id: RequestId, capability: &str) -> ServerMessage {
-    ServerMessage::Error {
-        request_id: Some(request_id),
-        error: ProtocolError {
-            code: ErrorCode::UnsupportedCapability,
-            message: format!("{capability} is not initialised"),
-            retryable: false,
-        },
-    }
-}
-
-fn lease_error(request_id: RequestId, error: LeaseError) -> ServerMessage {
+pub(crate) fn lease_error(request_id: RequestId, error: LeaseError) -> ServerMessage {
     let code = match error {
         LeaseError::UnknownConnection(_) => ErrorCode::UnknownConnection,
         LeaseError::HeldBy(_) => ErrorCode::LeaseHeld,
         LeaseError::NoActiveLease | LeaseError::NotOwner { .. } => ErrorCode::NotLeaseOwner,
+        LeaseError::ExecutionInProgress => ErrorCode::LeaseHeld,
     };
     ServerMessage::Error {
         request_id: Some(request_id),

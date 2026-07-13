@@ -144,7 +144,12 @@ pub struct ActResult {
     pub receipts: Vec<ActionReceipt>,
     pub first_not_executed: Option<usize>,
     pub stop_reason: StopReason,
-    pub observation: Observation,
+    /// Fresh settled evidence, absent only when post-action capture itself failed.
+    #[serde(default)]
+    pub observation: Option<Observation>,
+    /// Failure after ordered execution which could not be attached to one action receipt.
+    #[serde(default)]
+    pub completion_error: Option<ProtocolError>,
     pub verification: Vec<bool>,
 }
 

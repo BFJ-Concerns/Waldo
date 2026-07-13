@@ -1,8 +1,85 @@
 //! The single controller authority shared by Waldo's MCP and CLI bindings.
 
-use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
-use waldo_protocol::{ClientId, ConnectionId, DrivingSessionId, ObservationId};
+use waldo_protocol::{
+    ClientId, ConnectionId, DrivingSessionId, LogicalRect, ObservationId, OutputId,
+    OutputTransform, SourceSelector, WindowId,
+};
+
+const MAX_RETAINED_OBSERVATIONS: usize = 256;
+
+/// Desktop facts whose stability determines whether a planned action is safe.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObservationGrounding {
+    pub source: SourceSelector,
+    pub output_id: OutputId,
+    pub output_logical_bounds: LogicalRect,
+    pub observed_logical_bounds: LogicalRect,
+    pub scale: f64,
+    pub transform: OutputTransform,
+    pub focused_window: Option<WindowId>,
+    pub cursor_position: Option<waldo_protocol::LogicalPoint>,
+}
+
+/// Cooperative cancellation shared with one currently executing action batch.
+#[derive(Clone, Debug)]
+pub struct ExecutionToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ExecutionToken {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+/// Authority reserved atomically for one action batch.
+#[derive(Clone, Debug)]
+pub struct ExecutionAuthority {
+    session: DrivingSession,
+    cancellation: ExecutionToken,
+    acquired_lease: bool,
+}
+
+impl ExecutionAuthority {
+    pub const fn session(&self) -> DrivingSession {
+        self.session
+    }
+
+    pub fn cancellation(&self) -> &ExecutionToken {
+        &self.cancellation
+    }
+
+    pub const fn acquired_lease(&self) -> bool {
+        self.acquired_lease
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RetainedObservation {
+    owner: ConnectionId,
+    grounding: ObservationGrounding,
+}
 
 /// The controller-owned state for one period of foreground driving authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +112,8 @@ pub enum LeaseError {
     NoActiveLease,
     /// The operation came from a connected client that does not own the lease.
     NotOwner { owner: ConnectionId },
+    /// The owning connection already has a batch in flight.
+    ExecutionInProgress,
 }
 
 impl fmt::Display for LeaseError {
@@ -62,6 +141,9 @@ impl fmt::Display for LeaseError {
                     owner.get()
                 )
             }
+            Self::ExecutionInProgress => {
+                formatter.write_str("the driving connection already has an action batch in flight")
+            }
         }
     }
 }
@@ -81,6 +163,8 @@ pub struct Controller {
     next_observation: u64,
     connections: BTreeMap<ConnectionId, ClientId>,
     driving_session: Option<DrivingSession>,
+    active_execution: Option<(ConnectionId, ExecutionToken)>,
+    observations: BTreeMap<ObservationId, RetainedObservation>,
 }
 
 impl Controller {
@@ -93,6 +177,8 @@ impl Controller {
             next_observation: 1,
             connections: BTreeMap::new(),
             driving_session: None,
+            active_execution: None,
+            observations: BTreeMap::new(),
         }
     }
 
@@ -123,6 +209,7 @@ impl Controller {
             .driving_session
             .is_some_and(|lease| lease.owner == connection)
         {
+            self.cancel_active_execution();
             self.driving_session = None;
         }
         Ok(())
@@ -133,14 +220,41 @@ impl Controller {
         self.driving_session
     }
 
-    /// Allocates a fresh observation identity within this controller session.
-    pub fn next_observation_id(&mut self) -> ObservationId {
+    /// Records the safety-relevant facts behind a fresh observation identity.
+    pub fn record_observation(
+        &mut self,
+        owner: ConnectionId,
+        grounding: ObservationGrounding,
+    ) -> ObservationId {
         let sequence = self.next_observation;
         self.next_observation = self
             .next_observation
             .checked_add(1)
             .expect("observation identifier space exhausted");
-        ObservationId::new(sequence)
+        let id = ObservationId::new(sequence);
+        self.observations
+            .insert(id, RetainedObservation { owner, grounding });
+        if self.observations.len() > MAX_RETAINED_OBSERVATIONS {
+            let oldest = *self
+                .observations
+                .first_key_value()
+                .expect("an over-capacity observation ledger is non-empty")
+                .0;
+            self.observations.remove(&oldest);
+        }
+        id
+    }
+
+    /// Returns the facts originally attached to a retained observation.
+    pub fn observation(
+        &self,
+        owner: ConnectionId,
+        id: ObservationId,
+    ) -> Option<&ObservationGrounding> {
+        self.observations
+            .get(&id)
+            .filter(|observation| observation.owner == owner)
+            .map(|observation| &observation.grounding)
     }
 
     /// Atomically acquires or refreshes the lease for a mutating operation.
@@ -171,11 +285,81 @@ impl Controller {
         Ok(session)
     }
 
+    /// Atomically acquires authority and marks one cancellable batch in flight.
+    pub fn begin_execution(
+        &mut self,
+        connection: ConnectionId,
+        now: Duration,
+    ) -> Result<ExecutionAuthority, LeaseError> {
+        self.require_connection(connection)?;
+        if self.active_execution.is_some() {
+            return Err(LeaseError::ExecutionInProgress);
+        }
+        let acquired_lease = self.driving_session.is_none();
+        let session = self.acquire_driving_lease(connection, now)?;
+        let token = ExecutionToken::new();
+        self.active_execution = Some((connection, token.clone()));
+        Ok(ExecutionAuthority {
+            session,
+            cancellation: token,
+            acquired_lease,
+        })
+    }
+
+    /// Clears the in-flight marker after the batch has stopped touching backends.
+    pub fn finish_execution(&mut self, connection: ConnectionId) {
+        if self
+            .active_execution
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == connection)
+        {
+            self.active_execution = None;
+        }
+    }
+
+    pub fn execution_in_progress(&self, connection: ConnectionId) -> bool {
+        self.active_execution
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == connection)
+    }
+
+    /// Rolls back provisional authority when pre-dispatch validation fails.
+    pub fn abort_execution(&mut self, connection: ConnectionId, release_lease: bool) {
+        if self
+            .active_execution
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == connection)
+        {
+            self.cancel_active_execution();
+            self.active_execution = None;
+            if release_lease
+                && self
+                    .driving_session
+                    .is_some_and(|session| session.owner == connection)
+            {
+                self.driving_session = None;
+            }
+        }
+    }
+
+    /// Revokes all session authority before the controller service terminates.
+    pub fn terminate(&mut self) {
+        self.cancel_active_execution();
+        self.driving_session = None;
+        self.connections.clear();
+    }
+
     /// Releases the driving lease when its idle timeout has elapsed.
     ///
     /// The caller supplies time from one monotonic clock. A backwards value is
     /// treated as no elapsed time rather than expiring authority spuriously.
     pub fn expire_idle_lease(&mut self, now: Duration) -> bool {
+        // A batch actively touching backends is not idle. Its cancellation
+        // boundary is Stop/disconnect; the lease becomes expirable once the
+        // batch clears its in-flight marker.
+        if self.active_execution.is_some() {
+            return false;
+        }
         let Some(session) = self.driving_session else {
             return false;
         };
@@ -184,6 +368,7 @@ impl Controller {
             return false;
         }
 
+        self.cancel_active_execution();
         self.driving_session = None;
         true
     }
@@ -198,6 +383,7 @@ impl Controller {
             });
         }
 
+        self.cancel_active_execution();
         self.driving_session = None;
         Ok(())
     }
@@ -223,6 +409,7 @@ impl Controller {
             });
         }
 
+        self.cancel_active_execution();
         let transferred = DrivingSession {
             id: DrivingSessionId::new(self.take_driving_session_sequence()),
             owner: target,
@@ -237,6 +424,12 @@ impl Controller {
             Ok(())
         } else {
             Err(LeaseError::UnknownConnection(connection))
+        }
+    }
+
+    fn cancel_active_execution(&mut self) {
+        if let Some((_, token)) = &self.active_execution {
+            token.cancel();
         }
     }
 
@@ -265,9 +458,32 @@ mod tests {
 
     use waldo_protocol::{ClientId, ConnectionId};
 
-    use super::{Controller, LeaseError};
+    use super::{Controller, LeaseError, MAX_RETAINED_OBSERVATIONS, ObservationGrounding};
 
     const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn grounding(output: &str) -> ObservationGrounding {
+        ObservationGrounding {
+            source: waldo_protocol::SourceSelector::Output {
+                output_id: waldo_protocol::OutputId(output.into()),
+            },
+            output_id: waldo_protocol::OutputId(output.into()),
+            output_logical_bounds: waldo_protocol::LogicalRect {
+                origin: waldo_protocol::LogicalPoint { x: 0.0, y: 0.0 },
+                width: 1920.0,
+                height: 1080.0,
+            },
+            observed_logical_bounds: waldo_protocol::LogicalRect {
+                origin: waldo_protocol::LogicalPoint { x: 0.0, y: 0.0 },
+                width: 1920.0,
+                height: 1080.0,
+            },
+            scale: 1.0,
+            transform: waldo_protocol::OutputTransform::Normal,
+            focused_window: None,
+            cursor_position: None,
+        }
+    }
 
     fn client(name: &str) -> ClientId {
         ClientId::new(name).expect("test client identifiers are non-empty")
@@ -398,6 +614,87 @@ mod tests {
     }
 
     #[test]
+    fn stop_cancels_the_owners_in_flight_execution() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect(client("driver"));
+        let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
+        let token = authority.cancellation().clone();
+
+        controller.stop(owner).unwrap();
+
+        assert!(token.is_cancelled());
+        assert_eq!(controller.driving_session(), None);
+    }
+
+    #[test]
+    fn cancelled_execution_must_quiesce_before_another_batch_begins() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect(client("driver"));
+        let next = controller.connect(client("next"));
+        controller.begin_execution(owner, Duration::ZERO).unwrap();
+        controller.stop(owner).unwrap();
+
+        assert!(matches!(
+            controller.begin_execution(next, Duration::from_secs(1)),
+            Err(LeaseError::ExecutionInProgress)
+        ));
+
+        controller.finish_execution(owner);
+        assert!(
+            controller
+                .begin_execution(next, Duration::from_secs(2))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn termination_cancels_execution_and_forgets_all_connections() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect(client("driver"));
+        let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
+        let token = authority.cancellation().clone();
+
+        controller.terminate();
+
+        assert!(token.is_cancelled());
+        assert!(!controller.is_connected(owner));
+        assert_eq!(controller.driving_session(), None);
+    }
+
+    #[test]
+    fn a_second_batch_cannot_interleave_with_the_first() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect(client("driver"));
+        controller.begin_execution(owner, Duration::ZERO).unwrap();
+
+        assert!(matches!(
+            controller.begin_execution(owner, Duration::from_secs(1)),
+            Err(LeaseError::ExecutionInProgress)
+        ));
+    }
+
+    #[test]
+    fn failed_validation_rolls_back_only_a_newly_acquired_lease() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect(client("driver"));
+        let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
+        assert!(authority.acquired_lease());
+
+        controller.abort_execution(owner, authority.acquired_lease());
+        assert_eq!(controller.driving_session(), None);
+
+        controller
+            .acquire_driving_lease(owner, Duration::from_secs(1))
+            .unwrap();
+        let authority = controller
+            .begin_execution(owner, Duration::from_secs(2))
+            .unwrap();
+        assert!(!authority.acquired_lease());
+        controller.abort_execution(owner, authority.acquired_lease());
+        assert_eq!(controller.driving_session().unwrap().owner(), owner);
+    }
+
+    #[test]
     fn disconnected_clients_cannot_mutate_or_stop() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
         let missing = ConnectionId::new(99);
@@ -443,12 +740,48 @@ mod tests {
     #[test]
     fn observation_identifiers_are_unique_within_the_controller_session() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect(client("observer"));
 
-        let first = controller.next_observation_id();
-        let second = controller.next_observation_id();
+        let first = controller.record_observation(owner, grounding("DP-1"));
+        let second = controller.record_observation(owner, grounding("DP-2"));
 
         assert_ne!(first, second);
         assert_eq!(first.get(), 1);
         assert_eq!(second.get(), 2);
+        assert_eq!(
+            controller.observation(owner, first),
+            Some(&grounding("DP-1"))
+        );
+        assert_eq!(
+            controller.observation(owner, second),
+            Some(&grounding("DP-2"))
+        );
+    }
+
+    #[test]
+    fn another_connection_cannot_authorise_actions_from_a_guessed_observation_id() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let observer = controller.connect(client("observer"));
+        let other = controller.connect(client("other"));
+        let id = controller.record_observation(observer, grounding("DP-1"));
+
+        assert_eq!(controller.observation(other, id), None);
+        assert_eq!(
+            controller.observation(observer, id),
+            Some(&grounding("DP-1"))
+        );
+    }
+
+    #[test]
+    fn observation_ledger_evicts_oldest_grounding_at_its_fixed_bound() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect(client("observer"));
+        let oldest = controller.record_observation(owner, grounding("oldest"));
+        for sequence in 1..=MAX_RETAINED_OBSERVATIONS {
+            controller.record_observation(owner, grounding(&format!("output-{sequence}")));
+        }
+
+        assert_eq!(controller.observation(owner, oldest), None);
+        assert_eq!(controller.observations.len(), MAX_RETAINED_OBSERVATIONS);
     }
 }

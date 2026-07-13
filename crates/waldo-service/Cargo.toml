@@ -9,6 +9,7 @@ base64.workspace = true
 clap.workspace = true
 nix.workspace = true
 tokio.workspace = true
+waldo-action = { path = "../waldo-action" }
 waldo-controller = { path = "../waldo-controller" }
 waldo-niri = { path = "../waldo-niri" }
 waldo-protocol = { path = "../waldo-protocol" }

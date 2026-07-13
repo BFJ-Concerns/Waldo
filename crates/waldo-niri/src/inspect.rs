@@ -61,6 +61,7 @@ impl NiriInspector {
         let raw_outputs = response_outputs(send(&mut socket, Request::Outputs)?)?;
         let raw_workspaces = response_workspaces(send(&mut socket, Request::Workspaces)?)?;
         let focused_output = response_focused_output(send(&mut socket, Request::FocusedOutput)?)?;
+        let focused_window = response_focused_window(send(&mut socket, Request::FocusedWindow)?)?;
         let keyboard = response_keyboard(send(&mut socket, Request::KeyboardLayouts)?)?;
         let raw_windows = if include_windows {
             response_windows(send(&mut socket, Request::Windows)?)?
@@ -71,10 +72,7 @@ impl NiriInspector {
         let focused_output_name = focused_output.as_ref().map(|output| output.name.as_str());
         let outputs = convert::outputs(raw_outputs, focused_output_name);
         let workspaces = convert::workspaces(&raw_workspaces);
-        let focused_window = raw_windows
-            .iter()
-            .find(|window| window.is_focused)
-            .map(|window| WindowId(window.id.to_string()));
+        let focused_window = focused_window.map(|window| WindowId(window.id.to_string()));
         let windows = convert::windows(raw_windows, &raw_workspaces, &outputs);
         let active_keyboard_layout = keyboard
             .names
@@ -161,6 +159,13 @@ fn response_focused_output(response: Response) -> Result<Option<Output>, Inspect
     match response {
         Response::FocusedOutput(value) => Ok(value),
         _ => Err(InspectionError::UnexpectedNiriReply("focused output")),
+    }
+}
+
+fn response_focused_window(response: Response) -> Result<Option<Window>, InspectionError> {
+    match response {
+        Response::FocusedWindow(value) => Ok(value),
+        _ => Err(InspectionError::UnexpectedNiriReply("focused window")),
     }
 }
 

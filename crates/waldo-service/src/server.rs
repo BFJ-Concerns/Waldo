@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs,
     future::Future,
     os::unix::fs::PermissionsExt,
@@ -10,9 +11,10 @@ use std::{
 use nix::{sys::socket, unistd::Uid};
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::Mutex,
+    sync::{Mutex, Notify, watch},
     task::JoinSet,
 };
+use waldo_action::{ActionExecutor, UnavailableActionExecutor};
 use waldo_controller::Controller;
 use waldo_niri::{NiriInspector, SessionInspector};
 use waldo_protocol::{
@@ -28,6 +30,9 @@ pub(crate) struct ServiceState {
     pub capabilities: Capabilities,
     pub inspector: Arc<dyn SessionInspector>,
     pub capturer: Arc<dyn ScreenCapturer>,
+    pub executor: Arc<dyn ActionExecutor>,
+    execution_quiesced: Notify,
+    shutdown: watch::Sender<bool>,
     started_at: Instant,
 }
 
@@ -36,23 +41,60 @@ impl ServiceState {
         idle_timeout: Duration,
         inspector: Arc<dyn SessionInspector>,
         capturer: Arc<dyn ScreenCapturer>,
+        executor: Arc<dyn ActionExecutor>,
     ) -> Self {
         let mut capabilities = inspector
             .inspect(false)
             .map(|snapshot| snapshot.capabilities)
             .unwrap_or_else(|_| Capabilities::unavailable());
         enable_capture_capability(&mut capabilities, capturer.as_ref());
+        let (shutdown, _) = watch::channel(false);
         Self {
             controller: Mutex::new(Controller::new(idle_timeout)),
             capabilities,
             inspector,
             capturer,
+            executor,
+            execution_quiesced: Notify::new(),
+            shutdown,
             started_at: Instant::now(),
         }
     }
 
     pub fn elapsed(&self) -> Duration {
         self.started_at.elapsed()
+    }
+
+    pub async fn finish_execution(&self, connection: waldo_protocol::ConnectionId) {
+        self.controller.lock().await.finish_execution(connection);
+        self.execution_quiesced.notify_waiters();
+    }
+
+    pub async fn abort_execution(
+        &self,
+        connection: waldo_protocol::ConnectionId,
+        release_lease: bool,
+    ) {
+        self.controller
+            .lock()
+            .await
+            .abort_execution(connection, release_lease);
+        self.execution_quiesced.notify_waiters();
+    }
+
+    pub async fn wait_for_execution(&self, connection: waldo_protocol::ConnectionId) {
+        loop {
+            let notified = self.execution_quiesced.notified();
+            if !self
+                .controller
+                .lock()
+                .await
+                .execution_in_progress(connection)
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -66,11 +108,12 @@ pub struct ControllerService {
 impl ControllerService {
     /// Binds a private socket after rejecting symlink and ownership hazards.
     pub fn bind(path: impl AsRef<Path>, idle_timeout: Duration) -> Result<Self, ServiceError> {
-        Self::bind_with_backends(
+        Self::bind_with_all_backends(
             path,
             idle_timeout,
             Arc::new(NiriInspector),
             Arc::new(Screencopy),
+            Arc::new(UnavailableActionExecutor),
         )
     }
 
@@ -90,6 +133,23 @@ impl ControllerService {
         inspector: Arc<dyn SessionInspector>,
         capturer: Arc<dyn ScreenCapturer>,
     ) -> Result<Self, ServiceError> {
+        Self::bind_with_all_backends(
+            path,
+            idle_timeout,
+            inspector,
+            capturer,
+            Arc::new(UnavailableActionExecutor),
+        )
+    }
+
+    /// Binds every controller backend explicitly for deterministic integration tests.
+    pub fn bind_with_all_backends(
+        path: impl AsRef<Path>,
+        idle_timeout: Duration,
+        inspector: Arc<dyn SessionInspector>,
+        capturer: Arc<dyn ScreenCapturer>,
+        executor: Arc<dyn ActionExecutor>,
+    ) -> Result<Self, ServiceError> {
         let path = path.as_ref();
         socket_path::prepare(path)?;
 
@@ -98,7 +158,12 @@ impl ControllerService {
 
         Ok(Self {
             listener,
-            state: Arc::new(ServiceState::new(idle_timeout, inspector, capturer)),
+            state: Arc::new(ServiceState::new(
+                idle_timeout,
+                inspector,
+                capturer,
+                executor,
+            )),
             _socket_guard: socket_path::SocketGuard::new(path.to_path_buf())?,
         })
     }
@@ -110,12 +175,16 @@ impl ControllerService {
     {
         tokio::pin!(shutdown);
         let mut connections = JoinSet::new();
+        let mut lease_reaper = tokio::time::interval(Duration::from_millis(100));
 
-        loop {
+        let result = loop {
             tokio::select! {
-                _ = &mut shutdown => break,
+                _ = &mut shutdown => break Ok(()),
                 accepted = self.listener.accept() => {
-                    let (stream, _) = accepted?;
+                    let (stream, _) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => break Err(ServiceError::from(error)),
+                    };
                     let state = Arc::clone(&self.state);
                     connections.spawn(async move {
                         if let Err(error) = handle_connection(stream, state).await {
@@ -128,12 +197,20 @@ impl ControllerService {
                         eprintln!("Waldo controller connection task failed: {error}");
                     }
                 }
+                _ = lease_reaper.tick() => {
+                    self.state
+                        .controller
+                        .lock()
+                        .await
+                        .expire_idle_lease(self.state.elapsed());
+                }
             }
-        }
+        };
 
-        connections.abort_all();
+        self.state.controller.lock().await.terminate();
+        self.state.shutdown.send_replace(true);
         while connections.join_next().await.is_some() {}
-        Ok(())
+        result
     }
 }
 
@@ -153,7 +230,14 @@ async fn handle_connection(
 ) -> Result<(), ServiceError> {
     authenticate_peer(&stream)?;
 
-    let first: ClientMessage = read_message(&mut stream).await?;
+    let mut shutdown = state.shutdown.subscribe();
+    if *shutdown.borrow() {
+        return Ok(());
+    }
+    let first: ClientMessage = tokio::select! {
+        _ = shutdown.changed() => return Ok(()),
+        message = read_message(&mut stream) => message?,
+    };
     let (request_id, client_id) = match first {
         ClientMessage::Hello {
             request_id,
@@ -199,25 +283,129 @@ async fn handle_connection(
     )
     .await?;
 
-    let result = connection_loop(&mut stream, &state, connection_id).await;
+    let result = connection_loop(stream, Arc::clone(&state), connection_id).await;
     let _ = state.controller.lock().await.disconnect(connection_id);
     result
 }
 
 async fn connection_loop(
-    stream: &mut UnixStream,
-    state: &ServiceState,
+    stream: UnixStream,
+    state: Arc<ServiceState>,
     connection_id: waldo_protocol::ConnectionId,
 ) -> Result<(), ServiceError> {
+    let (mut reader, writer) = stream.into_split();
+    let writer = Arc::new(Mutex::new(writer));
+    let mut shutdown = state.shutdown.subscribe();
+    let mut queued = VecDeque::new();
+    let mut active_act: Option<tokio::task::JoinHandle<Result<(), TransportError>>> = None;
+
     loop {
-        let message: ClientMessage = match read_message(stream).await {
-            Ok(message) => message,
-            Err(TransportError::ConnectionClosed) => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        let response = dispatch(message, state, connection_id).await;
-        write_message(stream, &response).await?;
+        if *shutdown.borrow() {
+            quiesce_connection(&state, connection_id, &mut active_act).await;
+            return Ok(());
+        }
+        if active_act.is_none() {
+            let message = if let Some(message) = queued.pop_front() {
+                message
+            } else {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        quiesce_connection(&state, connection_id, &mut active_act).await;
+                        return Ok(());
+                    }
+                    message = read_message(&mut reader) => match message {
+                        Ok(message) => message,
+                        Err(TransportError::ConnectionClosed) => {
+                            quiesce_connection(&state, connection_id, &mut active_act).await;
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            quiesce_connection(&state, connection_id, &mut active_act).await;
+                            return Err(error.into());
+                        }
+                    }
+                }
+            };
+
+            if matches!(&message, ClientMessage::Act { .. }) {
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let request_state = Arc::clone(&state);
+                let request_writer = Arc::clone(&writer);
+                active_act = Some(tokio::spawn(async move {
+                    let response =
+                        dispatch(message, &request_state, connection_id, Some(ready_tx)).await;
+                    write_message(&mut *request_writer.lock().await, &response).await
+                }));
+                // Do not accept a later Stop until the earlier Act has either
+                // established its cancellation boundary or failed preflight.
+                let _ = ready_rx.await;
+            } else {
+                let response = dispatch(message, &state, connection_id, None).await;
+                if let Err(error) = write_message(&mut *writer.lock().await, &response).await {
+                    quiesce_connection(&state, connection_id, &mut active_act).await;
+                    return Err(error.into());
+                }
+            }
+            continue;
+        }
+
+        let active = active_act.as_mut().expect("active Act was checked above");
+        tokio::select! {
+            _ = shutdown.changed() => {
+                quiesce_connection(&state, connection_id, &mut active_act).await;
+                return Ok(());
+            }
+            completed = active => {
+                active_act = None;
+                match completed {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        quiesce_connection(&state, connection_id, &mut active_act).await;
+                        return Err(error.into());
+                    }
+                    Err(error) => {
+                        quiesce_connection(&state, connection_id, &mut active_act).await;
+                        return Err(ServiceError::ConnectionTask(error.to_string()));
+                    }
+                }
+            }
+            message = read_message(&mut reader) => {
+                match message {
+                    Ok(message @ ClientMessage::Stop { .. }) => {
+                        // Stop is the sole operation allowed to overtake an Act,
+                        // and it does not respond until that Act has quiesced.
+                        let response = dispatch(message, &state, connection_id, None).await;
+                        if let Err(error) = write_message(&mut *writer.lock().await, &response).await {
+                            quiesce_connection(&state, connection_id, &mut active_act).await;
+                            return Err(error.into());
+                        }
+                    }
+                    Ok(message) => queued.push_back(message),
+                    Err(TransportError::ConnectionClosed) => {
+                        quiesce_connection(&state, connection_id, &mut active_act).await;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        quiesce_connection(&state, connection_id, &mut active_act).await;
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
     }
+}
+
+async fn quiesce_connection(
+    state: &ServiceState,
+    connection_id: waldo_protocol::ConnectionId,
+    active_act: &mut Option<tokio::task::JoinHandle<Result<(), TransportError>>>,
+) {
+    let _ = state.controller.lock().await.disconnect(connection_id);
+    if let Some(active) = active_act.take() {
+        let _ = active.await;
+    }
+    // An unexpected request-task panic must not leave the exclusion marker set.
+    state.finish_execution(connection_id).await;
 }
 
 fn authenticate_peer(stream: &UnixStream) -> Result<(), ServiceError> {

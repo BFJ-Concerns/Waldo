@@ -8,7 +8,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::sync::oneshot;
 use waldo_protocol::{
-    ClientId, ClientMessage, ObserveRequest, OutputId, RequestId, ServerMessage, SourceSelector,
+    ActRequest, Action, ClientId, ClientMessage, ObserveRequest, OutputId, ReceiptStatus,
+    RequestId, ServerMessage, SourceSelector, StopReason,
 };
 use waldo_service::ControllerService;
 use waldo_socket::ControllerClient;
@@ -26,7 +27,7 @@ fn test_socket() -> PathBuf {
 }
 
 #[tokio::test]
-async fn observe_returns_a_png_and_grounding_metadata_through_the_service() {
+async fn observation_grounding_reaches_the_fail_closed_action_pipeline() {
     if std::env::var_os("NIRI_SOCKET").is_none() || std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return;
     }
@@ -73,6 +74,39 @@ async fn observe_returns_a_png_and_grounding_metadata_through_the_service() {
         observation.coordinates.model_image_pixels
     );
     assert!(observation.coordinates.logical_bounds.width > 0.0);
+    let source = observation.source.clone();
+    let observation_id = observation.id;
+
+    let response = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: ActRequest {
+                observation_id,
+                actions: vec![Action::Capture { source }],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = response else {
+        panic!("controller did not return an action result");
+    };
+    assert_eq!(result.stop_reason, StopReason::ExecutionFailed);
+    assert_eq!(result.first_not_executed, Some(0));
+    assert_eq!(result.receipts[0].status, ReceiptStatus::Failed);
+    assert_eq!(
+        result.receipts[0].error.as_ref().unwrap().code,
+        waldo_protocol::ErrorCode::UnsupportedCapability
+    );
+    let resulting_observation = result.observation.as_ref().unwrap();
+    assert_eq!(result.completion_error, None);
+    assert_ne!(resulting_observation.id, observation_id);
+    assert!(
+        BASE64
+            .decode(&resulting_observation.image.data_base64)
+            .unwrap()
+            .starts_with(b"\x89PNG\r\n\x1a\n")
+    );
     drop(client);
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();

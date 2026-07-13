@@ -8,6 +8,7 @@ pub enum ServiceError {
     Transport(TransportError),
     UnsafeSocketPath(String),
     PeerCredential(String),
+    ConnectionTask(String),
 }
 
 impl fmt::Display for ServiceError {
@@ -23,6 +24,9 @@ impl fmt::Display for ServiceError {
             }
             Self::PeerCredential(reason) => {
                 write!(formatter, "controller peer authentication failed: {reason}")
+            }
+            Self::ConnectionTask(reason) => {
+                write!(formatter, "controller request task failed: {reason}")
             }
         }
     }

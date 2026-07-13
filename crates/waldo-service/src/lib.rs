@@ -1,5 +1,6 @@
 //! The single private-socket authority for Waldo controller clients.
 
+mod act;
 mod dispatch;
 mod error;
 mod observe;

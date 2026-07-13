@@ -619,6 +619,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "waldo-action"
+version = "0.1.0"
+dependencies = [
+ "waldo-controller",
+ "waldo-protocol",
+]
+
+[[package]]
 name = "waldo-cli"
 version = "0.1.0"
 dependencies = [
@@ -679,6 +687,7 @@ dependencies = [
  "niri-ipc",
  "nix",
  "tokio",
+ "waldo-action",
  "waldo-controller",
  "waldo-niri",
  "waldo-protocol",
