@@ -1,0 +1,12 @@
+[package]
+name = "waldo-controller"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+waldo-protocol = { path = "../waldo-protocol" }
+
+[lib]
+path = "src/lib.rs"
+

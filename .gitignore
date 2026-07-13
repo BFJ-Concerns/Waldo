@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Local machine overrides
+*.local
+*.local.*
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
