@@ -2,6 +2,7 @@
 
 mod dispatch;
 mod error;
+mod observe;
 mod server;
 mod socket_path;
 

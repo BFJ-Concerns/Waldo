@@ -18,7 +18,10 @@ use waldo_protocol::{
 };
 
 /// Maximum accepted JSON payload, excluding the four-byte length prefix.
-pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+///
+/// This covers a worst-case base64-encoded 3840×2160 RGBA observation while
+/// retaining a firm allocation bound for malformed local clients.
+pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum TransportError {
@@ -241,5 +244,13 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, TransportError::ConnectionClosed));
+    }
+
+    #[test]
+    fn frame_limit_covers_an_uncompressed_target_output_after_base64_expansion() {
+        let rgba_bytes: usize = 3840 * 2160 * 4;
+        let base64_ceiling = rgba_bytes.div_ceil(3) * 4;
+
+        assert!(MAX_FRAME_BYTES > base64_ceiling);
     }
 }

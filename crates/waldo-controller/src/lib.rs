@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
 
-use waldo_protocol::{ClientId, ConnectionId, DrivingSessionId};
+use waldo_protocol::{ClientId, ConnectionId, DrivingSessionId, ObservationId};
 
 /// The controller-owned state for one period of foreground driving authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +78,7 @@ pub struct Controller {
     idle_timeout: Duration,
     next_connection: u64,
     next_driving_session: u64,
+    next_observation: u64,
     connections: BTreeMap<ConnectionId, ClientId>,
     driving_session: Option<DrivingSession>,
 }
@@ -89,6 +90,7 @@ impl Controller {
             idle_timeout,
             next_connection: 1,
             next_driving_session: 1,
+            next_observation: 1,
             connections: BTreeMap::new(),
             driving_session: None,
         }
@@ -129,6 +131,16 @@ impl Controller {
     /// Returns the current driving session for read-only inspection.
     pub const fn driving_session(&self) -> Option<DrivingSession> {
         self.driving_session
+    }
+
+    /// Allocates a fresh observation identity within this controller session.
+    pub fn next_observation_id(&mut self) -> ObservationId {
+        let sequence = self.next_observation;
+        self.next_observation = self
+            .next_observation
+            .checked_add(1)
+            .expect("observation identifier space exhausted");
+        ObservationId::new(sequence)
     }
 
     /// Atomically acquires or refreshes the lease for a mutating operation.
@@ -426,5 +438,17 @@ mod tests {
             controller.handover(mcp, missing, Duration::ZERO),
             Err(LeaseError::UnknownConnection(missing))
         );
+    }
+
+    #[test]
+    fn observation_identifiers_are_unique_within_the_controller_session() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+
+        let first = controller.next_observation_id();
+        let second = controller.next_observation_id();
+
+        assert_ne!(first, second);
+        assert_eq!(first.get(), 1);
+        assert_eq!(second.get(), 2);
     }
 }

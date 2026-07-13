@@ -1,0 +1,19 @@
+[package]
+name = "waldo-screencopy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+image.workspace = true
+memmap2.workspace = true
+nix.workspace = true
+wayland-client.workspace = true
+wayland-protocols-wlr.workspace = true
+waldo-protocol = { path = "../waldo-protocol" }
+
+[dev-dependencies]
+niri-ipc.workspace = true
+
+[lib]
+path = "src/lib.rs"

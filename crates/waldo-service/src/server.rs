@@ -18,6 +18,7 @@ use waldo_niri::{NiriInspector, SessionInspector};
 use waldo_protocol::{
     Capabilities, ClientMessage, ProtocolError, SCHEMA_MAJOR_VERSION, ServerMessage,
 };
+use waldo_screencopy::{ScreenCapturer, Screencopy, UnavailableCapturer};
 use waldo_socket::{TransportError, read_message, write_message};
 
 use crate::{ServiceError, dispatch::dispatch, socket_path};
@@ -26,19 +27,26 @@ pub(crate) struct ServiceState {
     pub controller: Mutex<Controller>,
     pub capabilities: Capabilities,
     pub inspector: Arc<dyn SessionInspector>,
+    pub capturer: Arc<dyn ScreenCapturer>,
     started_at: Instant,
 }
 
 impl ServiceState {
-    fn new(idle_timeout: Duration, inspector: Arc<dyn SessionInspector>) -> Self {
-        let capabilities = inspector
+    fn new(
+        idle_timeout: Duration,
+        inspector: Arc<dyn SessionInspector>,
+        capturer: Arc<dyn ScreenCapturer>,
+    ) -> Self {
+        let mut capabilities = inspector
             .inspect(false)
             .map(|snapshot| snapshot.capabilities)
             .unwrap_or_else(|_| Capabilities::unavailable());
+        enable_capture_capability(&mut capabilities, capturer.as_ref());
         Self {
             controller: Mutex::new(Controller::new(idle_timeout)),
             capabilities,
             inspector,
+            capturer,
             started_at: Instant::now(),
         }
     }
@@ -58,7 +66,12 @@ pub struct ControllerService {
 impl ControllerService {
     /// Binds a private socket after rejecting symlink and ownership hazards.
     pub fn bind(path: impl AsRef<Path>, idle_timeout: Duration) -> Result<Self, ServiceError> {
-        Self::bind_with_inspector(path, idle_timeout, Arc::new(NiriInspector))
+        Self::bind_with_backends(
+            path,
+            idle_timeout,
+            Arc::new(NiriInspector),
+            Arc::new(Screencopy),
+        )
     }
 
     /// Binds with an explicit read-only inspector for tests and diagnostics.
@@ -66,6 +79,16 @@ impl ControllerService {
         path: impl AsRef<Path>,
         idle_timeout: Duration,
         inspector: Arc<dyn SessionInspector>,
+    ) -> Result<Self, ServiceError> {
+        Self::bind_with_backends(path, idle_timeout, inspector, Arc::new(UnavailableCapturer))
+    }
+
+    /// Binds with explicit read-only backends for deterministic integration tests.
+    pub fn bind_with_backends(
+        path: impl AsRef<Path>,
+        idle_timeout: Duration,
+        inspector: Arc<dyn SessionInspector>,
+        capturer: Arc<dyn ScreenCapturer>,
     ) -> Result<Self, ServiceError> {
         let path = path.as_ref();
         socket_path::prepare(path)?;
@@ -75,7 +98,7 @@ impl ControllerService {
 
         Ok(Self {
             listener,
-            state: Arc::new(ServiceState::new(idle_timeout, inspector)),
+            state: Arc::new(ServiceState::new(idle_timeout, inspector, capturer)),
             _socket_guard: socket_path::SocketGuard::new(path.to_path_buf())?,
         })
     }
@@ -111,6 +134,16 @@ impl ControllerService {
         connections.abort_all();
         while connections.join_next().await.is_some() {}
         Ok(())
+    }
+}
+
+pub(crate) fn enable_capture_capability(
+    capabilities: &mut Capabilities,
+    capturer: &dyn ScreenCapturer,
+) {
+    if capturer.available() && capabilities.screencopy.version.is_some() {
+        capabilities.screencopy.available = true;
+        capabilities.screencopy.limitation = None;
     }
 }
 

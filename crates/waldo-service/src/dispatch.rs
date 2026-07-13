@@ -4,7 +4,10 @@ use waldo_protocol::{
     ServerMessage, StopResult,
 };
 
-use crate::server::ServiceState;
+use crate::{
+    observe::observe,
+    server::{ServiceState, enable_capture_capability},
+};
 
 pub(crate) async fn dispatch(
     message: ClientMessage,
@@ -17,11 +20,11 @@ pub(crate) async fn dispatch(
             request_id: Some(request_id),
             error: invalid_request("hello is only valid as the first message"),
         },
-        ClientMessage::Observe { .. } => unsupported(request_id, "screencopy backend"),
+        ClientMessage::Observe { request, .. } => observe(request_id, request.source, state).await,
         ClientMessage::Act { .. } => unsupported(request_id, "desktop action backends"),
         ClientMessage::Query { request, .. } => {
             let inspector = std::sync::Arc::clone(&state.inspector);
-            let snapshot = match tokio::task::spawn_blocking(move || {
+            let mut snapshot = match tokio::task::spawn_blocking(move || {
                 inspector.inspect(request.include_windows)
             })
             .await
@@ -30,6 +33,7 @@ pub(crate) async fn dispatch(
                 Ok(Err(error)) => return inspection_error(request_id, error.to_string()),
                 Err(error) => return inspection_error(request_id, error.to_string()),
             };
+            enable_capture_capability(&mut snapshot.capabilities, state.capturer.as_ref());
             let controller = state.controller.lock().await;
             let driving = controller.driving_session();
             ServerMessage::Queried {

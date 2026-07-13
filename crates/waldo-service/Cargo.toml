@@ -5,16 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 nix.workspace = true
 tokio.workspace = true
 waldo-controller = { path = "../waldo-controller" }
 waldo-niri = { path = "../waldo-niri" }
 waldo-protocol = { path = "../waldo-protocol" }
+waldo-screencopy = { path = "../waldo-screencopy" }
 waldo-socket = { path = "../waldo-socket" }
 
 [lib]
 path = "src/lib.rs"
+
+[dev-dependencies]
+niri-ipc.workspace = true
 
 [[bin]]
 name = "waldod"
