@@ -2,6 +2,7 @@
 members = [
     "crates/waldo-cli",
     "crates/waldo-controller",
+    "crates/waldo-niri",
     "crates/waldo-protocol",
     "crates/waldo-service",
     "crates/waldo-socket",
@@ -15,7 +16,9 @@ rust-version = "1.85"
 [workspace.dependencies]
 clap = { version = "=4.6.1", features = ["derive"] }
 nix = { version = "=0.31.3", features = ["socket", "user"] }
+niri-ipc = { version = "=26.4.0" }
 schemars = { version = "=1.2.1" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150" }
 tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+wayland-client = { version = "=0.31.14" }

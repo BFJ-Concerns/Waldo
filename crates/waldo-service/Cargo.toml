@@ -9,6 +9,7 @@ clap.workspace = true
 nix.workspace = true
 tokio.workspace = true
 waldo-controller = { path = "../waldo-controller" }
+waldo-niri = { path = "../waldo-niri" }
 waldo-protocol = { path = "../waldo-protocol" }
 waldo-socket = { path = "../waldo-socket" }
 

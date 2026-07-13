@@ -2,16 +2,27 @@ use std::{
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     path::PathBuf,
+    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use tokio::sync::oneshot;
+use waldo_niri::UnavailableInspector;
 use waldo_protocol::{ClientId, ClientMessage, ErrorCode, QueryRequest, RequestId, ServerMessage};
 use waldo_service::ControllerService;
 use waldo_socket::ControllerClient;
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
+
+fn bind_test_service(path: &PathBuf) -> ControllerService {
+    ControllerService::bind_with_inspector(
+        path,
+        Duration::from_secs(30),
+        Arc::new(UnavailableInspector::new("test session")),
+    )
+    .unwrap()
+}
 
 fn test_socket() -> PathBuf {
     std::env::temp_dir()
@@ -26,7 +37,7 @@ fn test_socket() -> PathBuf {
 #[tokio::test]
 async fn private_socket_accepts_a_query_from_the_current_user() {
     let path = test_socket();
-    let service = ControllerService::bind(&path, Duration::from_secs(30)).unwrap();
+    let service = bind_test_service(&path);
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
@@ -58,7 +69,7 @@ async fn private_socket_accepts_a_query_from_the_current_user() {
 #[tokio::test]
 async fn unavailable_desktop_operations_fail_explicitly() {
     let path = test_socket();
-    let service = ControllerService::bind(&path, Duration::from_secs(30)).unwrap();
+    let service = bind_test_service(&path);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(service.run_until(async {
         let _ = shutdown_rx.await;
@@ -155,7 +166,7 @@ fn binding_does_not_change_an_existing_shared_directory() {
 async fn shutdown_does_not_remove_a_path_that_replaced_the_bound_socket() {
     let path = test_socket();
     let moved = path.with_extension("moved");
-    let service = ControllerService::bind(&path, Duration::from_secs(30)).unwrap();
+    let service = bind_test_service(&path);
     fs::rename(&path, &moved).unwrap();
     fs::write(&path, "replacement").unwrap();
 

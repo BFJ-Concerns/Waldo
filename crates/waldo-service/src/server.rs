@@ -14,6 +14,7 @@ use tokio::{
     task::JoinSet,
 };
 use waldo_controller::Controller;
+use waldo_niri::{NiriInspector, SessionInspector};
 use waldo_protocol::{
     Capabilities, ClientMessage, ProtocolError, SCHEMA_MAJOR_VERSION, ServerMessage,
 };
@@ -24,14 +25,20 @@ use crate::{ServiceError, dispatch::dispatch, socket_path};
 pub(crate) struct ServiceState {
     pub controller: Mutex<Controller>,
     pub capabilities: Capabilities,
+    pub inspector: Arc<dyn SessionInspector>,
     started_at: Instant,
 }
 
 impl ServiceState {
-    fn new(idle_timeout: Duration) -> Self {
+    fn new(idle_timeout: Duration, inspector: Arc<dyn SessionInspector>) -> Self {
+        let capabilities = inspector
+            .inspect(false)
+            .map(|snapshot| snapshot.capabilities)
+            .unwrap_or_else(|_| Capabilities::unavailable());
         Self {
             controller: Mutex::new(Controller::new(idle_timeout)),
-            capabilities: Capabilities::unavailable(),
+            capabilities,
+            inspector,
             started_at: Instant::now(),
         }
     }
@@ -51,6 +58,15 @@ pub struct ControllerService {
 impl ControllerService {
     /// Binds a private socket after rejecting symlink and ownership hazards.
     pub fn bind(path: impl AsRef<Path>, idle_timeout: Duration) -> Result<Self, ServiceError> {
+        Self::bind_with_inspector(path, idle_timeout, Arc::new(NiriInspector))
+    }
+
+    /// Binds with an explicit read-only inspector for tests and diagnostics.
+    pub fn bind_with_inspector(
+        path: impl AsRef<Path>,
+        idle_timeout: Duration,
+        inspector: Arc<dyn SessionInspector>,
+    ) -> Result<Self, ServiceError> {
         let path = path.as_ref();
         socket_path::prepare(path)?;
 
@@ -59,7 +75,7 @@ impl ControllerService {
 
         Ok(Self {
             listener,
-            state: Arc::new(ServiceState::new(idle_timeout)),
+            state: Arc::new(ServiceState::new(idle_timeout, inspector)),
             _socket_guard: socket_path::SocketGuard::new(path.to_path_buf())?,
         })
     }

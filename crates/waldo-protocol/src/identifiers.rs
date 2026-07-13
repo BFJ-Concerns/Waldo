@@ -94,6 +94,10 @@ numeric_identifier!(
     /// Session-local identity for one captured desktop observation.
     ObservationId
 );
+numeric_identifier!(
+    /// Stable Niri identity for one workspace during the compositor session.
+    WorkspaceId
+);
 
 macro_rules! text_identifier {
     ($(#[$meta:meta])* $name:ident) => {

@@ -19,20 +19,33 @@ pub(crate) async fn dispatch(
         },
         ClientMessage::Observe { .. } => unsupported(request_id, "screencopy backend"),
         ClientMessage::Act { .. } => unsupported(request_id, "desktop action backends"),
-        ClientMessage::Query { .. } => {
+        ClientMessage::Query { request, .. } => {
+            let inspector = std::sync::Arc::clone(&state.inspector);
+            let snapshot = match tokio::task::spawn_blocking(move || {
+                inspector.inspect(request.include_windows)
+            })
+            .await
+            {
+                Ok(Ok(snapshot)) => snapshot,
+                Ok(Err(error)) => return inspection_error(request_id, error.to_string()),
+                Err(error) => return inspection_error(request_id, error.to_string()),
+            };
             let controller = state.controller.lock().await;
             let driving = controller.driving_session();
             ServerMessage::Queried {
                 request_id,
-                result: QueryResult {
-                    capabilities: state.capabilities.clone(),
-                    outputs: Vec::new(),
-                    windows: Vec::new(),
-                    focused_window: None,
-                    keyboard_layout: None,
+                result: Box::new(QueryResult {
+                    capabilities: snapshot.capabilities,
+                    profile: snapshot.profile,
+                    outputs: snapshot.outputs,
+                    workspaces: snapshot.workspaces,
+                    windows: snapshot.windows,
+                    focused_window: snapshot.focused_window,
+                    keyboard_layouts: snapshot.keyboard_layouts,
+                    active_keyboard_layout: snapshot.active_keyboard_layout,
                     driving_session: driving.map(|session| session.id()),
                     driving_connection: driving.map(|session| session.owner()),
-                },
+                }),
             }
         }
         ClientMessage::Stop { .. } => stop(request_id, state, connection_id).await,
@@ -51,6 +64,17 @@ pub(crate) async fn dispatch(
                 Err(error) => lease_error(request_id, error),
             }
         }
+    }
+}
+
+fn inspection_error(request_id: RequestId, message: String) -> ServerMessage {
+    ServerMessage::Error {
+        request_id: Some(request_id),
+        error: ProtocolError {
+            code: ErrorCode::BackendFailure,
+            message,
+            retryable: true,
+        },
     }
 }
 

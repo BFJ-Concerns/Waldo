@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{LogicalRect, OutputId, WindowId};
+use crate::{LogicalRect, OutputId, OutputTransform, PixelSize, WindowId, WorkspaceId};
 
 /// Availability and limits for one controller backend.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -58,7 +58,9 @@ pub struct OutputState {
     pub id: OutputId,
     pub name: String,
     pub logical_bounds: LogicalRect,
+    pub pixel_size: Option<PixelSize>,
     pub scale: f64,
+    pub transform: OutputTransform,
     pub focused: bool,
 }
 
@@ -66,10 +68,37 @@ pub struct OutputState {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct WindowState {
     pub id: WindowId,
-    pub title: String,
+    pub title: Option<String>,
     pub application_id: Option<String>,
-    pub logical_bounds: LogicalRect,
+    pub logical_bounds: Option<LogicalRect>,
     pub focused: bool,
-    pub workspace: String,
-    pub output_id: OutputId,
+    pub workspace_id: Option<WorkspaceId>,
+    pub output_id: Option<OutputId>,
+}
+
+/// One workspace in the active Niri session.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub struct WorkspaceState {
+    pub id: WorkspaceId,
+    pub index: u8,
+    pub name: Option<String>,
+    pub output_id: Option<OutputId>,
+    pub active: bool,
+    pub focused: bool,
+}
+
+/// One Wayland global advertised by the active compositor.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ProtocolAdvertisement {
+    pub interface: String,
+    pub version: u32,
+}
+
+/// Concrete environment facts gathered without enabling desktop mutation.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub struct CompatibilityProfile {
+    pub waldo_version: String,
+    pub niri_version: Option<String>,
+    pub wayland_display: Option<String>,
+    pub protocols: Vec<ProtocolAdvertisement>,
 }

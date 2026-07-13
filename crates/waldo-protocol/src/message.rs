@@ -2,8 +2,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Action, Capabilities, ClientId, ConnectionId, DrivingSessionId, ErrorCode, Observation,
-    ObservationId, OutputState, Predicate, ProtocolError, RequestId, SourceSelector, WindowState,
+    Action, Capabilities, ClientId, CompatibilityProfile, ConnectionId, DrivingSessionId,
+    ErrorCode, Observation, ObservationId, OutputState, Predicate, ProtocolError, RequestId,
+    SourceSelector, WindowState, WorkspaceState,
 };
 
 /// Parameters for a fresh or continued visual observation.
@@ -151,10 +152,13 @@ pub struct ActResult {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct QueryResult {
     pub capabilities: Capabilities,
+    pub profile: CompatibilityProfile,
     pub outputs: Vec<OutputState>,
+    pub workspaces: Vec<WorkspaceState>,
     pub windows: Vec<WindowState>,
     pub focused_window: Option<crate::WindowId>,
-    pub keyboard_layout: Option<String>,
+    pub keyboard_layouts: Vec<String>,
+    pub active_keyboard_layout: Option<String>,
     pub driving_session: Option<DrivingSessionId>,
     pub driving_connection: Option<ConnectionId>,
 }
@@ -195,7 +199,7 @@ pub enum ServerMessage {
     },
     Queried {
         request_id: RequestId,
-        result: QueryResult,
+        result: Box<QueryResult>,
     },
     Stopped {
         request_id: RequestId,
