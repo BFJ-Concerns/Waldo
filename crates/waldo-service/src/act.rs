@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use tokio::sync::oneshot;
 use waldo_action::{execute_batch, validate_grounding};
@@ -13,6 +17,10 @@ use crate::{
     server::ServiceState,
     verification::{VerificationPlan, failed_verification},
 };
+
+const POST_ACTION_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
+const POST_ACTION_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const POST_ACTION_FRAME_QUIET_PERIOD: Duration = Duration::from_millis(150);
 
 pub(crate) async fn act(
     request_id: RequestId,
@@ -134,6 +142,7 @@ pub(crate) async fn act(
     };
     let session = authority.session();
     let cancellation = authority.cancellation().clone();
+    let expect_visual_change = actions_expect_visual_change(&actions);
     let executor = Arc::clone(&state.executor);
     let batch_executor = BatchActionExecutor::new(
         executor,
@@ -162,25 +171,28 @@ pub(crate) async fn act(
             return error_response(request_id, ErrorCode::Internal, &error.to_string(), true);
         }
     };
-    let (observation, mut completion_error, mut stop_reason) = match capture_observation(
-        result_source,
-        grounding.include_accessibility,
-        state,
-        connection_id,
-    )
-    .await
-    {
-        Ok(observation) => (Some(observation), None, execution.stop_reason),
-        Err(error) => (
-            None,
-            Some(error),
-            if execution.stop_reason == waldo_protocol::StopReason::Completed {
-                waldo_protocol::StopReason::ExecutionFailed
-            } else {
-                execution.stop_reason
-            },
-        ),
-    };
+    let (observation, mut completion_error, mut stop_reason) =
+        match capture_post_action_observation(
+            result_source,
+            grounding.include_accessibility,
+            grounding.frame_fingerprint,
+            expect_visual_change,
+            state,
+            connection_id,
+        )
+        .await
+        {
+            Ok(observation) => (Some(observation), None, execution.stop_reason),
+            Err(error) => (
+                None,
+                Some(error),
+                if execution.stop_reason == waldo_protocol::StopReason::Completed {
+                    waldo_protocol::StopReason::ExecutionFailed
+                } else {
+                    execution.stop_reason
+                },
+            ),
+        };
     let verification_results = if let Some(observation) = &observation {
         match verification
             .evaluate(observation, state, connection_id)
@@ -220,6 +232,75 @@ pub(crate) async fn act(
             verification: verification_results,
         },
     }
+}
+
+async fn capture_post_action_observation(
+    source: waldo_protocol::SourceSelector,
+    include_accessibility: bool,
+    previous_frame: u64,
+    expect_visual_change: bool,
+    state: &ServiceState,
+    connection_id: ConnectionId,
+) -> Result<waldo_protocol::Observation, ProtocolError> {
+    let deadline = Instant::now() + POST_ACTION_FRAME_TIMEOUT;
+    let mut latest_frame = previous_frame;
+    let mut last_change = Instant::now();
+    let mut changed = false;
+    loop {
+        let observation =
+            capture_observation(source.clone(), include_accessibility, state, connection_id)
+                .await?;
+        if !expect_visual_change {
+            return Ok(observation);
+        }
+        let now = Instant::now();
+        let Some(frame) = observation_frame_fingerprint(state, connection_id, observation.id).await
+        else {
+            return Ok(observation);
+        };
+        if frame != latest_frame {
+            latest_frame = frame;
+            last_change = now;
+            changed = true;
+        }
+        if (changed && now.duration_since(last_change) >= POST_ACTION_FRAME_QUIET_PERIOD)
+            || now >= deadline
+        {
+            return Ok(observation);
+        }
+        tokio::time::sleep(POST_ACTION_FRAME_POLL_INTERVAL).await;
+    }
+}
+
+async fn observation_frame_fingerprint(
+    state: &ServiceState,
+    connection_id: ConnectionId,
+    observation_id: waldo_protocol::ObservationId,
+) -> Option<u64> {
+    state
+        .controller
+        .lock()
+        .await
+        .observation(connection_id, observation_id)
+        .map(|grounding| grounding.frame_fingerprint)
+}
+
+fn actions_expect_visual_change(actions: &[waldo_protocol::Action]) -> bool {
+    actions.iter().any(|action| {
+        matches!(
+            action,
+            waldo_protocol::Action::PointerButton { .. }
+                | waldo_protocol::Action::PointerClick { .. }
+                | waldo_protocol::Action::PointerDrag { .. }
+                | waldo_protocol::Action::Scroll { .. }
+                | waldo_protocol::Action::Key { .. }
+                | waldo_protocol::Action::KeyChord { .. }
+                | waldo_protocol::Action::Text { .. }
+                | waldo_protocol::Action::Accessibility { .. }
+                | waldo_protocol::Action::Window { .. }
+                | waldo_protocol::Action::Workspace { .. }
+        )
+    })
 }
 
 struct ReadySignal(Option<oneshot::Sender<()>>);

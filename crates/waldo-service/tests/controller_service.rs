@@ -115,6 +115,41 @@ struct FailingFinalCapturer {
     calls: AtomicUsize,
 }
 
+struct SettlingFrameCapturer {
+    calls: AtomicUsize,
+}
+
+impl ScreenCapturer for SettlingFrameCapturer {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn capture_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Capture {
+            png: match call {
+                0 => b"before-action".to_vec(),
+                1..=3 => b"transient-frame".to_vec(),
+                _ => b"settled-frame".to_vec(),
+            },
+            width: 1920,
+            height: 1080,
+            captured_at_unix_ms: call as u64,
+        })
+    }
+
+    fn capture_region(
+        &self,
+        output_name: &str,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture_output(output_name)
+    }
+}
+
 impl ScreenCapturer for FailingFinalCapturer {
     fn available(&self) -> bool {
         true
@@ -942,6 +977,71 @@ async fn act_returns_mechanical_post_action_verification_results() {
     };
     assert_eq!(result.stop_reason, StopReason::Completed);
     assert_eq!(result.verification, vec![true]);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn act_waits_past_transient_changes_for_a_quiet_post_action_frame() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(SettlingFrameCapturer {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("fresh-frame-test").unwrap())
+        .await
+        .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let before = observation.image.data_base64;
+
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![Action::Text {
+                    text: "changed".into(),
+                    route: waldo_protocol::TextRoutePreference::VirtualKeyboard,
+                }],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("action did not return a result")
+    };
+    let settled = result.observation.unwrap();
+    assert_ne!(settled.image.data_base64, before);
+    assert!(settled.captured_at_unix_ms >= 4);
 
     drop(client);
     shutdown_tx.send(()).unwrap();
