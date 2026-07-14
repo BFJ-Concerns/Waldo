@@ -47,6 +47,9 @@ not already authorised.
    `{"type":"wait","predicate":{"type":"element_state","element":"element-17","state":"focused","present":true},"timeout_ms":500}`.
    Capture accepts only its source:
    `{"type":"capture","source":{"type":"window","window_id":"16"}}`.
+   Frame-change verification must name the observation it compares against:
+   `{"type":"frame_changed","from":55}`. Use the same identifier supplied as
+   `observation_id` when checking that an action changed its grounded frame.
    Do not add `target`, `handle`, `condition`, or `include_accessibility` fields
    to these action variants.
 4. Inspect every receipt and the resulting image. A transport acknowledgement
