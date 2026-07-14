@@ -17,6 +17,7 @@ use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{
+        wl_output,
         wl_pointer::{Axis, ButtonState},
         wl_registry,
     },
@@ -98,7 +99,10 @@ impl ActionExecutor for VirtualPointerExecutor {
 struct PointerState {
     connection: Connection,
     queue: EventQueue<WaylandState>,
+    manager: ZwlrVirtualPointerManagerV1,
     pointer: ZwlrVirtualPointerV1,
+    pointer_output: Option<String>,
+    outputs: Vec<OutputRecord>,
     held_buttons: BTreeSet<u32>,
 }
 
@@ -106,13 +110,30 @@ impl PointerState {
     fn connect() -> Result<Self, ProtocolError> {
         let connection = Connection::connect_to_env()
             .map_err(|error| backend_failure(format!("connect to Wayland: {error}"), true))?;
-        let (globals, queue) = registry_queue_init::<WaylandState>(&connection)
+        let (globals, mut queue) = registry_queue_init::<WaylandState>(&connection)
             .map_err(|error| backend_failure(format!("read Wayland globals: {error}"), true))?;
         let qh = queue.handle();
         let manager: ZwlrVirtualPointerManagerV1 =
             globals.bind(&qh, 1..=2, ()).map_err(|error| {
                 backend_failure(format!("bind virtual-pointer manager: {error}"), false)
             })?;
+        let mut wayland_state = WaylandState::default();
+        globals.contents().with_list(|list| {
+            for global in list.iter().filter(|global| global.interface == "wl_output") {
+                let output = globals.registry().bind::<wl_output::WlOutput, _, _>(
+                    global.name,
+                    global.version.min(4),
+                    &qh,
+                    (),
+                );
+                wayland_state
+                    .outputs
+                    .push(OutputRecord { output, name: None });
+            }
+        });
+        queue.roundtrip(&mut wayland_state).map_err(|error| {
+            backend_failure(format!("read Wayland output names: {error}"), true)
+        })?;
         let pointer = manager.create_virtual_pointer(None, &qh, ());
         connection
             .flush()
@@ -120,7 +141,10 @@ impl PointerState {
         Ok(Self {
             connection,
             queue,
+            manager,
             pointer,
+            pointer_output: None,
+            outputs: wayland_state.outputs,
             held_buttons: BTreeSet::new(),
         })
     }
@@ -135,32 +159,18 @@ impl PointerState {
         cancelled_before_dispatch(cancellation)?;
 
         match prepared {
-            PreparedAction::MoveAbsolute {
-                x,
-                y,
-                width,
-                height,
-            } => {
-                self.pointer
-                    .motion_absolute(timestamp(), x, y, width, height);
-                self.pointer.frame();
-            }
+            PreparedAction::MoveAbsolute(point) => self.send_absolute(&point)?,
             PreparedAction::MoveRelative { x, y } => {
                 self.pointer.motion(timestamp(), x, y);
                 self.pointer.frame();
             }
             PreparedAction::Button { button, state } => self.button(button, state),
             PreparedAction::Click {
-                x,
-                y,
-                width,
-                height,
+                point,
                 button,
                 count,
             } => {
-                self.pointer
-                    .motion_absolute(timestamp(), x, y, width, height);
-                self.pointer.frame();
+                self.send_absolute(&point)?;
                 for _ in 0..count {
                     self.button(button, InputState::Pressed);
                     self.button(button, InputState::Released);
@@ -172,7 +182,7 @@ impl PointerState {
                 delay,
             } => {
                 let first = points.first().expect("prepared drag is non-empty");
-                self.send_absolute(*first);
+                self.send_absolute(first)?;
                 self.button(button, InputState::Pressed);
                 self.flush_dispatched("start virtual-pointer drag")?;
                 let result = self.follow_prepared_path(&points[1..], delay, cancellation, true);
@@ -197,7 +207,7 @@ impl PointerState {
         }
         self.flush_dispatched("flush virtual-pointer action")?;
         self.queue
-            .dispatch_pending(&mut WaylandState)
+            .dispatch_pending(&mut WaylandState::default())
             .map_err(|error| {
                 ActionExecutionFailure::indeterminate(
                     ActionRoute::VirtualPointer,
@@ -210,10 +220,44 @@ impl PointerState {
         Ok(())
     }
 
-    fn send_absolute(&self, point: PreparedPoint) {
+    fn send_absolute(&mut self, point: &PreparedPoint) -> Result<(), ActionExecutionFailure> {
+        self.select_output(&point.output)?;
         self.pointer
             .motion_absolute(timestamp(), point.x, point.y, point.width, point.height);
         self.pointer.frame();
+        Ok(())
+    }
+
+    fn select_output(&mut self, output_name: &str) -> Result<(), ActionExecutionFailure> {
+        if self.pointer_output.as_deref() == Some(output_name) {
+            return Ok(());
+        }
+        if !self.held_buttons.is_empty() {
+            return Err(ActionExecutionFailure::indeterminate(
+                ActionRoute::VirtualPointer,
+                invalid("a pointer drag cannot cross an output boundary"),
+            ));
+        }
+        let output = self
+            .outputs
+            .iter()
+            .find(|output| output.name.as_deref() == Some(output_name))
+            .map(|output| output.output.clone())
+            .ok_or_else(|| {
+                ActionExecutionFailure::not_executed(backend_failure(
+                    format!("Wayland output {output_name} is no longer available"),
+                    true,
+                ))
+            })?;
+        self.pointer.destroy();
+        self.pointer = self.manager.create_virtual_pointer_with_output(
+            None,
+            Some(&output),
+            &self.queue.handle(),
+            (),
+        );
+        self.pointer_output = Some(output_name.to_owned());
+        Ok(())
     }
 
     fn button(&mut self, button: PointerButton, state: InputState) {
@@ -245,7 +289,7 @@ impl PointerState {
             if index > 0 || already_dispatched {
                 sleep_cancellable(delay, cancellation, dispatched)?;
             }
-            self.send_absolute(*point);
+            self.send_absolute(point)?;
             self.flush_dispatched("flush virtual-pointer path")?;
             dispatched = true;
         }
@@ -263,12 +307,7 @@ impl PointerState {
 }
 
 enum PreparedAction {
-    MoveAbsolute {
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-    },
+    MoveAbsolute(PreparedPoint),
     MoveRelative {
         x: f64,
         y: f64,
@@ -278,10 +317,7 @@ enum PreparedAction {
         state: InputState,
     },
     Click {
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
+        point: PreparedPoint,
         button: PointerButton,
         count: u8,
     },
@@ -305,12 +341,7 @@ impl PreparedAction {
         match action {
             Action::PointerMoveAbsolute { position } => {
                 let point = PreparedPoint::new(*position, &DesktopGeometry::inspect()?)?;
-                Ok(Self::MoveAbsolute {
-                    x: point.x,
-                    y: point.y,
-                    width: point.width,
-                    height: point.height,
-                })
+                Ok(Self::MoveAbsolute(point))
             }
             Action::PointerMoveRelative { delta } => {
                 finite(delta.x, "relative pointer x")?;
@@ -334,10 +365,7 @@ impl PreparedAction {
                 }
                 let point = PreparedPoint::new(*position, &DesktopGeometry::inspect()?)?;
                 Ok(Self::Click {
-                    x: point.x,
-                    y: point.y,
-                    width: point.width,
-                    height: point.height,
+                    point,
                     button: *button,
                     count: *count,
                 })
@@ -403,8 +431,9 @@ impl PreparedAction {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PreparedPoint {
+    output: String,
     x: u32,
     y: u32,
     width: u32,
@@ -413,11 +442,21 @@ struct PreparedPoint {
 
 impl PreparedPoint {
     fn new(point: LogicalPoint, geometry: &DesktopGeometry) -> Result<Self, ProtocolError> {
+        let output = geometry.output_at(point).ok_or_else(|| {
+            invalid("pointer position lies outside every active output in the desktop layout")
+        })?;
+        let width = extent(output.logical_bounds.width, "output width")?;
+        let height = extent(output.logical_bounds.height, "output height")?;
         Ok(Self {
-            x: geometry.normalise_x(point.x)?,
-            y: geometry.normalise_y(point.y)?,
-            width: geometry.width,
-            height: geometry.height,
+            output: output.name.clone(),
+            x: coordinate(point.x - output.logical_bounds.origin.x, width, "pointer x")?,
+            y: coordinate(
+                point.y - output.logical_bounds.origin.y,
+                height,
+                "pointer y",
+            )?,
+            width,
+            height,
         })
     }
 }
@@ -435,7 +474,14 @@ impl Drop for PointerState {
 }
 
 #[derive(Default)]
-struct WaylandState;
+struct WaylandState {
+    outputs: Vec<OutputRecord>,
+}
+
+struct OutputRecord {
+    output: wl_output::WlOutput,
+    name: Option<String>,
+}
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandState {
     fn event(
@@ -461,6 +507,23 @@ impl Dispatch<ZwlrVirtualPointerManagerV1, ()> for WaylandState {
     }
 }
 
+impl Dispatch<wl_output::WlOutput, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _data: &(),
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Name { name } = event
+            && let Some(record) = state.outputs.iter_mut().find(|item| item.output == *proxy)
+        {
+            record.name = Some(name);
+        }
+    }
+}
+
 impl Dispatch<ZwlrVirtualPointerV1, ()> for WaylandState {
     fn event(
         _state: &mut Self,
@@ -474,10 +537,7 @@ impl Dispatch<ZwlrVirtualPointerV1, ()> for WaylandState {
 }
 
 struct DesktopGeometry {
-    left: f64,
-    top: f64,
-    width: u32,
-    height: u32,
+    outputs: Vec<waldo_protocol::OutputState>,
 }
 
 impl DesktopGeometry {
@@ -485,34 +545,22 @@ impl DesktopGeometry {
         let snapshot = NiriInspector
             .inspect(false)
             .map_err(|error| backend_failure(format!("inspect desktop geometry: {error}"), true))?;
-        let first = snapshot
-            .outputs
-            .first()
-            .ok_or_else(|| backend_failure("desktop has no active outputs", true))?;
-        let mut left = first.logical_bounds.origin.x;
-        let mut top = first.logical_bounds.origin.y;
-        let mut right = left + first.logical_bounds.width;
-        let mut bottom = top + first.logical_bounds.height;
-        for output in &snapshot.outputs[1..] {
-            left = left.min(output.logical_bounds.origin.x);
-            top = top.min(output.logical_bounds.origin.y);
-            right = right.max(output.logical_bounds.origin.x + output.logical_bounds.width);
-            bottom = bottom.max(output.logical_bounds.origin.y + output.logical_bounds.height);
+        if snapshot.outputs.is_empty() {
+            return Err(backend_failure("desktop has no active outputs", true));
         }
         Ok(Self {
-            left,
-            top,
-            width: extent(right - left, "desktop width")?,
-            height: extent(bottom - top, "desktop height")?,
+            outputs: snapshot.outputs,
         })
     }
 
-    fn normalise_x(&self, value: f64) -> Result<u32, ProtocolError> {
-        coordinate(value - self.left, self.width, "pointer x")
-    }
-
-    fn normalise_y(&self, value: f64) -> Result<u32, ProtocolError> {
-        coordinate(value - self.top, self.height, "pointer y")
+    fn output_at(&self, point: LogicalPoint) -> Option<&waldo_protocol::OutputState> {
+        self.outputs.iter().find(|output| {
+            let bounds = output.logical_bounds;
+            point.x >= bounds.origin.x
+                && point.x < bounds.origin.x + bounds.width
+                && point.y >= bounds.origin.y
+                && point.y < bounds.origin.y + bounds.height
+        })
     }
 }
 
@@ -629,22 +677,49 @@ fn backend_failure(message: impl Into<String>, retryable: bool) -> ProtocolError
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopGeometry, button_code};
-    use waldo_protocol::PointerButton;
+    use super::{DesktopGeometry, PreparedPoint, button_code};
+    use waldo_protocol::{
+        LogicalPoint, LogicalRect, OutputId, OutputState, OutputTransform, PointerButton,
+    };
 
     #[test]
-    fn desktop_coordinates_are_normalised_from_negative_origins() {
+    fn desktop_coordinates_are_grounded_to_the_containing_output() {
         let geometry = DesktopGeometry {
-            left: -1920.0,
-            top: -100.0,
-            width: 4480,
-            height: 1540,
+            outputs: vec![
+                output("left", -1920.0, -100.0, 1920.0, 1080.0),
+                output("right", 0.0, 0.0, 2560.0, 1440.0),
+            ],
         };
 
-        assert_eq!(geometry.normalise_x(-1920.0).unwrap(), 0);
-        assert_eq!(geometry.normalise_x(2560.0).unwrap(), 4480);
-        assert_eq!(geometry.normalise_y(0.0).unwrap(), 100);
-        assert!(geometry.normalise_x(2561.0).is_err());
+        let left = PreparedPoint::new(
+            LogicalPoint {
+                x: -960.0,
+                y: 440.0,
+            },
+            &geometry,
+        )
+        .unwrap();
+        assert_eq!(left.output, "left");
+        assert_eq!(
+            (left.x, left.y, left.width, left.height),
+            (960, 540, 1920, 1080)
+        );
+
+        let right = PreparedPoint::new(
+            LogicalPoint {
+                x: 1280.0,
+                y: 720.0,
+            },
+            &geometry,
+        )
+        .unwrap();
+        assert_eq!(right.output, "right");
+        assert_eq!(
+            (right.x, right.y, right.width, right.height),
+            (1280, 720, 2560, 1440)
+        );
+
+        assert!(PreparedPoint::new(LogicalPoint { x: 2560.0, y: 0.0 }, &geometry).is_err());
     }
 
     #[test]
@@ -654,5 +729,21 @@ mod tests {
         assert_eq!(button_code(PointerButton::Middle), 0x112);
         assert_eq!(button_code(PointerButton::Back), 0x113);
         assert_eq!(button_code(PointerButton::Forward), 0x114);
+    }
+
+    fn output(name: &str, x: f64, y: f64, width: f64, height: f64) -> OutputState {
+        OutputState {
+            id: OutputId(name.to_owned()),
+            name: name.to_owned(),
+            logical_bounds: LogicalRect {
+                origin: LogicalPoint { x, y },
+                width,
+                height,
+            },
+            pixel_size: None,
+            scale: 1.0,
+            transform: OutputTransform::Normal,
+            focused: false,
+        }
     }
 }

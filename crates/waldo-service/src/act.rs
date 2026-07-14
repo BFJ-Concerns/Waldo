@@ -289,7 +289,9 @@ fn actions_expect_visual_change(actions: &[waldo_protocol::Action]) -> bool {
     actions.iter().any(|action| {
         matches!(
             action,
-            waldo_protocol::Action::PointerButton { .. }
+            waldo_protocol::Action::PointerMoveAbsolute { .. }
+                | waldo_protocol::Action::PointerMoveRelative { .. }
+                | waldo_protocol::Action::PointerButton { .. }
                 | waldo_protocol::Action::PointerClick { .. }
                 | waldo_protocol::Action::PointerDrag { .. }
                 | waldo_protocol::Action::Scroll { .. }
@@ -374,7 +376,16 @@ fn validate_action_order(actions: &[waldo_protocol::Action]) -> Result<(), Proto
 mod tests {
     use waldo_protocol::{Action, LogicalPoint, Predicate, WindowId};
 
-    use super::validate_action_order;
+    use super::{actions_expect_visual_change, validate_action_order};
+
+    #[test]
+    fn pointer_motion_waits_for_its_cursor_frame() {
+        assert!(actions_expect_visual_change(&[
+            Action::PointerMoveAbsolute {
+                position: LogicalPoint { x: 10.0, y: 20.0 },
+            },
+        ]));
+    }
 
     #[test]
     fn visual_coordinates_cannot_cross_a_wait_boundary() {
