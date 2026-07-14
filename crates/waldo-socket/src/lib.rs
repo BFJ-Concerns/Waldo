@@ -1,6 +1,7 @@
 //! Length-delimited JSON transport for Waldo's private controller socket.
 
 use std::{
+    collections::HashMap,
     env,
     error::Error,
     fmt, io,
@@ -11,6 +12,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::UnixStream,
+    sync::{Mutex, mpsc, oneshot},
 };
 use waldo_protocol::{
     Capabilities, ClientId, ClientMessage, ConnectionId, RequestId, SCHEMA_MAJOR_VERSION,
@@ -143,6 +145,115 @@ pub struct ControllerClient {
     stream: UnixStream,
     connection_id: ConnectionId,
     capabilities: Capabilities,
+}
+
+struct PendingRequest {
+    message: ClientMessage,
+    response: oneshot::Sender<Result<ServerMessage, String>>,
+}
+
+type PendingResponses =
+    std::sync::Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<ServerMessage, String>>>>>;
+
+/// A cloneable controller connection which safely pipelines requests.
+///
+/// This is required by bindings whose Stop request must be able to overtake a
+/// long-running Act request on the same lease-owning connection.
+#[derive(Clone)]
+pub struct PipelinedControllerClient {
+    requests: mpsc::Sender<PendingRequest>,
+    connection_id: ConnectionId,
+    capabilities: Capabilities,
+}
+
+impl PipelinedControllerClient {
+    pub async fn connect(path: &Path, client_id: ClientId) -> Result<Self, TransportError> {
+        let client = ControllerClient::connect(path, client_id).await?;
+        let ControllerClient {
+            stream,
+            connection_id,
+            capabilities,
+        } = client;
+        let (reader, writer) = stream.into_split();
+        let pending = std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let (request_tx, request_rx) = mpsc::channel(16);
+
+        tokio::spawn(write_requests(writer, request_rx, pending.clone()));
+        tokio::spawn(read_responses(reader, pending));
+
+        Ok(Self {
+            requests: request_tx,
+            connection_id,
+            capabilities,
+        })
+    }
+
+    pub const fn connection_id(&self) -> ConnectionId {
+        self.connection_id
+    }
+
+    pub const fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
+    pub async fn request(&self, message: ClientMessage) -> Result<ServerMessage, TransportError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.requests
+            .send(PendingRequest {
+                message,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| TransportError::ConnectionClosed)?;
+        match response_rx.await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => Err(TransportError::Handshake(error)),
+            Err(_) => Err(TransportError::ConnectionClosed),
+        }
+    }
+}
+
+async fn write_requests(
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut requests: mpsc::Receiver<PendingRequest>,
+    pending: PendingResponses,
+) {
+    while let Some(request) = requests.recv().await {
+        let request_id = request.message.request_id();
+        pending.lock().await.insert(request_id, request.response);
+        if let Err(error) = write_message(&mut writer, &request.message).await {
+            fail_pending(&pending, error.to_string()).await;
+            return;
+        }
+    }
+}
+
+async fn read_responses(mut reader: tokio::net::unix::OwnedReadHalf, pending: PendingResponses) {
+    loop {
+        match read_message::<_, ServerMessage>(&mut reader).await {
+            Ok(response) => {
+                let Some(request_id) = response.request_id() else {
+                    continue;
+                };
+                if let Some(sender) = pending.lock().await.remove(&request_id) {
+                    let _ = sender.send(Ok(response));
+                }
+            }
+            Err(error) => {
+                fail_pending(&pending, error.to_string()).await;
+                return;
+            }
+        }
+    }
+}
+
+async fn fail_pending(
+    pending: &Mutex<HashMap<RequestId, oneshot::Sender<Result<ServerMessage, String>>>>,
+    error: String,
+) {
+    for (_, sender) in pending.lock().await.drain() {
+        let _ = sender.send(Err(error.clone()));
+    }
 }
 
 impl ControllerClient {

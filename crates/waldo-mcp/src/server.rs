@@ -1,0 +1,209 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    sync::Mutex,
+    task::JoinSet,
+};
+use waldo_protocol::{ClientId, ClientMessage, RequestId};
+use waldo_socket::PipelinedControllerClient;
+
+use crate::{
+    McpError,
+    result::{tool_failure, tool_response},
+    tools::{CallToolParams, JsonRpcMessage, decode, initialize, rpc_error, tools},
+};
+
+/// One MCP process and its persistent connection to the session controller.
+#[derive(Clone)]
+pub struct McpServer {
+    socket: Arc<PathBuf>,
+    client_id: ClientId,
+    controller: Arc<Mutex<Option<PipelinedControllerClient>>>,
+    next_request_id: Arc<AtomicU64>,
+}
+
+impl McpServer {
+    pub fn new(socket: impl Into<PathBuf>) -> Result<Self, McpError> {
+        let client_id = ClientId::new(format!("waldo-mcp-{}", std::process::id()))
+            .map_err(|_| McpError::InvalidClientId)?;
+        Ok(Self {
+            socket: Arc::new(socket.into()),
+            client_id,
+            controller: Arc::new(Mutex::new(None)),
+            next_request_id: Arc::new(AtomicU64::new(2)),
+        })
+    }
+
+    /// Serves newline-delimited JSON-RPC until the client closes stdin.
+    pub async fn run<R, W>(&self, reader: R, writer: W) -> Result<(), McpError>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut lines = BufReader::new(reader).lines();
+        let mut writer = BufWriter::new(writer);
+        let mut requests = JoinSet::new();
+        let mut input_open = true;
+
+        while input_open || !requests.is_empty() {
+            tokio::select! {
+                line = lines.next_line(), if input_open => match line? {
+                    Some(line) => match serde_json::from_str::<JsonRpcMessage>(&line) {
+                        Ok(message) => {
+                            let server = self.clone();
+                            requests.spawn(async move { server.handle(message).await });
+                        }
+                        Err(error) => {
+                            write_response(
+                                &mut writer,
+                                &rpc_error(Value::Null, -32700, error.to_string()),
+                            ).await?;
+                        }
+                    },
+                    None => input_open = false,
+                },
+                completed = requests.join_next(), if !requests.is_empty() => {
+                    if let Some(response) = completed.expect("request set was not empty")
+                        .map_err(std::io::Error::other)?
+                    {
+                        write_response(&mut writer, &response).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle(&self, message: JsonRpcMessage) -> Option<Value> {
+        let id = message.id?;
+        let result = match message.method.as_str() {
+            "initialize" => initialize(message.params),
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(json!({ "tools": tools() })),
+            "tools/call" => self.call_tool(message.params).await,
+            _ => return Some(rpc_error(id, -32601, "method not found")),
+        };
+
+        Some(match result {
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err(error) => rpc_error(id, -32602, error),
+        })
+    }
+
+    async fn call_tool(&self, params: Value) -> Result<Value, String> {
+        let call: CallToolParams = decode(params)?;
+        let request_id = self.next_controller_request_id();
+        let message = match call.name.as_str() {
+            "observe" => ClientMessage::Observe {
+                request_id,
+                request: decode(call.arguments)?,
+            },
+            "act" => ClientMessage::Act {
+                request_id,
+                request: decode(call.arguments)?,
+            },
+            "query" => ClientMessage::Query {
+                request_id,
+                request: decode(call.arguments)?,
+            },
+            "stop" => ClientMessage::Stop {
+                request_id,
+                request: decode(call.arguments)?,
+            },
+            _ => return Err(format!("unknown Waldo tool: {}", call.name)),
+        };
+
+        let response = match self.controller().await {
+            Ok(controller) => controller.request(message).await,
+            Err(error) => return Ok(tool_failure(error.to_string())),
+        };
+        match response {
+            Ok(response) => Ok(tool_response(response)),
+            Err(error) => {
+                *self.controller.lock().await = None;
+                Ok(tool_failure(error.to_string()))
+            }
+        }
+    }
+
+    async fn controller(&self) -> Result<PipelinedControllerClient, McpError> {
+        let mut controller = self.controller.lock().await;
+        if controller.is_none() {
+            *controller = Some(
+                PipelinedControllerClient::connect(
+                    Path::new(self.socket.as_ref()),
+                    self.client_id.clone(),
+                )
+                .await?,
+            );
+        }
+        Ok(controller
+            .as_ref()
+            .expect("controller was connected")
+            .clone())
+    }
+
+    fn next_controller_request_id(&self) -> RequestId {
+        RequestId::new(self.next_request_id.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+async fn write_response<W>(writer: &mut BufWriter<W>, response: &Value) -> Result<(), McpError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(&serde_json::to_vec(response)?).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::McpServer;
+
+    #[tokio::test]
+    async fn stdio_negotiates_and_lists_tools_without_a_controller() {
+        let (mut client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, mut client_read) = tokio::io::duplex(128 * 1024);
+        let server = McpServer::new("/controller-is-not-needed").unwrap();
+        let task = tokio::spawn(async move { server.run(server_read, server_write).await });
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+            )
+            .await
+            .unwrap();
+        drop(client_write);
+
+        let mut lines = BufReader::new(&mut client_read).lines();
+        let first: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let initialized = [&first, &second]
+            .into_iter()
+            .find(|response| response["id"] == 1)
+            .unwrap();
+        let listed = [&first, &second]
+            .into_iter()
+            .find(|response| response["id"] == 2)
+            .unwrap();
+
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 4);
+        task.await.unwrap().unwrap();
+    }
+}

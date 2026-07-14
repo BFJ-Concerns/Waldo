@@ -648,6 +648,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "waldo-mcp"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "waldo-action",
+ "waldo-controller",
+ "waldo-niri",
+ "waldo-protocol",
+ "waldo-screencopy",
+ "waldo-service",
+ "waldo-socket",
+]
+
+[[package]]
 name = "waldo-niri"
 version = "0.1.0"
 dependencies = [
