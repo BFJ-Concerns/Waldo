@@ -243,11 +243,7 @@ impl KeyboardState {
                         retryable: false,
                     });
                 }
-                Ok(PreparedKeyboardAction::Text(
-                    text.chars()
-                        .map(|character| self.resolve_character(character))
-                        .collect::<Result<Vec<_>, _>>()?,
-                ))
+                Ok(PreparedKeyboardAction::Text(self.resolve_text(text)?))
             }
             _ => Err(ProtocolError {
                 code: ErrorCode::UnsupportedCapability,
@@ -269,7 +265,7 @@ impl KeyboardState {
     }
 
     fn resolve_character(&self, character: char) -> Result<KeyStroke, ProtocolError> {
-        let keysym = xkb::Keysym::from_char(character);
+        let keysym = text_keysym(character);
         self.find_stroke(keysym).ok_or_else(|| ProtocolError {
             code: ErrorCode::UnsupportedCapability,
             message: format!(
@@ -277,6 +273,19 @@ impl KeyboardState {
             ),
             retryable: false,
         })
+    }
+
+    fn resolve_text(&self, text: &str) -> Result<Vec<KeyStroke>, ProtocolError> {
+        let mut characters = text.chars().peekable();
+        let mut strokes = Vec::with_capacity(text.chars().count());
+        while let Some(mut character) = characters.next() {
+            if character == '\r' && characters.peek() == Some(&'\n') {
+                characters.next();
+                character = '\n';
+            }
+            strokes.push(self.resolve_character(character)?);
+        }
+        Ok(strokes)
     }
 
     fn find_stroke(&self, target: xkb::Keysym) -> Option<KeyStroke> {
@@ -453,6 +462,14 @@ fn named_keysym(name: &str) -> Option<xkb::Keysym> {
     (keysym != xkb::Keysym::NoSymbol).then_some(keysym)
 }
 
+fn text_keysym(character: char) -> xkb::Keysym {
+    match character {
+        '\n' | '\r' => xkb::keysyms::KEY_Return.into(),
+        '\t' => xkb::keysyms::KEY_Tab.into(),
+        _ => xkb::Keysym::from_char(character),
+    }
+}
+
 fn evdev_keycode(keycode: xkb::Keycode) -> Option<u32> {
     keycode.raw().checked_sub(XKB_EVDEV_OFFSET)
 }
@@ -541,7 +558,9 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for WaylandState {
 
 #[cfg(test)]
 mod tests {
-    use super::{compile_keymap, evdev_keycode, named_keysym, xkb_layout_for_niri_name};
+    use super::{
+        compile_keymap, evdev_keycode, named_keysym, text_keysym, xkb_layout_for_niri_name,
+    };
     use waldo_protocol::ErrorCode;
     use xkbcommon::xkb;
 
@@ -554,6 +573,14 @@ mod tests {
         );
         assert_eq!(named_keysym("A"), Some(xkb::Keysym::from_char('a')));
         assert_eq!(named_keysym("not-a-real-key"), None);
+    }
+
+    #[test]
+    fn text_control_characters_use_application_keys() {
+        assert_eq!(text_keysym('\n'), xkb::keysyms::KEY_Return.into());
+        assert_eq!(text_keysym('\r'), xkb::keysyms::KEY_Return.into());
+        assert_eq!(text_keysym('\t'), xkb::keysyms::KEY_Tab.into());
+        assert_eq!(text_keysym('A'), xkb::Keysym::from_char('A'));
     }
 
     #[test]
