@@ -2,10 +2,26 @@
 
 use waldo_controller::{ExecutionToken, ObservationGrounding};
 use waldo_protocol::{
-    Action, ActionReceipt, ActionRoute, ErrorCode, LogicalPoint, LogicalRect, OutputState,
-    ProtocolError, ReceiptStatus, StopReason, WindowId, WindowOperation, WindowState,
-    WorkspaceState,
+    Action, ActionOutput, ActionReceipt, ActionRoute, ErrorCode, LogicalPoint, LogicalRect,
+    OutputState, ProtocolError, ReceiptStatus, SourceSelector, StopReason, WindowId,
+    WindowOperation, WindowState, WorkspaceOperation, WorkspaceState,
 };
+
+/// Successful backend execution with its route and optional produced value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActionExecution {
+    pub route: ActionRoute,
+    pub output: Option<ActionOutput>,
+}
+
+impl From<ActionRoute> for ActionExecution {
+    fn from(route: ActionRoute) -> Self {
+        Self {
+            route,
+            output: None,
+        }
+    }
+}
 
 /// Backend seam beneath the controller-owned ordering and safety policy.
 pub trait ActionExecutor: Send + Sync {
@@ -13,7 +29,15 @@ pub trait ActionExecutor: Send + Sync {
         &self,
         action: &Action,
         cancellation: &ExecutionToken,
-    ) -> Result<ActionRoute, ActionExecutionFailure>;
+    ) -> Result<ActionExecution, ActionExecutionFailure>;
+
+    /// Whether this executor has initialised the named live backend route.
+    fn supports(&self, _route: ActionRoute) -> bool {
+        false
+    }
+
+    /// Releases any explicitly held input and tears down its virtual devices.
+    fn release_all(&self) {}
 }
 
 /// A backend failure with an honest statement about whether mutation may have occurred.
@@ -47,7 +71,7 @@ impl ActionExecutor for UnavailableActionExecutor {
         &self,
         _action: &Action,
         _cancellation: &ExecutionToken,
-    ) -> Result<ActionRoute, ActionExecutionFailure> {
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
         Err(ActionExecutionFailure::not_executed(ProtocolError {
             code: ErrorCode::UnsupportedCapability,
             message: "no desktop action backend is initialised".into(),
@@ -79,15 +103,19 @@ pub fn execute_batch(
                 status: ReceiptStatus::NotExecuted,
                 route: None,
                 error: None,
+                predicate_result: None,
+                output: None,
             }));
             break;
         }
         match executor.execute(action, cancellation) {
-            Ok(route) => receipts.push(ActionReceipt {
+            Ok(execution) => receipts.push(ActionReceipt {
                 index,
                 status: ReceiptStatus::Executed,
-                route: Some(route),
+                route: Some(execution.route),
                 error: None,
+                predicate_result: matches!(action, Action::Wait { .. }).then_some(true),
+                output: execution.output,
             }),
             Err(failure) => {
                 let (status, route, error) = match failure {
@@ -104,13 +132,17 @@ pub fn execute_batch(
                     index,
                     status,
                     route,
+                    predicate_result: (error.code == ErrorCode::WaitFailed).then_some(false),
                     error: Some(error),
+                    output: None,
                 });
                 receipts.extend((index + 1..actions.len()).map(|index| ActionReceipt {
                     index,
                     status: ReceiptStatus::NotExecuted,
                     route: None,
                     error: None,
+                    predicate_result: None,
+                    output: None,
                 }));
                 break;
             }
@@ -124,13 +156,17 @@ pub fn execute_batch(
         StopReason::Completed
     } else if cancellation.is_cancelled() {
         StopReason::Cancelled
-    } else if receipts
-        .iter()
-        .any(|receipt| receipt.status != ReceiptStatus::Executed)
-    {
-        StopReason::ExecutionFailed
+    } else if let Some(error) = receipts.iter().find_map(|receipt| receipt.error.as_ref()) {
+        match error.code {
+            ErrorCode::WaitFailed => StopReason::WaitFailed,
+            ErrorCode::StaleObservation => StopReason::StaleObservation,
+            ErrorCode::TargetLost => StopReason::TargetLost,
+            ErrorCode::GeometryChanged => StopReason::GeometryChanged,
+            ErrorCode::FocusChanged => StopReason::FocusChanged,
+            _ => StopReason::ExecutionFailed,
+        }
     } else {
-        StopReason::Completed
+        StopReason::ExecutionFailed
     };
     BatchExecution {
         receipts,
@@ -210,23 +246,28 @@ pub fn validate_grounding(
     {
         return Err(GroundingFailure::GeometryChanged);
     }
-    if actions.iter().any(|action| {
-        let Action::Window { window_id, .. } = action else {
-            return false;
-        };
-        !windows.iter().any(|window| &window.id == window_id)
+    if actions.iter().any(|action| match action {
+        Action::Window { window_id, .. } => !windows.iter().any(|window| &window.id == window_id),
+        Action::Workspace { workspace_id, .. } => !workspaces
+            .iter()
+            .any(|workspace| &workspace.id == workspace_id),
+        _ => false,
     }) {
         return Err(GroundingFailure::TargetLost);
     }
     if actions.iter().any(|action| match action {
         Action::Window {
-            operation: WindowOperation::MoveToWorkspace { workspace },
+            operation: WindowOperation::MoveToWorkspace { workspace_id },
             ..
         } => !workspaces
             .iter()
-            .any(|candidate| candidate.name.as_ref() == Some(workspace)),
+            .any(|candidate| candidate.id == *workspace_id),
         Action::Window {
             operation: WindowOperation::MoveToOutput { output },
+            ..
+        }
+        | Action::Workspace {
+            operation: WorkspaceOperation::MoveToOutput { output },
             ..
         } => !outputs
             .iter()
@@ -234,6 +275,17 @@ pub fn validate_grounding(
         _ => false,
     }) {
         return Err(GroundingFailure::TargetLost);
+    }
+    if let SourceSelector::Window { window_id } = &recorded.source {
+        let window = windows
+            .iter()
+            .find(|window| &window.id == window_id)
+            .ok_or(GroundingFailure::TargetLost)?;
+        if window.output_id.as_ref() != Some(&recorded.output_id)
+            || window.logical_bounds != Some(recorded.observed_logical_bounds)
+        {
+            return Err(GroundingFailure::GeometryChanged);
+        }
     }
     if actions_require_stable_focus(actions) && focused_window != recorded.focused_window.as_ref() {
         return Err(GroundingFailure::FocusChanged);
@@ -352,9 +404,9 @@ mod tests {
             &self,
             action: &Action,
             _cancellation: &ExecutionToken,
-        ) -> Result<ActionRoute, ActionExecutionFailure> {
+        ) -> Result<ActionExecution, ActionExecutionFailure> {
             match action {
-                Action::Capture { .. } => Ok(ActionRoute::Screencopy),
+                Action::Capture { .. } => Ok(ActionRoute::Screencopy.into()),
                 _ => Err(ActionExecutionFailure::not_executed(ProtocolError {
                     code: ErrorCode::BackendFailure,
                     message: "deliberate test failure".into(),
@@ -369,7 +421,7 @@ mod tests {
             &self,
             _action: &Action,
             _cancellation: &ExecutionToken,
-        ) -> Result<ActionRoute, ActionExecutionFailure> {
+        ) -> Result<ActionExecution, ActionExecutionFailure> {
             Err(ActionExecutionFailure::indeterminate(
                 ActionRoute::NiriIpc,
                 ProtocolError {
@@ -386,9 +438,9 @@ mod tests {
             &self,
             _action: &Action,
             cancellation: &ExecutionToken,
-        ) -> Result<ActionRoute, ActionExecutionFailure> {
+        ) -> Result<ActionExecution, ActionExecutionFailure> {
             cancellation.cancel();
-            Ok(ActionRoute::NiriIpc)
+            Ok(ActionRoute::NiriIpc.into())
         }
     }
 
@@ -411,7 +463,9 @@ mod tests {
             scale: 1.0,
             transform: OutputTransform::Normal,
             focused_window: Some(WindowId("41".into())),
+            include_accessibility: false,
             cursor_position: None,
+            frame_fingerprint: 0,
         }
     }
 
@@ -433,6 +487,7 @@ mod tests {
             id: WindowId(id.into()),
             title: None,
             application_id: None,
+            pid: None,
             logical_bounds: None,
             focused: false,
             workspace_id: None,
@@ -535,11 +590,67 @@ mod tests {
     }
 
     #[test]
+    fn direct_window_observations_revalidate_exact_geometry() {
+        let mut recorded = grounding();
+        recorded.source = SourceSelector::Window {
+            window_id: WindowId("17".into()),
+        };
+        let mut current = window("17");
+        current.logical_bounds = Some(recorded.observed_logical_bounds);
+        current.output_id = Some(recorded.output_id.clone());
+
+        assert_eq!(
+            validate_grounding(
+                Some(&recorded),
+                &[output()],
+                &[current.clone()],
+                &[],
+                recorded.focused_window.as_ref(),
+                &[],
+            ),
+            Ok(())
+        );
+
+        current.logical_bounds.as_mut().unwrap().origin.x += 1.0;
+        assert_eq!(
+            validate_grounding(
+                Some(&recorded),
+                &[output()],
+                &[current],
+                &[],
+                recorded.focused_window.as_ref(),
+                &[],
+            ),
+            Err(GroundingFailure::GeometryChanged)
+        );
+    }
+
+    #[test]
+    fn workspace_operations_require_the_stable_workspace_identity() {
+        let action = Action::Workspace {
+            workspace_id: waldo_protocol::WorkspaceId::new(99),
+            operation: WorkspaceOperation::Focus,
+        };
+
+        assert_eq!(
+            validate_grounding(
+                Some(&grounding()),
+                &[output()],
+                &[],
+                &[workspace("research")],
+                None,
+                &[action],
+            ),
+            Err(GroundingFailure::TargetLost)
+        );
+    }
+
+    #[test]
     fn niri_window_moves_require_the_destination_to_still_exist() {
         let to_workspace = Action::Window {
             window_id: WindowId("17".into()),
             operation: WindowOperation::MoveToWorkspace {
-                workspace: "missing".into(),
+                workspace_id: waldo_protocol::WorkspaceId::new(99),
             },
         };
         let to_output = Action::Window {

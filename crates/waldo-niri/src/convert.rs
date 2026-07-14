@@ -97,6 +97,7 @@ pub(crate) fn windows(
                 id: WindowId(window.id.to_string()),
                 title: window.title,
                 application_id: window.app_id,
+                pid: window.pid.and_then(|pid| u32::try_from(pid).ok()),
                 logical_bounds,
                 focused: window.is_focused,
                 workspace_id: window.workspace_id.map(WorkspaceId::new),

@@ -14,13 +14,13 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream},
     sync::oneshot,
 };
-use waldo_action::{ActionExecutionFailure, ActionExecutor};
+use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
 use waldo_controller::ExecutionToken;
 use waldo_mcp::McpServer;
 use waldo_niri::{NiriSnapshot, SessionInspector};
 use waldo_protocol::{
-    Action, ActionRoute, ErrorCode, LogicalPoint, LogicalRect, OutputId, OutputState,
-    OutputTransform, ProtocolError, StopReason,
+    Action, ErrorCode, LogicalPoint, LogicalRect, OutputId, OutputState, OutputTransform,
+    ProtocolError, StopReason,
 };
 use waldo_screencopy::{Capture, CaptureError, ScreenCapturer};
 use waldo_service::ControllerService;
@@ -92,7 +92,7 @@ impl ActionExecutor for BlockingExecutor {
         &self,
         _action: &Action,
         cancellation: &ExecutionToken,
-    ) -> Result<ActionRoute, ActionExecutionFailure> {
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
         let _ = self.started.send(());
         while !cancellation.is_cancelled() {
             std::thread::sleep(Duration::from_millis(2));
@@ -199,8 +199,8 @@ async fn stop_overtakes_and_quiesces_an_active_mcp_act() {
                 "arguments": {
                     "observation_id": observation_id,
                     "actions": [{
-                        "type": "capture",
-                        "source": { "type": "output", "output_id": "DP-1" }
+                        "type": "key_chord",
+                        "keys": ["test"]
                     }],
                     "verification": []
                 }

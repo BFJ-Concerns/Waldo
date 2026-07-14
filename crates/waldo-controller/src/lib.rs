@@ -28,7 +28,11 @@ pub struct ObservationGrounding {
     pub scale: f64,
     pub transform: OutputTransform,
     pub focused_window: Option<WindowId>,
+    /// Whether the observation requested an AT-SPI semantic overlay.
+    pub include_accessibility: bool,
     pub cursor_position: Option<waldo_protocol::LogicalPoint>,
+    /// Process-local fingerprint used only for exact frame-change predicates.
+    pub frame_fingerprint: u64,
 }
 
 /// Cooperative cancellation shared with one currently executing action batch.
@@ -481,7 +485,9 @@ mod tests {
             scale: 1.0,
             transform: waldo_protocol::OutputTransform::Normal,
             focused_window: None,
+            include_accessibility: false,
             cursor_position: None,
+            frame_fingerprint: 0,
         }
     }
 

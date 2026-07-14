@@ -21,8 +21,34 @@ not already authorised.
 2. Observe the relevant output, visible foreground window, or region. Treat the
    returned observation identifier, geometry, focus, target identity, and image
    as one grounding record.
+   A Query `request_id` is only transport correlation and never authorises Act.
+   If a direct window observation fails because the window is not foreground,
+   observe its output first, use that observation ID for a window-focus Act,
+   then observe the focused window directly.
 3. Send one coherent Act batch tied to that observation. Keep ordered actions
    together when they share the same verified target and preconditions.
+   Use Waldo's shared tagged action schema exactly. For example, a compositor
+   focus action is `{"type":"window","window_id":"8","operation":{"type":"focus"}}`;
+   resizing keeps `width` and `height` inside the operation:
+   `{"type":"window","window_id":"20","operation":{"type":"set_size","width":420,"height":380}}`;
+   there is no `focus_window` action variant. Absolute pointer movement is
+   `{"type":"pointer_move_absolute","position":{"x":3600,"y":250}}`, and a
+   primary click adds `"type":"pointer_click"`, `"button":"primary"`, and
+   `"count":1` alongside the position. There is no generic `pointer` action
+   with a nested operation. Deterministic text entry is
+   `{"type":"text","text":"Waldo 42!","route":"virtual_keyboard"}`;
+   a chord is `{"type":"key_chord","keys":["ctrl","a"]}`.
+   Automatic text targets the focused element and has no element field:
+   `{"type":"text","text":"Waldo 42!","route":"automatic"}`. An
+   accessibility action names `"element"` and nests its operation, for example
+   `{"type":"accessibility","element":"element-9","operation":{"type":"invoke","action":"Click"}}`.
+   A wait names `"predicate"`, whose accessibility handle is also called
+   `"element"`:
+   `{"type":"wait","predicate":{"type":"element_state","element":"element-17","state":"focused","present":true},"timeout_ms":500}`.
+   Capture accepts only its source:
+   `{"type":"capture","source":{"type":"window","window_id":"16"}}`.
+   Do not add `target`, `handle`, `condition`, or `include_accessibility` fields
+   to these action variants.
 4. Inspect every receipt and the resulting image. A transport acknowledgement
    or pointer-motion receipt alone does not prove the intended outcome.
 5. Observe again before replanning. If Waldo reports stale geometry, focus, or

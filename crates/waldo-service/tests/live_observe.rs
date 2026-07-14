@@ -27,7 +27,7 @@ fn test_socket() -> PathBuf {
 }
 
 #[tokio::test]
-async fn observation_grounding_reaches_the_fail_closed_action_pipeline() {
+async fn observation_grounding_reaches_capture_and_fail_closed_target_checks() {
     if std::env::var_os("NIRI_SOCKET").is_none() || std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return;
     }
@@ -91,13 +91,14 @@ async fn observation_grounding_reaches_the_fail_closed_action_pipeline() {
     let ServerMessage::Acted { result, .. } = response else {
         panic!("controller did not return an action result");
     };
-    assert_eq!(result.stop_reason, StopReason::ExecutionFailed);
-    assert_eq!(result.first_not_executed, Some(0));
-    assert_eq!(result.receipts[0].status, ReceiptStatus::Failed);
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(result.first_not_executed, None);
+    assert_eq!(result.receipts[0].status, ReceiptStatus::Executed);
     assert_eq!(
-        result.receipts[0].error.as_ref().unwrap().code,
-        waldo_protocol::ErrorCode::UnsupportedCapability
+        result.receipts[0].route,
+        Some(waldo_protocol::ActionRoute::Screencopy)
     );
+    assert_eq!(result.receipts[0].error, None);
     let resulting_observation = result.observation.as_ref().unwrap();
     assert_eq!(result.completion_error, None);
     assert_ne!(resulting_observation.id, observation_id);

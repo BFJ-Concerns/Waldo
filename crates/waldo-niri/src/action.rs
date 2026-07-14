@@ -5,10 +5,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use niri_ipc::{Action as NiriAction, Reply, Request, Response, WorkspaceReferenceArg};
-use waldo_action::{ActionExecutionFailure, ActionExecutor};
+use niri_ipc::{Action as NiriAction, Reply, Request, Response, SizeChange, WorkspaceReferenceArg};
+use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
 use waldo_controller::ExecutionToken;
-use waldo_protocol::{Action, ActionRoute, ErrorCode, ProtocolError, WindowOperation};
+use waldo_protocol::{
+    Action, ActionRoute, ErrorCode, ProtocolError, WindowOperation, WorkspaceOperation,
+};
 
 /// Executes the subset of Waldo actions which Niri can target by window ID.
 #[derive(Clone, Copy, Debug, Default)]
@@ -19,16 +21,20 @@ impl ActionExecutor for NiriActionExecutor {
         &self,
         action: &Action,
         cancellation: &ExecutionToken,
-    ) -> Result<ActionRoute, ActionExecutionFailure> {
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
         execute_with(action, cancellation, send_to_niri)
+    }
+
+    fn supports(&self, route: ActionRoute) -> bool {
+        route == ActionRoute::NiriIpc
     }
 }
 
 fn execute_with(
     action: &Action,
     cancellation: &ExecutionToken,
-    send: impl FnOnce(Request, &ExecutionToken) -> Result<Reply, ActionExecutionFailure>,
-) -> Result<ActionRoute, ActionExecutionFailure> {
+    mut send: impl FnMut(Request, &ExecutionToken) -> Result<Reply, ActionExecutionFailure>,
+) -> Result<ActionExecution, ActionExecutionFailure> {
     if cancellation.is_cancelled() {
         return Err(ActionExecutionFailure::not_executed(ProtocolError {
             code: ErrorCode::Cancelled,
@@ -36,21 +42,71 @@ fn execute_with(
             retryable: false,
         }));
     }
-    let request = translate(action).map_err(ActionExecutionFailure::not_executed)?;
-    match send(request, cancellation)? {
-        Ok(Response::Handled) => Ok(ActionRoute::NiriIpc),
-        Ok(_) => Err(ActionExecutionFailure::indeterminate(
-            ActionRoute::NiriIpc,
-            backend_failure(
-                "Niri returned an unexpected response to a window action",
-                false,
-            ),
-        )),
-        Err(message) => Err(ActionExecutionFailure::not_executed(backend_failure(
-            format!("Niri rejected the window action: {message}"),
-            false,
-        ))),
+    let requests = translate(action).map_err(ActionExecutionFailure::not_executed)?;
+    for (index, request) in requests.into_iter().enumerate() {
+        if cancellation.is_cancelled() {
+            let failure = ActionExecutionFailure::not_executed(cancelled());
+            return Err(if index == 0 {
+                failure
+            } else {
+                partial_execution(failure)
+            });
+        }
+        let reply = send(request, cancellation).map_err(|failure| {
+            if index == 0 {
+                failure
+            } else {
+                partial_execution(failure)
+            }
+        })?;
+        match reply {
+            Ok(Response::Handled) => {}
+            Ok(_) => {
+                return Err(ActionExecutionFailure::indeterminate(
+                    ActionRoute::NiriIpc,
+                    backend_failure(
+                        "Niri returned an unexpected response after action dispatch",
+                        false,
+                    ),
+                ));
+            }
+            Err(message) if index == 0 => {
+                return Err(ActionExecutionFailure::not_executed(backend_failure(
+                    format!("Niri rejected the action: {message}"),
+                    false,
+                )));
+            }
+            Err(message) => {
+                return Err(ActionExecutionFailure::indeterminate(
+                    ActionRoute::NiriIpc,
+                    backend_failure(
+                        format!(
+                            "Niri rejected a later resize step after changing the window: {message}"
+                        ),
+                        false,
+                    ),
+                ));
+            }
+        }
     }
+    Ok(ActionRoute::NiriIpc.into())
+}
+
+fn partial_execution(failure: ActionExecutionFailure) -> ActionExecutionFailure {
+    let error = match failure {
+        ActionExecutionFailure::NotExecuted { error }
+        | ActionExecutionFailure::Indeterminate { error, .. } => error,
+    };
+    ActionExecutionFailure::indeterminate(
+        ActionRoute::NiriIpc,
+        ProtocolError {
+            message: format!(
+                "Niri changed part of the requested window size: {}",
+                error.message
+            ),
+            ..error
+        },
+    )
 }
 
 fn send_to_niri(
@@ -166,37 +222,81 @@ fn read_dispatched_reply(
     }
 }
 
-fn translate(action: &Action) -> Result<Request, ProtocolError> {
-    let Action::Window {
-        window_id,
-        operation,
-    } = action
-    else {
-        return Err(unsupported("this action has no Niri IPC route"));
-    };
-    let id = window_id.0.parse::<u64>().map_err(|_| ProtocolError {
-        code: ErrorCode::InvalidRequest,
-        message: "window IDs supplied to Niri must be unsigned integers".into(),
-        retryable: false,
-    })?;
-
-    let action = match operation {
-        WindowOperation::Focus => NiriAction::FocusWindow { id },
-        WindowOperation::Close => NiriAction::CloseWindow { id: Some(id) },
-        WindowOperation::MoveToWorkspace { workspace } => NiriAction::MoveWindowToWorkspace {
-            window_id: Some(id),
-            reference: WorkspaceReferenceArg::Name(workspace.clone()),
-            focus: false,
-        },
-        WindowOperation::MoveToOutput { output } => NiriAction::MoveWindowToMonitor {
-            id: Some(id),
-            output: output.clone(),
-        },
-        WindowOperation::SetSize { .. } => {
-            return Err(unsupported("atomic Niri window resizing is not available"));
+fn translate(action: &Action) -> Result<Vec<Request>, ProtocolError> {
+    let actions = match action {
+        Action::Window {
+            window_id,
+            operation,
+        } => {
+            let id = window_id.0.parse::<u64>().map_err(|_| ProtocolError {
+                code: ErrorCode::InvalidRequest,
+                message: "window IDs supplied to Niri must be unsigned integers".into(),
+                retryable: false,
+            })?;
+            match operation {
+                WindowOperation::Focus => vec![NiriAction::FocusWindow { id }],
+                WindowOperation::Close => vec![NiriAction::CloseWindow { id: Some(id) }],
+                WindowOperation::MoveToWorkspace { workspace_id } => {
+                    vec![NiriAction::MoveWindowToWorkspace {
+                        window_id: Some(id),
+                        reference: WorkspaceReferenceArg::Id(workspace_id.get()),
+                        focus: false,
+                    }]
+                }
+                WindowOperation::MoveToOutput { output } => {
+                    vec![NiriAction::MoveWindowToMonitor {
+                        id: Some(id),
+                        output: output.clone(),
+                    }]
+                }
+                WindowOperation::SetSize { width, height } => {
+                    let width = fixed_size(*width)?;
+                    let height = fixed_size(*height)?;
+                    vec![
+                        NiriAction::SetWindowWidth {
+                            id: Some(id),
+                            change: SizeChange::SetFixed(width),
+                        },
+                        NiriAction::SetWindowHeight {
+                            id: Some(id),
+                            change: SizeChange::SetFixed(height),
+                        },
+                    ]
+                }
+            }
         }
+        Action::Workspace {
+            workspace_id,
+            operation,
+        } => match operation {
+            WorkspaceOperation::Focus => vec![NiriAction::FocusWorkspace {
+                reference: WorkspaceReferenceArg::Id(workspace_id.get()),
+            }],
+            WorkspaceOperation::MoveToOutput { output } => {
+                vec![NiriAction::MoveWorkspaceToMonitor {
+                    output: output.clone(),
+                    reference: Some(WorkspaceReferenceArg::Id(workspace_id.get())),
+                }]
+            }
+        },
+        _ => return Err(unsupported("this action has no Niri IPC route")),
     };
-    Ok(Request::Action(action))
+    Ok(actions.into_iter().map(Request::Action).collect())
+}
+
+fn fixed_size(value: u32) -> Result<i32, ProtocolError> {
+    if value == 0 {
+        return Err(ProtocolError {
+            code: ErrorCode::InvalidRequest,
+            message: "window dimensions must be greater than zero".into(),
+            retryable: false,
+        });
+    }
+    i32::try_from(value).map_err(|_| ProtocolError {
+        code: ErrorCode::InvalidRequest,
+        message: "window dimension exceeds Niri's supported range".into(),
+        retryable: false,
+    })
 }
 
 fn unsupported(message: &str) -> ProtocolError {
@@ -236,9 +336,12 @@ fn cancelled() -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use niri_ipc::{Action as NiriAction, Request, Response, WorkspaceReferenceArg};
+    use niri_ipc::{Action as NiriAction, Request, Response, SizeChange, WorkspaceReferenceArg};
     use waldo_action::ActionExecutionFailure;
-    use waldo_protocol::{Action, ActionRoute, ClientId, ErrorCode, WindowId, WindowOperation};
+    use waldo_protocol::{
+        Action, ActionRoute, ClientId, ErrorCode, WindowId, WindowOperation, WorkspaceId,
+        WorkspaceOperation,
+    };
 
     use super::{execute_with, translate};
     use waldo_controller::{Controller, ExecutionToken};
@@ -254,35 +357,82 @@ mod tests {
     fn translates_targeted_focus_close_and_moves() {
         assert!(matches!(
             translate(&window(WindowOperation::Focus)),
-            Ok(Request::Action(NiriAction::FocusWindow { id: 42 }))
+            Ok(requests) if matches!(
+                requests.as_slice(),
+                [Request::Action(NiriAction::FocusWindow { id: 42 })]
+            )
         ));
         assert!(matches!(
             translate(&window(WindowOperation::Close)),
-            Ok(Request::Action(NiriAction::CloseWindow { id: Some(42) }))
+            Ok(requests) if matches!(
+                requests.as_slice(),
+                [Request::Action(NiriAction::CloseWindow { id: Some(42) })]
+            )
         ));
         assert!(matches!(
             translate(&window(WindowOperation::MoveToWorkspace {
-                workspace: "research".into(),
+                workspace_id: WorkspaceId::new(7),
             })),
-            Ok(Request::Action(NiriAction::MoveWindowToWorkspace {
-                window_id: Some(42),
-                reference: WorkspaceReferenceArg::Name(name),
-                focus: false,
-            })) if name == "research"
+            Ok(requests) if matches!(
+                requests.as_slice(),
+                [Request::Action(NiriAction::MoveWindowToWorkspace {
+                    window_id: Some(42),
+                    reference: WorkspaceReferenceArg::Id(7),
+                    focus: false,
+                })]
+            )
         ));
         assert!(matches!(
             translate(&window(WindowOperation::MoveToOutput {
                 output: "DP-2".into(),
             })),
-            Ok(Request::Action(NiriAction::MoveWindowToMonitor {
-                id: Some(42),
-                output,
-            })) if output == "DP-2"
+            Ok(requests) if matches!(
+                requests.as_slice(),
+                [Request::Action(NiriAction::MoveWindowToMonitor {
+                    id: Some(42),
+                    output,
+                })] if output == "DP-2"
+            )
         ));
     }
 
     #[test]
-    fn rejects_invalid_ids_resize_and_non_niri_actions() {
+    fn translates_resize_and_workspace_actions() {
+        assert!(matches!(
+            translate(&window(WindowOperation::SetSize {
+                width: 800,
+                height: 600,
+            })),
+            Ok(requests) if matches!(
+                requests.as_slice(),
+                [
+                    Request::Action(NiriAction::SetWindowWidth {
+                        id: Some(42),
+                        change: SizeChange::SetFixed(800),
+                    }),
+                    Request::Action(NiriAction::SetWindowHeight {
+                        id: Some(42),
+                        change: SizeChange::SetFixed(600),
+                    }),
+                ]
+            )
+        ));
+        assert!(matches!(
+            translate(&Action::Workspace {
+                workspace_id: WorkspaceId::new(7),
+                operation: WorkspaceOperation::Focus,
+            }),
+            Ok(requests) if matches!(
+                requests.as_slice(),
+                [Request::Action(NiriAction::FocusWorkspace {
+                    reference: WorkspaceReferenceArg::Id(7),
+                })]
+            )
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_ids_sizes_and_non_niri_actions() {
         let invalid = Action::Window {
             window_id: WindowId("not-niri".into()),
             operation: WindowOperation::Focus,
@@ -293,12 +443,12 @@ mod tests {
         );
         assert_eq!(
             translate(&window(WindowOperation::SetSize {
-                width: 800,
+                width: 0,
                 height: 600,
             }))
             .unwrap_err()
             .code,
-            ErrorCode::UnsupportedCapability
+            ErrorCode::InvalidRequest
         );
         assert_eq!(
             translate(&Action::KeyChord {
@@ -323,7 +473,7 @@ mod tests {
                 Ok(Ok(Response::Handled))
             },
         );
-        assert_eq!(result, Ok(ActionRoute::NiriIpc));
+        assert_eq!(result, Ok(ActionRoute::NiriIpc.into()));
     }
 
     #[test]
@@ -363,6 +513,36 @@ mod tests {
             cancelled,
             ActionExecutionFailure::NotExecuted { error }
                 if error.code == ErrorCode::Cancelled
+        ));
+    }
+
+    #[test]
+    fn resize_reports_indeterminate_when_only_one_dimension_changed() {
+        let mut dispatched = 0;
+        let failure = execute_with(
+            &window(WindowOperation::SetSize {
+                width: 800,
+                height: 600,
+            }),
+            &test_token(),
+            |_, _| {
+                dispatched += 1;
+                if dispatched == 1 {
+                    Ok(Ok(Response::Handled))
+                } else {
+                    Ok(Err("height rejected".into()))
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(dispatched, 2);
+        assert!(matches!(
+            failure,
+            ActionExecutionFailure::Indeterminate {
+                route: ActionRoute::NiriIpc,
+                error,
+            } if error.message.contains("later resize step")
         ));
     }
 

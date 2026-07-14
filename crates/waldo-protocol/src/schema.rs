@@ -28,7 +28,7 @@ mod tests {
     use crate::SCHEMA_MAJOR_VERSION;
 
     #[test]
-    fn initial_schema_uses_major_version_one() {
-        assert_eq!(SCHEMA_MAJOR_VERSION, 1);
+    fn current_schema_uses_major_version_two() {
+        assert_eq!(SCHEMA_MAJOR_VERSION, 2);
     }
 }

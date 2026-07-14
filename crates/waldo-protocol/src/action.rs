@@ -1,7 +1,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{ElementHandle, LogicalDelta, LogicalPoint, ObservationId, SourceSelector, WindowId};
+use crate::{
+    ElementHandle, LogicalDelta, LogicalPoint, ObservationId, SourceSelector, WindowId, WorkspaceId,
+};
 
 /// A pointer button independent of Linux's numeric button codes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -49,9 +51,17 @@ pub enum AccessibilityOperation {
 pub enum WindowOperation {
     Focus,
     Close,
-    MoveToWorkspace { workspace: String },
+    MoveToWorkspace { workspace_id: WorkspaceId },
     MoveToOutput { output: String },
     SetSize { width: u32, height: u32 },
+}
+
+/// Niri-native operations against a positively identified workspace.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspaceOperation {
+    Focus,
+    MoveToOutput { output: String },
 }
 
 /// Mechanical conditions which may be waited for or verified.
@@ -137,6 +147,10 @@ pub enum Action {
     Window {
         window_id: WindowId,
         operation: WindowOperation,
+    },
+    Workspace {
+        workspace_id: WorkspaceId,
+        operation: WorkspaceOperation,
     },
     Wait {
         predicate: Predicate,

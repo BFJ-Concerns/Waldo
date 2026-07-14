@@ -97,6 +97,7 @@ pub enum ActionRoute {
     VirtualKeyboard,
     Accessibility,
     Clipboard,
+    ClipboardPaste,
     NiriIpc,
     Screencopy,
     ControllerWait,
@@ -111,6 +112,16 @@ pub enum ReceiptStatus {
     /// The backend may have acted, but its authoritative acknowledgement was lost.
     Indeterminate,
     NotExecuted,
+}
+
+/// Non-structural data returned by an action which produces a value.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActionOutput {
+    Clipboard {
+        mime_type: String,
+        data_base64: String,
+    },
 }
 
 /// Why an action batch stopped before nominal completion.
@@ -137,6 +148,12 @@ pub struct ActionReceipt {
     pub status: ReceiptStatus,
     pub route: Option<ActionRoute>,
     pub error: Option<ProtocolError>,
+    /// Mechanical outcome for a wait action; absent for other action kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate_result: Option<bool>,
+    /// Value produced by this action, absent for actions which only mutate state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<ActionOutput>,
 }
 
 /// Result of an ordered action batch and its automatic settled observation.

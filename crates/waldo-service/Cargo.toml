@@ -10,11 +10,15 @@ clap.workspace = true
 nix.workspace = true
 tokio.workspace = true
 waldo-action = { path = "../waldo-action" }
+waldo-accessibility = { path = "../waldo-accessibility" }
+waldo-clipboard = { path = "../waldo-clipboard" }
 waldo-controller = { path = "../waldo-controller" }
 waldo-niri = { path = "../waldo-niri" }
 waldo-protocol = { path = "../waldo-protocol" }
 waldo-screencopy = { path = "../waldo-screencopy" }
 waldo-socket = { path = "../waldo-socket" }
+waldo-virtual-pointer = { path = "../waldo-virtual-pointer" }
+waldo-virtual-keyboard = { path = "../waldo-virtual-keyboard" }
 
 [lib]
 path = "src/lib.rs"

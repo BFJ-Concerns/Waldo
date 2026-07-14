@@ -70,6 +70,9 @@ pub struct WindowState {
     pub id: WindowId,
     pub title: Option<String>,
     pub application_id: Option<String>,
+    /// Process which owns the window's Wayland connection, where Niri knows it.
+    #[serde(default)]
+    pub pid: Option<u32>,
     pub logical_bounds: Option<LogicalRect>,
     pub focused: bool,
     pub workspace_id: Option<WorkspaceId>,

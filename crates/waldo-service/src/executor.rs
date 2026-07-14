@@ -1,0 +1,296 @@
+use std::{
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
+
+use waldo_accessibility::AccessibilityBackend;
+use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
+use waldo_clipboard::ClipboardExecutor;
+use waldo_controller::ExecutionToken;
+use waldo_niri::NiriActionExecutor;
+use waldo_protocol::{Action, ActionRoute, ErrorCode, ProtocolError, TextRoutePreference};
+use waldo_virtual_keyboard::VirtualKeyboardExecutor;
+use waldo_virtual_pointer::VirtualPointerExecutor;
+
+/// Routes each action to the one live backend which owns its semantics.
+pub(crate) struct DesktopActionExecutor {
+    niri: NiriActionExecutor,
+    pointer: Option<VirtualPointerExecutor>,
+    keyboard: Option<VirtualKeyboardExecutor>,
+    clipboard: Option<ClipboardExecutor>,
+    accessibility: Option<Arc<AccessibilityBackend>>,
+}
+
+impl DesktopActionExecutor {
+    pub(crate) fn initialise(
+        accessibility: Option<Arc<AccessibilityBackend>>,
+        active_keyboard_layout: Option<String>,
+    ) -> Self {
+        Self {
+            niri: NiriActionExecutor,
+            pointer: VirtualPointerExecutor::initialise().ok(),
+            keyboard: active_keyboard_layout
+                .as_deref()
+                .and_then(|layout| VirtualKeyboardExecutor::initialise(layout).ok()),
+            clipboard: ClipboardExecutor::initialise().ok(),
+            accessibility,
+        }
+    }
+
+    fn execute_text(
+        &self,
+        text: &str,
+        route: TextRoutePreference,
+        cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        match route {
+            TextRoutePreference::Accessibility => self.accessibility_text(text, cancellation),
+            TextRoutePreference::ClipboardPaste => self.clipboard_paste(text, cancellation),
+            TextRoutePreference::VirtualKeyboard => self.virtual_keyboard_text(text, cancellation),
+            TextRoutePreference::Automatic => {
+                match self.accessibility_text(text, cancellation) {
+                    Ok(execution) => return Ok(execution),
+                    Err(ActionExecutionFailure::Indeterminate { route, error }) => {
+                        return Err(ActionExecutionFailure::Indeterminate { route, error });
+                    }
+                    Err(ActionExecutionFailure::NotExecuted { .. }) => {}
+                }
+                match self.clipboard_paste(text, cancellation) {
+                    Ok(execution) => Ok(execution),
+                    Err(ActionExecutionFailure::Indeterminate { route, error }) => {
+                        Err(ActionExecutionFailure::Indeterminate { route, error })
+                    }
+                    Err(ActionExecutionFailure::NotExecuted { .. }) => {
+                        self.virtual_keyboard_text(text, cancellation)
+                    }
+                }
+            }
+        }
+    }
+
+    fn accessibility_text(
+        &self,
+        text: &str,
+        cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        self.accessibility
+            .as_ref()
+            .ok_or_else(|| unsupported("AT-SPI text entry is unavailable"))?
+            .set_focused_text(text, cancellation)
+    }
+
+    fn virtual_keyboard_text(
+        &self,
+        text: &str,
+        cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        self.keyboard
+            .as_ref()
+            .ok_or_else(|| unsupported("Wayland virtual-keyboard text entry is unavailable"))?
+            .execute(
+                &Action::Text {
+                    text: text.to_owned(),
+                    route: TextRoutePreference::VirtualKeyboard,
+                },
+                cancellation,
+            )
+    }
+
+    fn clipboard_paste(
+        &self,
+        text: &str,
+        cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        let clipboard = self
+            .clipboard
+            .as_ref()
+            .ok_or_else(|| unsupported("Wayland clipboard paste is unavailable"))?;
+        let keyboard = self
+            .keyboard
+            .as_ref()
+            .ok_or_else(|| unsupported("clipboard paste requires the virtual keyboard"))?;
+        let snapshot = clipboard
+            .snapshot()
+            .map_err(ActionExecutionFailure::not_executed)?;
+        clipboard
+            .offer_text_once(text)
+            .map_err(as_clipboard_paste_failure)?;
+        let key_result = keyboard.execute(
+            &Action::KeyChord {
+                keys: vec!["Control".into(), "v".into()],
+            },
+            cancellation,
+        );
+        if let Err(failure) = key_result {
+            return restore_after_failure(clipboard, snapshot, failure);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if cancellation.is_cancelled() {
+                let failure = ActionExecutionFailure::indeterminate(
+                    ActionRoute::ClipboardPaste,
+                    ProtocolError {
+                        code: ErrorCode::Cancelled,
+                        message: "clipboard paste was cancelled after key dispatch".into(),
+                        retryable: false,
+                    },
+                );
+                return restore_after_failure(clipboard, snapshot, failure);
+            }
+            match clipboard.is_empty() {
+                Ok(true) => break,
+                Ok(false) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(false) => {
+                    let failure = ActionExecutionFailure::indeterminate(
+                        ActionRoute::ClipboardPaste,
+                        ProtocolError {
+                            code: ErrorCode::BackendFailure,
+                            message: "application did not consume the temporary clipboard before the paste deadline".into(),
+                            retryable: true,
+                        },
+                    );
+                    return restore_after_failure(clipboard, snapshot, failure);
+                }
+                Err(error) => {
+                    let failure =
+                        ActionExecutionFailure::indeterminate(ActionRoute::ClipboardPaste, error);
+                    return restore_after_failure(clipboard, snapshot, failure);
+                }
+            }
+        }
+        clipboard.restore(snapshot).map_err(|error| {
+            ActionExecutionFailure::indeterminate(ActionRoute::ClipboardPaste, error)
+        })?;
+        Ok(ActionRoute::ClipboardPaste.into())
+    }
+}
+
+impl ActionExecutor for DesktopActionExecutor {
+    fn execute(
+        &self,
+        action: &Action,
+        cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        match action {
+            Action::PointerMoveAbsolute { .. }
+            | Action::PointerMoveRelative { .. }
+            | Action::PointerButton { .. }
+            | Action::PointerClick { .. }
+            | Action::PointerDrag { .. }
+            | Action::PointerPath { .. }
+            | Action::Scroll { .. } => self
+                .pointer
+                .as_ref()
+                .ok_or_else(|| {
+                    ActionExecutionFailure::not_executed(ProtocolError {
+                        code: ErrorCode::UnsupportedCapability,
+                        message: "Wayland virtual-pointer backend is unavailable".into(),
+                        retryable: true,
+                    })
+                })?
+                .execute(action, cancellation),
+            Action::Key { .. } | Action::KeyChord { .. } => self
+                .keyboard
+                .as_ref()
+                .ok_or_else(|| {
+                    ActionExecutionFailure::not_executed(ProtocolError {
+                        code: ErrorCode::UnsupportedCapability,
+                        message: "Wayland virtual-keyboard backend is unavailable".into(),
+                        retryable: true,
+                    })
+                })?
+                .execute(action, cancellation),
+            Action::Text { text, route } => self.execute_text(text, *route, cancellation),
+            Action::ClipboardRead { .. } | Action::ClipboardWrite { .. } => self
+                .clipboard
+                .as_ref()
+                .ok_or_else(|| {
+                    ActionExecutionFailure::not_executed(ProtocolError {
+                        code: ErrorCode::UnsupportedCapability,
+                        message: "Wayland clipboard backend is unavailable".into(),
+                        retryable: true,
+                    })
+                })?
+                .execute(action, cancellation),
+            Action::Accessibility { .. } => self
+                .accessibility
+                .as_ref()
+                .ok_or_else(|| {
+                    ActionExecutionFailure::not_executed(ProtocolError {
+                        code: ErrorCode::UnsupportedCapability,
+                        message: "AT-SPI backend is unavailable".into(),
+                        retryable: true,
+                    })
+                })?
+                .execute(action, cancellation),
+            _ => self.niri.execute(action, cancellation),
+        }
+    }
+
+    fn supports(&self, route: ActionRoute) -> bool {
+        match route {
+            ActionRoute::NiriIpc => self.niri.supports(route),
+            ActionRoute::VirtualPointer => self
+                .pointer
+                .as_ref()
+                .is_some_and(|pointer| pointer.supports(route)),
+            ActionRoute::VirtualKeyboard => self
+                .keyboard
+                .as_ref()
+                .is_some_and(|keyboard| keyboard.supports(route)),
+            ActionRoute::Clipboard => self
+                .clipboard
+                .as_ref()
+                .is_some_and(|clipboard| clipboard.supports(route)),
+            ActionRoute::ClipboardPaste => self.clipboard.is_some() && self.keyboard.is_some(),
+            ActionRoute::Accessibility => self
+                .accessibility
+                .as_ref()
+                .is_some_and(|accessibility| accessibility.supports(route)),
+            _ => false,
+        }
+    }
+
+    fn release_all(&self) {
+        if let Some(pointer) = &self.pointer {
+            pointer.release_all();
+        }
+        if let Some(keyboard) = &self.keyboard {
+            keyboard.release_all();
+        }
+    }
+}
+
+fn unsupported(message: &str) -> ActionExecutionFailure {
+    ActionExecutionFailure::not_executed(ProtocolError {
+        code: ErrorCode::UnsupportedCapability,
+        message: message.into(),
+        retryable: false,
+    })
+}
+
+fn as_clipboard_paste_failure(failure: ActionExecutionFailure) -> ActionExecutionFailure {
+    match failure {
+        ActionExecutionFailure::NotExecuted { error } => {
+            ActionExecutionFailure::NotExecuted { error }
+        }
+        ActionExecutionFailure::Indeterminate { error, .. } => {
+            ActionExecutionFailure::indeterminate(ActionRoute::ClipboardPaste, error)
+        }
+    }
+}
+
+fn restore_after_failure(
+    clipboard: &ClipboardExecutor,
+    snapshot: waldo_clipboard::ClipboardSnapshot,
+    failure: ActionExecutionFailure,
+) -> Result<ActionExecution, ActionExecutionFailure> {
+    clipboard.restore(snapshot).map_err(|error| {
+        ActionExecutionFailure::indeterminate(ActionRoute::ClipboardPaste, error)
+    })?;
+    Err(as_clipboard_paste_failure(failure))
+}

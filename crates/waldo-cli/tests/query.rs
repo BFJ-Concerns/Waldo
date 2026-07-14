@@ -65,5 +65,5 @@ async fn schema_does_not_require_a_running_controller() {
     .await
     .unwrap();
 
-    assert_eq!(result["schema_major"], 1);
+    assert_eq!(result["schema_major"], waldo_protocol::SCHEMA_MAJOR_VERSION);
 }

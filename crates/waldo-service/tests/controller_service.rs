@@ -9,13 +9,14 @@ use std::{
 };
 
 use tokio::{io::AsyncWriteExt, sync::oneshot};
-use waldo_action::{ActionExecutionFailure, ActionExecutor};
+use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
 use waldo_controller::ExecutionToken;
 use waldo_niri::{NiriSnapshot, SessionInspector, UnavailableInspector};
 use waldo_protocol::{
     Action, ActionRoute, ClientId, ClientMessage, ErrorCode, LogicalPoint, LogicalRect,
-    ObserveRequest, OutputId, OutputState, OutputTransform, ProtocolError, QueryRequest, RequestId,
-    SCHEMA_MAJOR_VERSION, ServerMessage, SourceSelector, StopReason, StopRequest,
+    ObserveRequest, OutputId, OutputState, OutputTransform, Predicate, ProtocolError, QueryRequest,
+    RequestId, SCHEMA_MAJOR_VERSION, ServerMessage, SourceSelector, StopReason, StopRequest,
+    WindowId,
 };
 use waldo_screencopy::{Capture, CaptureError, ScreenCapturer};
 use waldo_service::ControllerService;
@@ -27,7 +28,7 @@ static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 struct FixedInspector;
 
 impl SessionInspector for FixedInspector {
-    fn inspect(&self, _include_windows: bool) -> Result<NiriSnapshot, waldo_niri::InspectionError> {
+    fn inspect(&self, include_windows: bool) -> Result<NiriSnapshot, waldo_niri::InspectionError> {
         let mut snapshot = NiriSnapshot::unavailable("test session");
         snapshot.outputs = vec![OutputState {
             id: OutputId("DP-1".into()),
@@ -45,6 +46,19 @@ impl SessionInspector for FixedInspector {
             transform: OutputTransform::Normal,
             focused: true,
         }];
+        snapshot.focused_window = Some(WindowId("41".into()));
+        if include_windows {
+            snapshot.windows = vec![waldo_protocol::WindowState {
+                id: WindowId("41".into()),
+                title: Some("test window".into()),
+                application_id: Some("waldo-test".into()),
+                pid: None,
+                logical_bounds: None,
+                focused: true,
+                workspace_id: None,
+                output_id: Some(OutputId("DP-1".into())),
+            }];
+        }
         Ok(snapshot)
     }
 }
@@ -107,10 +121,10 @@ impl ScreenCapturer for FailingFinalCapturer {
     }
 
     fn capture_output(&self, output_name: &str) -> Result<Capture, CaptureError> {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            FixedCapturer.capture_output(output_name)
-        } else {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 2 {
             Err(CaptureError::CompositorFailed)
+        } else {
+            FixedCapturer.capture_output(output_name)
         }
     }
 
@@ -129,13 +143,31 @@ impl ScreenCapturer for FailingFinalCapturer {
 #[derive(Clone, Copy)]
 struct SuccessfulExecutor;
 
+struct ReleaseTrackingExecutor {
+    releases: Arc<AtomicUsize>,
+}
+
 impl ActionExecutor for SuccessfulExecutor {
     fn execute(
         &self,
         _action: &Action,
         _cancellation: &ExecutionToken,
-    ) -> Result<ActionRoute, ActionExecutionFailure> {
-        Ok(ActionRoute::Screencopy)
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        Ok(ActionRoute::Screencopy.into())
+    }
+}
+
+impl ActionExecutor for ReleaseTrackingExecutor {
+    fn execute(
+        &self,
+        _action: &Action,
+        _cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        Ok(ActionRoute::Screencopy.into())
+    }
+
+    fn release_all(&self) {
+        self.releases.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -144,7 +176,7 @@ impl ActionExecutor for BlockingExecutor {
         &self,
         _action: &Action,
         cancellation: &ExecutionToken,
-    ) -> Result<ActionRoute, ActionExecutionFailure> {
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
         let _ = self.started.send(());
         while !cancellation.is_cancelled() {
             std::thread::sleep(Duration::from_millis(2));
@@ -215,8 +247,8 @@ async fn connect_and_start_capture(path: &PathBuf, client_name: &str) -> tokio::
             request_id: RequestId::new(3),
             request: waldo_protocol::ActRequest {
                 observation_id: observation.id,
-                actions: vec![Action::Capture {
-                    source: observation.source,
+                actions: vec![Action::KeyChord {
+                    keys: vec!["test".into()],
                 }],
                 verification: Vec::new(),
             },
@@ -565,6 +597,157 @@ async fn abnormal_client_disconnect_waits_for_executor_quiescence() {
 }
 
 #[tokio::test]
+async fn wait_and_capture_actions_return_predicate_and_selected_frame_evidence() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("wait-capture-test").unwrap())
+        .await
+        .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let region = LogicalRect {
+        origin: LogicalPoint { x: 10.0, y: 20.0 },
+        width: 100.0,
+        height: 80.0,
+    };
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![
+                    Action::Wait {
+                        predicate: Predicate::ProcessExited { pid: u32::MAX },
+                        timeout_ms: 0,
+                    },
+                    Action::Capture {
+                        source: SourceSelector::Region {
+                            output_id: OutputId("DP-1".into()),
+                            region,
+                        },
+                    },
+                ],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("wait/capture batch did not return an Act result")
+    };
+
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(result.receipts[0].route, Some(ActionRoute::ControllerWait));
+    assert_eq!(result.receipts[0].predicate_result, Some(true));
+    assert_eq!(result.receipts[1].route, Some(ActionRoute::Screencopy));
+    assert_eq!(result.receipts[1].predicate_result, None);
+    assert_eq!(
+        result.observation.unwrap().source,
+        SourceSelector::Region {
+            output_id: OutputId("DP-1".into()),
+            region,
+        }
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn false_wait_stops_the_batch_with_a_false_predicate_receipt() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("failed-wait-test").unwrap())
+        .await
+        .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![Action::Wait {
+                    predicate: Predicate::ProcessExited {
+                        pid: std::process::id(),
+                    },
+                    timeout_ms: 0,
+                }],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("failed wait did not return an Act result")
+    };
+
+    assert_eq!(result.stop_reason, StopReason::WaitFailed);
+    assert_eq!(result.receipts[0].predicate_result, Some(false));
+    assert_eq!(
+        result.receipts[0].error.as_ref().unwrap().code,
+        ErrorCode::WaitFailed
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
 async fn final_capture_failure_preserves_receipts_for_executed_actions() {
     let path = test_socket();
     let service = ControllerService::bind_with_all_backends(
@@ -637,12 +820,15 @@ async fn final_capture_failure_preserves_receipts_for_executed_actions() {
 #[tokio::test]
 async fn service_queries_enforce_the_configured_idle_lease_expiry() {
     let path = test_socket();
+    let releases = Arc::new(AtomicUsize::new(0));
     let service = ControllerService::bind_with_all_backends(
         &path,
         Duration::ZERO,
         Arc::new(FixedInspector),
         Arc::new(FixedCapturer),
-        Arc::new(SuccessfulExecutor),
+        Arc::new(ReleaseTrackingExecutor {
+            releases: Arc::clone(&releases),
+        }),
     )
     .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -692,6 +878,70 @@ async fn service_queries_enforce_the_configured_idle_lease_expiry() {
         panic!("controller did not return lease state")
     };
     assert_eq!(result.driving_session, None);
+    assert!(
+        releases.load(Ordering::SeqCst) >= 1,
+        "idle lease expiry must release backend-held input"
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn act_returns_mechanical_post_action_verification_results() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("verification-test").unwrap())
+        .await
+        .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: Vec::new(),
+                verification: vec![Predicate::FocusedWindow {
+                    window_id: WindowId("41".into()),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("verified action did not return an Act result")
+    };
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(result.verification, vec![true]);
 
     drop(client);
     shutdown_tx.send(()).unwrap();

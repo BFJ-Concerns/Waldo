@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+plugin_home="${WALDO_PLUGIN_HOME:-$HOME/plugins/waldo}"
+marketplace="${WALDO_MARKETPLACE:-$HOME/.agents/plugins/marketplace.json}"
+service_file="$HOME/.config/systemd/user/waldod.service"
+profile_file="${XDG_STATE_HOME:-$HOME/.local/state}/waldo/environment.json"
+
+for command in cargo codex jq rsync systemctl; do
+    command -v "$command" >/dev/null || {
+        printf 'Waldo installation requires %s on PATH.\n' "$command" >&2
+        exit 1
+    }
+done
+
+if [[ -z "${XDG_RUNTIME_DIR:-}" || -z "${WAYLAND_DISPLAY:-}" || -z "${NIRI_SOCKET:-}" ]]; then
+    printf 'Run the installer inside the active Niri graphical session.\n' >&2
+    exit 1
+fi
+
+cargo install --locked --force --path "$repo_root/crates/waldo-service"
+cargo install --locked --force --path "$repo_root/crates/waldo-cli"
+cargo install --locked --force --path "$repo_root/crates/waldo-mcp"
+
+install -d -m 0755 "$(dirname -- "$service_file")"
+install -m 0644 "$repo_root/packaging/waldod.service" "$service_file"
+systemctl --user import-environment \
+    XDG_RUNTIME_DIR WAYLAND_DISPLAY NIRI_SOCKET DBUS_SESSION_BUS_ADDRESS
+systemctl --user daemon-reload
+systemctl --user enable waldod.service
+systemctl --user restart waldod.service
+
+install -d -m 0755 "$plugin_home"
+rsync -a --delete "$repo_root/plugins/waldo/" "$plugin_home/"
+cachebuster="$(date -u +%Y%m%d%H%M%S)"
+plugin_manifest="$plugin_home/.codex-plugin/plugin.json"
+plugin_manifest_tmp="$(mktemp)"
+jq --arg cachebuster "$cachebuster" \
+    '.version = ((.version | split("+")[0]) + "+codex." + $cachebuster)' \
+    "$plugin_manifest" >"$plugin_manifest_tmp"
+install -m 0644 "$plugin_manifest_tmp" "$plugin_manifest"
+rm -f "$plugin_manifest_tmp"
+
+install -d -m 0755 "$(dirname -- "$marketplace")"
+marketplace_tmp="$(mktemp)"
+if [[ -f "$marketplace" ]]; then
+    jq '.name = "personal"
+        | .interface = (.interface // {"displayName":"Personal"})
+        | .plugins = ((.plugins // []) | map(select(.name != "waldo")) + [{
+            "name":"waldo",
+            "source":{"source":"local","path":"./plugins/waldo"},
+            "policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},
+            "category":"Productivity"
+        }])' "$marketplace" >"$marketplace_tmp"
+else
+    jq -n '{
+        "name":"personal",
+        "interface":{"displayName":"Personal"},
+        "plugins":[{
+            "name":"waldo",
+            "source":{"source":"local","path":"./plugins/waldo"},
+            "policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},
+            "category":"Productivity"
+        }]
+    }' >"$marketplace_tmp"
+fi
+install -m 0644 "$marketplace_tmp" "$marketplace"
+rm -f "$marketplace_tmp"
+codex plugin add waldo@personal
+
+for _ in {1..50}; do
+    [[ -S "$XDG_RUNTIME_DIR/waldo/controller.sock" ]] && break
+    sleep 0.1
+done
+if [[ ! -S "$XDG_RUNTIME_DIR/waldo/controller.sock" ]]; then
+    printf 'Waldo controller did not create its private socket.\n' >&2
+    systemctl --user status waldod.service --no-pager >&2 || true
+    exit 1
+fi
+
+install -d -m 0700 "$(dirname -- "$profile_file")"
+profile_tmp="$(mktemp)"
+recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+waldo query | jq --arg recorded_at "$recorded_at" '{
+    recorded_at: $recorded_at,
+    profile: .result.profile,
+    capabilities: .result.capabilities,
+    outputs: .result.outputs,
+    keyboard_layouts: .result.keyboard_layouts,
+    active_keyboard_layout: .result.active_keyboard_layout
+}' >"$profile_tmp"
+install -m 0600 "$profile_tmp" "$profile_file"
+rm -f "$profile_tmp"
+
+printf 'Installed Waldo, enabled waldod.service, and recorded %s\n' "$profile_file"

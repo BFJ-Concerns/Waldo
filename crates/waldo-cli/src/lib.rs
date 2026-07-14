@@ -11,8 +11,8 @@ use clap::{Parser, Subcommand};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use waldo_protocol::{
-    ClientId, ClientMessage, ConnectionId, HandoverRequest, QueryRequest, RequestId, StopRequest,
-    published_schema,
+    ActRequest, ClientId, ClientMessage, ConnectionId, HandoverRequest, ObserveRequest,
+    QueryRequest, RequestId, ServerMessage, StopRequest, published_schema,
 };
 use waldo_socket::{ControllerClient, TransportError, default_socket_path};
 
@@ -49,6 +49,9 @@ pub enum Command {
     Act {
         /// JSON document path, or '-' for standard input.
         document: PathBuf,
+        /// ObserveRequest document used to ground this action on the same connection.
+        #[arg(long)]
+        observe: Option<PathBuf>,
     },
     /// Cancel and release this connection's driving session.
     Stop,
@@ -71,6 +74,7 @@ pub enum CliError {
     Transport(TransportError),
     InvalidClientId(waldo_protocol::InvalidClientId),
     HelloDocument,
+    SharedStdin,
 }
 
 impl fmt::Display for CliError {
@@ -83,6 +87,9 @@ impl fmt::Display for CliError {
             Self::HelloDocument => formatter.write_str(
                 "send documents cannot contain hello; the CLI performs the authenticated handshake",
             ),
+            Self::SharedStdin => formatter.write_str(
+                "the action and grounding observation documents cannot both use standard input",
+            ),
         }
     }
 }
@@ -94,7 +101,7 @@ impl Error for CliError {
             Self::Json(error) => Some(error),
             Self::Transport(error) => Some(error),
             Self::InvalidClientId(error) => Some(error),
-            Self::HelloDocument => None,
+            Self::HelloDocument | Self::SharedStdin => None,
         }
     }
 }
@@ -130,6 +137,33 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
     let client_id = ClientId::new(arguments.client_id).map_err(CliError::InvalidClientId)?;
     let mut client = ControllerClient::connect(&socket, client_id).await?;
     let request_id = RequestId::new(2);
+    if let Command::Act { document, observe } = arguments.command {
+        let mut request: ActRequest = read_document(&document)?;
+        if let Some(observe_document) = observe {
+            if document == Path::new("-") && observe_document == Path::new("-") {
+                return Err(CliError::SharedStdin);
+            }
+            let observation_request: ObserveRequest = read_document(&observe_document)?;
+            let observed = client
+                .request(&ClientMessage::Observe {
+                    request_id,
+                    request: observation_request,
+                })
+                .await?;
+            let ServerMessage::Observed { observation, .. } = observed else {
+                return Ok(serde_json::to_value(observed)?);
+            };
+            request.observation_id = observation.id;
+        }
+        return Ok(serde_json::to_value(
+            client
+                .request(&ClientMessage::Act {
+                    request_id: RequestId::new(3),
+                    request,
+                })
+                .await?,
+        )?);
+    }
     let message = match arguments.command {
         Command::Schema => unreachable!("schema returned before opening the controller socket"),
         Command::Query { include_windows } => ClientMessage::Query {
@@ -140,10 +174,7 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
             request_id,
             request: read_document(&document)?,
         },
-        Command::Act { document } => ClientMessage::Act {
-            request_id,
-            request: read_document(&document)?,
-        },
+        Command::Act { .. } => unreachable!("Act returned through its composed CLI path"),
         Command::Stop => ClientMessage::Stop {
             request_id,
             request: StopRequest::default(),
@@ -186,7 +217,25 @@ mod tests {
     fn action_documents_have_a_direct_cli_route() {
         let arguments = Arguments::try_parse_from(["waldo", "act", "batch.json"]).unwrap();
 
-        assert!(matches!(arguments.command, Command::Act { .. }));
+        assert!(matches!(
+            arguments.command,
+            Command::Act { observe: None, .. }
+        ));
+    }
+
+    #[test]
+    fn act_can_ground_a_saved_batch_on_the_same_controller_connection() {
+        let arguments =
+            Arguments::try_parse_from(["waldo", "act", "batch.json", "--observe", "source.json"])
+                .unwrap();
+
+        assert!(matches!(
+            arguments.command,
+            Command::Act {
+                observe: Some(path),
+                ..
+            } if path == std::path::Path::new("source.json")
+        ));
     }
 
     #[test]

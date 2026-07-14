@@ -17,18 +17,28 @@ pub(crate) async fn dispatch(
     act_ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> ServerMessage {
     let request_id = message.request_id();
-    state
+    let expired = state
         .controller
         .lock()
         .await
         .expire_idle_lease(state.elapsed());
+    if expired {
+        state.executor.release_all();
+    }
     match message {
         ClientMessage::Hello { .. } => ServerMessage::Error {
             request_id: Some(request_id),
             error: invalid_request("hello is only valid as the first message"),
         },
         ClientMessage::Observe { request, .. } => {
-            observe(request_id, request.source, state, connection_id).await
+            observe(
+                request_id,
+                request.source,
+                request.include_accessibility,
+                state,
+                connection_id,
+            )
+            .await
         }
         ClientMessage::Act { request, .. } => {
             act(request_id, request, state, connection_id, act_ready).await
@@ -45,6 +55,11 @@ pub(crate) async fn dispatch(
                 Err(error) => return inspection_error(request_id, error.to_string()),
             };
             enable_capture_capability(&mut snapshot.capabilities, state.capturer.as_ref());
+            crate::server::enable_action_capabilities(
+                &mut snapshot.capabilities,
+                state.executor.as_ref(),
+            );
+            merge_controller_capabilities(&mut snapshot.capabilities, &state.capabilities);
             let controller = state.controller.lock().await;
             let driving = controller.driving_session();
             ServerMessage::Queried {
@@ -68,18 +83,28 @@ pub(crate) async fn dispatch(
             let mut controller = state.controller.lock().await;
             let previous = controller.driving_session().map(|session| session.id());
             match controller.handover(connection_id, request.target, state.elapsed()) {
-                Ok(session) => ServerMessage::HandedOver {
-                    request_id,
-                    result: HandoverResult {
-                        previous_session: previous.expect("handover requires an active lease"),
-                        driving_session: session.id(),
-                        owner: session.owner(),
-                    },
-                },
+                Ok(session) => {
+                    state.executor.release_all();
+                    ServerMessage::HandedOver {
+                        request_id,
+                        result: HandoverResult {
+                            previous_session: previous.expect("handover requires an active lease"),
+                            driving_session: session.id(),
+                            owner: session.owner(),
+                        },
+                    }
+                }
                 Err(error) => lease_error(request_id, error),
             }
         }
     }
+}
+
+fn merge_controller_capabilities(
+    inspected: &mut waldo_protocol::Capabilities,
+    controller: &waldo_protocol::Capabilities,
+) {
+    inspected.accessibility = controller.accessibility.clone();
 }
 
 fn inspection_error(request_id: RequestId, message: String) -> ServerMessage {
@@ -109,6 +134,7 @@ async fn stop(
     match stopped {
         Ok(()) | Err(LeaseError::NoActiveLease) => {
             state.wait_for_execution(connection_id).await;
+            state.executor.release_all();
             ServerMessage::Stopped {
                 request_id,
                 result: StopResult {
@@ -142,5 +168,28 @@ pub(crate) fn lease_error(request_id: RequestId, error: LeaseError) -> ServerMes
             message: error.to_string(),
             retryable: matches!(error, LeaseError::HeldBy(_)),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use waldo_protocol::{BackendCapability, Capabilities};
+
+    use super::merge_controller_capabilities;
+
+    #[test]
+    fn query_capabilities_preserve_the_controller_accessibility_probe() {
+        let mut inspected = Capabilities::unavailable();
+        inspected.accessibility = BackendCapability::unavailable("AT-SPI has not been probed");
+        let mut controller = Capabilities::unavailable();
+        controller.accessibility = BackendCapability {
+            available: true,
+            version: Some("2".into()),
+            limitation: None,
+        };
+
+        merge_controller_capabilities(&mut inspected, &controller);
+
+        assert_eq!(inspected.accessibility, controller.accessibility);
     }
 }

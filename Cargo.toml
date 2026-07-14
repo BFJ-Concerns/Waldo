@@ -1,7 +1,9 @@
 [workspace]
 members = [
     "crates/waldo-action",
+    "crates/waldo-accessibility",
     "crates/waldo-cli",
+    "crates/waldo-clipboard",
     "crates/waldo-controller",
     "crates/waldo-mcp",
     "crates/waldo-niri",
@@ -9,6 +11,8 @@ members = [
     "crates/waldo-screencopy",
     "crates/waldo-service",
     "crates/waldo-socket",
+    "crates/waldo-virtual-pointer",
+    "crates/waldo-virtual-keyboard",
 ]
 resolver = "3"
 
@@ -17,6 +21,7 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
+atspi-common = { version = "=0.14.0" }
 base64 = { version = "=0.22.1" }
 clap = { version = "=4.6.1", features = ["derive"] }
 image = { version = "=0.25.9", default-features = false, features = ["png"] }
@@ -28,4 +33,9 @@ serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150" }
 tokio = { version = "=1.52.3", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 wayland-client = { version = "=0.31.14" }
+wayland-backend = { version = "=0.3.15" }
 wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }
+wayland-scanner = { version = "=0.31.10" }
+xkbcommon = { version = "=0.9.0", default-features = false }
+wl-clipboard-rs = { version = "=0.9.3" }
+zbus = { version = "=5.13.2" }

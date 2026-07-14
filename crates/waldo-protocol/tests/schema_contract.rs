@@ -74,7 +74,7 @@ fn published_schema_names_every_top_level_operation() {
     let schema = published_schema();
     let encoded = serde_json::to_string(&schema).unwrap();
 
-    assert_eq!(schema.schema_major, 1);
+    assert_eq!(schema.schema_major, waldo_protocol::SCHEMA_MAJOR_VERSION);
     for operation in ["hello", "observe", "act", "query", "stop", "handover"] {
         assert!(encoded.contains(operation), "schema omitted {operation}");
     }

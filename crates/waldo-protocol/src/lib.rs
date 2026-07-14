@@ -28,4 +28,4 @@ pub use selector::*;
 ///
 /// Bindings may add ignorable result fields within this version. Incompatible
 /// request changes require a new major version.
-pub const SCHEMA_MAJOR_VERSION: u16 = 1;
+pub const SCHEMA_MAJOR_VERSION: u16 = 2;
