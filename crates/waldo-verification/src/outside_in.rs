@@ -210,6 +210,39 @@ impl Drop for ChildGuard {
     }
 }
 
+struct ScratchDirectory {
+    path: Option<PathBuf>,
+}
+
+impl ScratchDirectory {
+    fn create(path: PathBuf) -> Result<Self, std::io::Error> {
+        fs::create_dir(&path)?;
+        Ok(Self { path: Some(path) })
+    }
+
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("scratch directory exists until cleanup")
+    }
+
+    fn remove(mut self) -> Result<(), std::io::Error> {
+        if let Some(path) = self.path.as_ref() {
+            fs::remove_dir_all(path)?;
+        }
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for ScratchDirectory {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
 struct McpClient {
     child: ChildGuard,
     input: ChildStdin,
@@ -321,13 +354,14 @@ impl McpClient {
 }
 
 pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Error>> {
-    fs::create_dir_all(&options.evidence_directory)?;
-    let scratch = std::env::temp_dir().join(format!(
+    prepare_evidence_directory(&options.evidence_directory)?;
+    let scratch_path = std::env::temp_dir().join(format!(
         "waldo-verification-{}-{}",
         std::process::id(),
         unix_ns()?
     ));
-    let runtime = scratch.join("runtime");
+    let scratch = ScratchDirectory::create(scratch_path.clone())?;
+    let runtime = scratch.path().join("runtime");
     let socket_directory = runtime.join("waldo");
     fs::create_dir_all(&socket_directory)?;
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
@@ -385,7 +419,7 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
     let output_id = delayed.output_id.clone();
     mcp.child.terminate();
     controller.terminate();
-    fs::remove_dir_all(&scratch)?;
+    scratch.remove()?;
 
     let summary = OutsideInSummary {
         identity,
@@ -395,7 +429,7 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
         continuous_completion: continuous,
         transparent_interception,
         contradictory_state,
-        controller_socket_removed: !scratch.exists(),
+        controller_socket_removed: !scratch_path.exists(),
         sensitive_payloads_retained: false,
     };
     write_json(options.evidence_directory.join("summary.json"), &summary)?;
@@ -1228,6 +1262,38 @@ fn focused_window_id() -> Result<String, Box<dyn std::error::Error>> {
         .ok_or_else(|| "Niri has no focused window".into())
 }
 
+fn prepare_evidence_directory(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(format!(
+            "retained evidence directory cannot be a symbolic link: {}",
+            path.display()
+        )
+        .into());
+    }
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "retained evidence path is not a directory: {}",
+            path.display()
+        )
+        .into());
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(format!(
+            "retained evidence directory {} has mode {mode:o}, expected 700",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -1263,16 +1329,33 @@ fn wait_for_release(path: &Path) -> Result<FixtureEvent, Box<dyn std::error::Err
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         if let Ok(contents) = fs::read_to_string(path) {
-            for line in contents.lines() {
-                let event: FixtureEvent = serde_json::from_str(line)?;
-                if event.kind == "target_release" {
-                    return Ok(event);
-                }
+            if let Some(event) = release_from_complete_jsonl(&contents)? {
+                return Ok(event);
             }
         }
         thread::sleep(Duration::from_millis(20));
     }
     Err("timed out waiting for the fixture release event".into())
+}
+
+fn release_from_complete_jsonl(contents: &str) -> Result<Option<FixtureEvent>, serde_json::Error> {
+    for framed_line in contents.split_inclusive('\n') {
+        if !framed_line.ends_with('\n') {
+            continue;
+        }
+        let line = framed_line
+            .strip_suffix('\n')
+            .expect("completed JSONL line ends with newline");
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: FixtureEvent = serde_json::from_str(line)?;
+        if event.kind == "target_release" {
+            return Ok(Some(event));
+        }
+    }
+    Ok(None)
 }
 
 fn sha256_bytes(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
@@ -1336,12 +1419,31 @@ fn unix_ns() -> Result<u128, std::time::SystemTimeError> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        thread,
+        time::Duration,
+    };
+
     use image::{DynamicImage, RgbaImage};
     use waldo_verification::{FixtureRect, TargetGrid};
 
     use super::{
-        FloatPoint, PixelSize, ToolObservation, model_to_logical, rgb_near, select_target,
+        FloatPoint, PixelSize, ScratchDirectory, ToolObservation, model_to_logical,
+        prepare_evidence_directory, release_from_complete_jsonl, rgb_near, select_target, unix_ns,
+        wait_for_release,
     };
+
+    fn temporary_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "waldo-verification-test-{label}-{}-{}",
+            std::process::id(),
+            unix_ns().unwrap()
+        ))
+    }
 
     #[test]
     fn selected_seeded_target_stays_well_inside_its_expected_cell() {
@@ -1393,5 +1495,58 @@ mod tests {
     fn fixture_pixel_comparison_allows_only_small_capture_variance() {
         assert!(rgb_near([100, 101, 102, 255], [98, 100, 104], 3));
         assert!(!rgb_near([100, 101, 120, 255], [98, 100, 104], 3));
+    }
+
+    #[test]
+    fn release_wait_ignores_a_partial_tail_but_rejects_a_malformed_complete_line() {
+        let path = temporary_path("partial-jsonl");
+        fs::write(
+            &path,
+            r#"{"kind":"target_release","recorded_at_unix_ns":1,"x":2.0,"y":3.0,"column":0,"#,
+        )
+        .unwrap();
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let mut file = OpenOptions::new().append(true).open(writer_path).unwrap();
+            file.write_all(b"\"row\":0}\n").unwrap();
+        });
+
+        let event = wait_for_release(&path).unwrap();
+
+        writer.join().unwrap();
+        assert_eq!(event.kind, "target_release");
+        assert_eq!(event.x, 2.0);
+        fs::remove_file(path).unwrap();
+        assert!(release_from_complete_jsonl("{not-json}").unwrap().is_none());
+        assert!(release_from_complete_jsonl("{not-json}\n").is_err());
+    }
+
+    #[test]
+    fn scratch_directory_is_removed_during_an_early_error_return() {
+        fn fail_after_create(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+            let scratch = ScratchDirectory::create(path)?;
+            fs::write(scratch.path().join("marker"), b"temporary")?;
+            Err("forced verifier error".into())
+        }
+
+        let path = temporary_path("scratch-cleanup");
+        assert!(fail_after_create(path.clone()).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn retained_evidence_directory_is_corrected_to_owner_only_permissions() {
+        let path = temporary_path("evidence-mode");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        prepare_evidence_directory(&path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir(path).unwrap();
     }
 }
