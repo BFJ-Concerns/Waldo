@@ -34,6 +34,14 @@ pub enum TextRoutePreference {
     VirtualKeyboard,
 }
 
+/// One exact MIME representation within an atomic clipboard offer.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardRepresentation {
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
 /// A deterministic accessibility operation against an opaque element handle.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -143,6 +151,13 @@ pub enum Action {
     ClipboardWrite {
         mime_type: String,
         data_base64: String,
+    },
+    ClipboardWriteOffer {
+        representations: Vec<ClipboardRepresentation>,
+    },
+    ClipboardPreserve,
+    ClipboardRestore {
+        preservation_id: crate::ClipboardPreservationId,
     },
     Window {
         window_id: WindowId,

@@ -41,12 +41,16 @@ pub struct ObservationGrounding {
 #[derive(Clone, Debug)]
 pub struct ExecutionToken {
     cancelled: Arc<AtomicBool>,
+    session: DrivingSessionId,
+    owner: ConnectionId,
 }
 
 impl ExecutionToken {
-    fn new() -> Self {
+    fn new(session: DrivingSession) -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            session: session.id,
+            owner: session.owner,
         }
     }
 
@@ -56,6 +60,16 @@ impl ExecutionToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Returns the non-resumable driving session which authorised this batch.
+    pub const fn driving_session(&self) -> DrivingSessionId {
+        self.session
+    }
+
+    /// Returns the controller connection which owns this batch.
+    pub const fn owner(&self) -> ConnectionId {
+        self.owner
     }
 }
 
@@ -120,6 +134,8 @@ pub enum LeaseError {
     NotOwner { owner: ConnectionId },
     /// The owning connection already has a batch in flight.
     ExecutionInProgress,
+    /// Backend cleanup is retaining the old lease as an exclusion boundary.
+    CleanupInProgress,
 }
 
 impl fmt::Display for LeaseError {
@@ -150,6 +166,8 @@ impl fmt::Display for LeaseError {
             Self::ExecutionInProgress => {
                 formatter.write_str("the driving connection already has an action batch in flight")
             }
+            Self::CleanupInProgress => formatter
+                .write_str("the previous driving session is still completing backend cleanup"),
         }
     }
 }
@@ -170,6 +188,7 @@ pub struct Controller {
     connections: BTreeMap<ConnectionId, ClientId>,
     driving_session: Option<DrivingSession>,
     active_execution: Option<(ConnectionId, ExecutionToken)>,
+    cleanup_in_progress: Option<ConnectionId>,
     observations: BTreeMap<ObservationId, RetainedObservation>,
 }
 
@@ -184,6 +203,7 @@ impl Controller {
             connections: BTreeMap::new(),
             driving_session: None,
             active_execution: None,
+            cleanup_in_progress: None,
             observations: BTreeMap::new(),
         }
     }
@@ -217,6 +237,7 @@ impl Controller {
         {
             self.cancel_active_execution();
             self.driving_session = None;
+            self.cleanup_in_progress = None;
         }
         Ok(())
     }
@@ -270,6 +291,9 @@ impl Controller {
         now: Duration,
     ) -> Result<DrivingSession, LeaseError> {
         self.require_connection(connection)?;
+        if self.cleanup_in_progress.is_some() {
+            return Err(LeaseError::CleanupInProgress);
+        }
 
         if let Some(session) = &mut self.driving_session {
             if session.owner != connection {
@@ -301,9 +325,12 @@ impl Controller {
         if self.active_execution.is_some() {
             return Err(LeaseError::ExecutionInProgress);
         }
+        if self.cleanup_in_progress.is_some() {
+            return Err(LeaseError::CleanupInProgress);
+        }
         let acquired_lease = self.driving_session.is_none();
         let session = self.acquire_driving_lease(connection, now)?;
-        let token = ExecutionToken::new();
+        let token = ExecutionToken::new(session);
         self.active_execution = Some((connection, token.clone()));
         Ok(ExecutionAuthority {
             session,
@@ -329,6 +356,20 @@ impl Controller {
             .is_some_and(|(owner, _)| *owner == connection)
     }
 
+    /// Cancels the owner's active batch while retaining its lease for cleanup.
+    pub fn begin_session_cleanup(&mut self, connection: ConnectionId) -> Result<(), LeaseError> {
+        self.require_connection(connection)?;
+        let session = self.driving_session.ok_or(LeaseError::NoActiveLease)?;
+        if session.owner != connection {
+            return Err(LeaseError::NotOwner {
+                owner: session.owner,
+            });
+        }
+        self.cancel_active_execution();
+        self.cleanup_in_progress = Some(connection);
+        Ok(())
+    }
+
     /// Rolls back provisional authority when pre-dispatch validation fails.
     pub fn abort_execution(&mut self, connection: ConnectionId, release_lease: bool) {
         if self
@@ -352,6 +393,7 @@ impl Controller {
     pub fn terminate(&mut self) {
         self.cancel_active_execution();
         self.driving_session = None;
+        self.cleanup_in_progress = None;
         self.connections.clear();
     }
 
@@ -376,7 +418,30 @@ impl Controller {
 
         self.cancel_active_execution();
         self.driving_session = None;
+        self.cleanup_in_progress = None;
         true
+    }
+
+    /// Reports expiry without releasing the lease which excludes cleanup races.
+    pub fn idle_lease_expired(&self, now: Duration) -> bool {
+        if self.active_execution.is_some() || self.cleanup_in_progress.is_some() {
+            return false;
+        }
+        self.driving_session
+            .is_some_and(|session| now.saturating_sub(session.last_activity) >= self.idle_timeout)
+    }
+
+    /// Starts idle cleanup while retaining the old lease as an exclusion.
+    pub fn begin_idle_cleanup(&mut self, now: Duration) -> Option<ConnectionId> {
+        if !self.idle_lease_expired(now) {
+            return None;
+        }
+        let owner = self
+            .driving_session
+            .expect("an expired lease was present")
+            .owner;
+        self.cleanup_in_progress = Some(owner);
+        Some(owner)
     }
 
     /// Stops the active driving session when requested by its owner.
@@ -391,6 +456,7 @@ impl Controller {
 
         self.cancel_active_execution();
         self.driving_session = None;
+        self.cleanup_in_progress = None;
         Ok(())
     }
 
@@ -422,7 +488,25 @@ impl Controller {
             last_activity: now,
         };
         self.driving_session = Some(transferred);
+        self.cleanup_in_progress = None;
         Ok(transferred)
+    }
+
+    /// Validates a handover before backend cleanup runs under the old lease.
+    pub fn validate_handover(
+        &self,
+        owner: ConnectionId,
+        target: ConnectionId,
+    ) -> Result<(), LeaseError> {
+        self.require_connection(owner)?;
+        self.require_connection(target)?;
+        let current = self.driving_session.ok_or(LeaseError::NoActiveLease)?;
+        if current.owner != owner {
+            return Err(LeaseError::NotOwner {
+                owner: current.owner,
+            });
+        }
+        Ok(())
     }
 
     fn require_connection(&self, connection: ConnectionId) -> Result<(), LeaseError> {
@@ -633,6 +717,93 @@ mod tests {
 
         assert!(token.is_cancelled());
         assert_eq!(controller.driving_session(), None);
+    }
+
+    #[test]
+    fn session_cleanup_retains_exclusion_until_backend_restoration_finishes() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect(client("owner"));
+        let competitor = controller.connect(client("competitor"));
+        let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
+
+        controller.begin_session_cleanup(owner).unwrap();
+
+        assert!(authority.cancellation().is_cancelled());
+        assert!(matches!(
+            controller.begin_execution(competitor, Duration::from_secs(1)),
+            Err(LeaseError::ExecutionInProgress | LeaseError::HeldBy(_))
+        ));
+        controller.finish_execution(owner);
+        assert!(matches!(
+            controller.begin_execution(competitor, Duration::from_secs(1)),
+            Err(LeaseError::CleanupInProgress)
+        ));
+        assert!(matches!(
+            controller.begin_execution(owner, Duration::from_secs(1)),
+            Err(LeaseError::CleanupInProgress)
+        ));
+        controller.stop(owner).unwrap();
+        assert!(
+            controller
+                .begin_execution(competitor, Duration::from_secs(1))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn idle_expiry_can_be_detected_without_releasing_cleanup_exclusion() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect(client("owner"));
+        let competitor = controller.connect(client("competitor"));
+        controller
+            .acquire_driving_lease(owner, Duration::ZERO)
+            .unwrap();
+
+        assert_eq!(controller.begin_idle_cleanup(IDLE_TIMEOUT), Some(owner));
+        assert!(matches!(
+            controller.begin_execution(competitor, IDLE_TIMEOUT),
+            Err(LeaseError::CleanupInProgress)
+        ));
+        assert!(matches!(
+            controller.begin_execution(owner, IDLE_TIMEOUT),
+            Err(LeaseError::CleanupInProgress)
+        ));
+        controller.stop(owner).unwrap();
+        assert!(
+            controller
+                .acquire_driving_lease(competitor, IDLE_TIMEOUT)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn handover_cannot_authorise_the_target_until_old_session_cleanup_finishes() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect(client("owner"));
+        let target = controller.connect(client("target"));
+        controller
+            .acquire_driving_lease(owner, Duration::ZERO)
+            .unwrap();
+        controller.validate_handover(owner, target).unwrap();
+        controller.begin_session_cleanup(owner).unwrap();
+
+        assert!(matches!(
+            controller.begin_execution(owner, Duration::from_secs(1)),
+            Err(LeaseError::CleanupInProgress)
+        ));
+        assert!(matches!(
+            controller.begin_execution(target, Duration::from_secs(1)),
+            Err(LeaseError::CleanupInProgress)
+        ));
+
+        controller
+            .handover(owner, target, Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            controller
+                .begin_execution(target, Duration::from_secs(1))
+                .is_ok()
+        );
     }
 
     #[test]

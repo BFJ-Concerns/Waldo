@@ -302,6 +302,10 @@ impl ActionExecutor for BatchActionExecutor {
             || self.desktop.supports(route)
     }
 
+    fn limitation(&self, route: ActionRoute) -> Option<String> {
+        self.desktop.limitation(route)
+    }
+
     fn release_all(&self) {
         self.desktop.release_all();
     }

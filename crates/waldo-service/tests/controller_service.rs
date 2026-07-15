@@ -15,9 +15,9 @@ use waldo_controller::ExecutionToken;
 use waldo_niri::{NiriSnapshot, SessionInspector, UnavailableInspector};
 use waldo_protocol::{
     Action, ActionRoute, ApplicationFrameState, ApplicationOutcome, ClientId, ClientMessage,
-    ErrorCode, EvidenceAgreement, LogicalPoint, LogicalRect, ObserveRequest, OutputId, OutputState,
-    OutputTransform, Predicate, ProtocolError, QueryRequest, RequestId, SCHEMA_MAJOR_VERSION,
-    ServerMessage, SourceSelector, StopReason, StopRequest, WindowId,
+    ErrorCode, EvidenceAgreement, HandoverRequest, LogicalPoint, LogicalRect, ObserveRequest,
+    OutputId, OutputState, OutputTransform, Predicate, ProtocolError, QueryRequest, RequestId,
+    SCHEMA_MAJOR_VERSION, ServerMessage, SourceSelector, StopReason, StopRequest, WindowId,
 };
 use waldo_screencopy::{Capture, CaptureError, ScreenCapturer};
 use waldo_service::ControllerService;
@@ -1267,12 +1267,10 @@ async fn pipelined_act_then_stop_never_executes_after_stop_completion() {
         })
         .expect("Act must return its cancellation receipts");
     assert_eq!(acted.stop_reason, StopReason::Cancelled);
+    assert_eq!(acted.application_outcome, ApplicationOutcome::Inconclusive);
+    assert!(acted.observation.is_none());
     let backend_started = started_rx.try_recv().is_ok();
     assert!(!backend_started || finished.load(Ordering::Acquire));
-    assert_eq!(
-        acted.observation.as_ref().unwrap().stable_output_id.0,
-        "DP-1"
-    );
 
     drop(stream);
     shutdown_tx.send(()).unwrap();
@@ -1325,6 +1323,65 @@ async fn stop_response_waits_for_an_active_executor_to_quiesce() {
     assert!(finished.load(Ordering::Acquire));
 
     drop(stream);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn handover_response_waits_for_the_old_executor_to_quiesce() {
+    let path = test_socket();
+    let (started_tx, started_rx) = mpsc::channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(BlockingExecutor {
+            started: started_tx,
+            finished: Arc::clone(&finished),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let target = ControllerClient::connect(&path, ClientId::new("handover-target").unwrap())
+        .await
+        .unwrap();
+    let mut owner = connect_and_start_capture(&path, "handover-owner").await;
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .unwrap();
+
+    write_message(
+        &mut owner,
+        &ClientMessage::Handover {
+            request_id: RequestId::new(4),
+            request: HandoverRequest {
+                target: target.connection_id(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let first: ServerMessage = read_message(&mut owner).await.unwrap();
+    let second: ServerMessage = read_message(&mut owner).await.unwrap();
+    let handed_over = [first, second]
+        .into_iter()
+        .find_map(|response| match response {
+            ServerMessage::HandedOver { result, .. } => Some(result),
+            _ => None,
+        })
+        .expect("Handover must return after the cancelled Act");
+    assert!(finished.load(Ordering::Acquire));
+    assert_eq!(handed_over.owner, target.connection_id());
+
+    drop(owner);
+    drop(target);
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
     let _ = fs::remove_dir_all(path.parent().unwrap());

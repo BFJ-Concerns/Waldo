@@ -87,9 +87,9 @@ pub(crate) async fn act(
             };
         }
     };
+    state.cleanup_expired_lease().await;
     let authority = {
         let mut controller = state.controller.lock().await;
-        controller.expire_idle_lease(state.elapsed());
         match controller.begin_execution(connection_id, state.elapsed()) {
             Ok(authority) => authority,
             Err(error) => return lease_error(request_id, error),
@@ -173,35 +173,45 @@ pub(crate) async fn act(
         }
     };
     let (observation, frame_state, settle_deadline_reached, mut completion_error, mut stop_reason) =
-        match capture_post_action_observation(
-            result_source,
-            grounding.include_accessibility,
-            grounding.frame_fingerprint,
-            grounding.application_frame_fingerprint,
-            expect_visual_change,
-            state,
-            connection_id,
-        )
-        .await
-        {
-            Ok(post_action) => (
-                Some(post_action.observation),
-                post_action.frame_state,
-                post_action.settle_deadline_reached,
-                None,
-                execution.stop_reason,
-            ),
-            Err(error) => (
+        if execution.stop_reason == waldo_protocol::StopReason::Cancelled {
+            (
                 None,
                 ApplicationFrameState::Unchanged,
                 false,
-                Some(error),
-                if execution.stop_reason == waldo_protocol::StopReason::Completed {
-                    waldo_protocol::StopReason::ExecutionFailed
-                } else {
-                    execution.stop_reason
-                },
-            ),
+                None,
+                execution.stop_reason,
+            )
+        } else {
+            match capture_post_action_observation(
+                result_source,
+                grounding.include_accessibility,
+                grounding.frame_fingerprint,
+                grounding.application_frame_fingerprint,
+                expect_visual_change,
+                state,
+                connection_id,
+            )
+            .await
+            {
+                Ok(post_action) => (
+                    Some(post_action.observation),
+                    post_action.frame_state,
+                    post_action.settle_deadline_reached,
+                    None,
+                    execution.stop_reason,
+                ),
+                Err(error) => (
+                    None,
+                    ApplicationFrameState::Unchanged,
+                    false,
+                    Some(error),
+                    if execution.stop_reason == waldo_protocol::StopReason::Completed {
+                        waldo_protocol::StopReason::ExecutionFailed
+                    } else {
+                        execution.stop_reason
+                    },
+                ),
+            }
         };
     let verification_results = if let Some(observation) = &observation {
         match verification
@@ -357,14 +367,11 @@ fn evidence_agreement(results: &[bool]) -> EvidenceAgreement {
 
 fn application_outcome(
     stop_reason: waldo_protocol::StopReason,
-    frame_state: ApplicationFrameState,
-    settle_deadline_reached: bool,
+    _frame_state: ApplicationFrameState,
+    _settle_deadline_reached: bool,
     verification: &[bool],
 ) -> ApplicationOutcome {
     if stop_reason != waldo_protocol::StopReason::Completed {
-        return ApplicationOutcome::Inconclusive;
-    }
-    if settle_deadline_reached && frame_state == ApplicationFrameState::Changing {
         return ApplicationOutcome::Inconclusive;
     }
     match verification.first() {
@@ -464,9 +471,43 @@ fn validate_action_order(actions: &[waldo_protocol::Action]) -> Result<(), Proto
 
 #[cfg(test)]
 mod tests {
-    use waldo_protocol::{Action, LogicalPoint, Predicate, WindowId};
+    use waldo_protocol::{
+        Action, ApplicationFrameState, ApplicationOutcome, LogicalPoint, Predicate, StopReason,
+        WindowId,
+    };
 
-    use super::{actions_expect_visual_change, validate_action_order};
+    use super::{actions_expect_visual_change, application_outcome, validate_action_order};
+
+    #[test]
+    fn agreed_application_evidence_decides_outcome_despite_incidental_frame_motion() {
+        assert_eq!(
+            application_outcome(
+                StopReason::Completed,
+                ApplicationFrameState::Changing,
+                true,
+                &[true, true]
+            ),
+            ApplicationOutcome::Completed
+        );
+        assert_eq!(
+            application_outcome(
+                StopReason::Completed,
+                ApplicationFrameState::Changing,
+                true,
+                &[false, false]
+            ),
+            ApplicationOutcome::Failed
+        );
+        assert_eq!(
+            application_outcome(
+                StopReason::Completed,
+                ApplicationFrameState::Changing,
+                true,
+                &[]
+            ),
+            ApplicationOutcome::Inconclusive
+        );
+    }
 
     #[test]
     fn pointer_motion_waits_for_its_cursor_frame() {

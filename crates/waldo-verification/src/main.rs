@@ -5,6 +5,7 @@ use waldo_verification::{
     BoundaryTargets, FixtureRect, RunRecord, TargetGrid, capture_niri_topology,
 };
 
+mod clipboard_outside_in;
 mod outside_in;
 
 #[derive(Debug, Parser)]
@@ -81,6 +82,20 @@ enum Command {
         #[arg(long, default_value = "python3")]
         python: PathBuf,
         #[arg(long, default_value_t = 0xa3c7)]
+        seed: u64,
+    },
+    /// Exercise clipboard offer, preservation, and final-consumer certainty.
+    ClipboardOutsideIn {
+        evidence_directory: PathBuf,
+        #[arg(long)]
+        waldod: PathBuf,
+        #[arg(long)]
+        mcp: PathBuf,
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long, default_value = "python3")]
+        python: PathBuf,
+        #[arg(long, default_value_t = 0xc8e5)]
         seed: u64,
     },
 }
@@ -161,6 +176,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             seed,
         } => {
             let summary = outside_in::run_accessibility(outside_in::Options {
+                evidence_directory,
+                waldod,
+                mcp,
+                fixture,
+                python,
+                seed,
+            })?;
+            emit_json(&summary, None)?;
+        }
+        Command::ClipboardOutsideIn {
+            evidence_directory,
+            waldod,
+            mcp,
+            fixture,
+            python,
+            seed,
+        } => {
+            let summary = clipboard_outside_in::run(outside_in::Options {
                 evidence_directory,
                 waldod,
                 mcp,

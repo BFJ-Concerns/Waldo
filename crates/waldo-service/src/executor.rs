@@ -48,24 +48,11 @@ impl DesktopActionExecutor {
             TextRoutePreference::Accessibility => self.accessibility_text(text, cancellation),
             TextRoutePreference::ClipboardPaste => self.clipboard_paste(text, cancellation),
             TextRoutePreference::VirtualKeyboard => self.virtual_keyboard_text(text, cancellation),
-            TextRoutePreference::Automatic => {
-                match self.accessibility_text(text, cancellation) {
-                    Ok(execution) => return Ok(execution),
-                    Err(ActionExecutionFailure::Indeterminate { route, error }) => {
-                        return Err(ActionExecutionFailure::Indeterminate { route, error });
-                    }
-                    Err(ActionExecutionFailure::NotExecuted { .. }) => {}
-                }
-                match self.clipboard_paste(text, cancellation) {
-                    Ok(execution) => Ok(execution),
-                    Err(ActionExecutionFailure::Indeterminate { route, error }) => {
-                        Err(ActionExecutionFailure::Indeterminate { route, error })
-                    }
-                    Err(ActionExecutionFailure::NotExecuted { .. }) => {
-                        self.virtual_keyboard_text(text, cancellation)
-                    }
-                }
-            }
+            TextRoutePreference::Automatic => automatic_text(
+                || self.accessibility_text(text, cancellation),
+                || self.clipboard_paste(text, cancellation),
+                || self.virtual_keyboard_text(text, cancellation),
+            ),
         }
     }
 
@@ -113,9 +100,9 @@ impl DesktopActionExecutor {
         let snapshot = clipboard
             .snapshot()
             .map_err(ActionExecutionFailure::not_executed)?;
-        clipboard
-            .offer_text_once(text)
-            .map_err(as_clipboard_paste_failure)?;
+        if let Err(failure) = clipboard.offer_text_once(text) {
+            return restore_after_failure(clipboard, snapshot, failure);
+        }
         let key_result = keyboard.execute(
             &Action::KeyChord {
                 keys: vec!["Control".into(), "v".into()],
@@ -162,10 +149,27 @@ impl DesktopActionExecutor {
                 }
             }
         }
-        clipboard.restore(snapshot).map_err(|error| {
+        clipboard.restore_temporary(snapshot).map_err(|error| {
             ActionExecutionFailure::indeterminate(ActionRoute::ClipboardPaste, error)
         })?;
         Ok(ActionRoute::ClipboardPaste.into())
+    }
+}
+
+fn automatic_text(
+    accessibility: impl FnOnce() -> Result<ActionExecution, ActionExecutionFailure>,
+    clipboard: impl FnOnce() -> Result<ActionExecution, ActionExecutionFailure>,
+    virtual_keyboard: impl FnOnce() -> Result<ActionExecution, ActionExecutionFailure>,
+) -> Result<ActionExecution, ActionExecutionFailure> {
+    match accessibility() {
+        Ok(execution) => return Ok(execution),
+        Err(failure @ ActionExecutionFailure::Indeterminate { .. }) => return Err(failure),
+        Err(ActionExecutionFailure::NotExecuted { .. }) => {}
+    }
+    match clipboard() {
+        Ok(execution) => Ok(execution),
+        Err(failure @ ActionExecutionFailure::Indeterminate { .. }) => Err(failure),
+        Err(ActionExecutionFailure::NotExecuted { .. }) => virtual_keyboard(),
     }
 }
 
@@ -205,7 +209,11 @@ impl ActionExecutor for DesktopActionExecutor {
                 })?
                 .execute(action, cancellation),
             Action::Text { text, route } => self.execute_text(text, *route, cancellation),
-            Action::ClipboardRead { .. } | Action::ClipboardWrite { .. } => self
+            Action::ClipboardRead { .. }
+            | Action::ClipboardWrite { .. }
+            | Action::ClipboardWriteOffer { .. }
+            | Action::ClipboardPreserve
+            | Action::ClipboardRestore { .. } => self
                 .clipboard
                 .as_ref()
                 .ok_or_else(|| {
@@ -255,12 +263,25 @@ impl ActionExecutor for DesktopActionExecutor {
         }
     }
 
+    fn limitation(&self, route: ActionRoute) -> Option<String> {
+        match route {
+            ActionRoute::Clipboard | ActionRoute::ClipboardPaste => self
+                .clipboard
+                .as_ref()
+                .and_then(|clipboard| clipboard.limitation()),
+            _ => None,
+        }
+    }
+
     fn release_all(&self) {
         if let Some(pointer) = &self.pointer {
             pointer.release_all();
         }
         if let Some(keyboard) = &self.keyboard {
             keyboard.release_all();
+        }
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.cleanup_preservation();
         }
     }
 }
@@ -289,8 +310,109 @@ fn restore_after_failure(
     snapshot: waldo_clipboard::ClipboardSnapshot,
     failure: ActionExecutionFailure,
 ) -> Result<ActionExecution, ActionExecutionFailure> {
-    clipboard.restore(snapshot).map_err(|error| {
+    clipboard.restore_temporary(snapshot).map_err(|error| {
         ActionExecutionFailure::indeterminate(ActionRoute::ClipboardPaste, error)
     })?;
     Err(as_clipboard_paste_failure(failure))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use waldo_action::{ActionExecution, ActionExecutionFailure};
+    use waldo_protocol::{ActionRoute, ErrorCode, ProtocolError};
+
+    use super::automatic_text;
+
+    #[test]
+    fn automatic_never_falls_through_an_indeterminate_route() {
+        let clipboard_attempted = Cell::new(false);
+        let keyboard_attempted = Cell::new(false);
+        let result = automatic_text(
+            || indeterminate(ActionRoute::Accessibility),
+            || {
+                clipboard_attempted.set(true);
+                executed(ActionRoute::ClipboardPaste)
+            },
+            || {
+                keyboard_attempted.set(true);
+                executed(ActionRoute::VirtualKeyboard)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ActionExecutionFailure::Indeterminate {
+                route: ActionRoute::Accessibility,
+                ..
+            })
+        ));
+        assert!(!clipboard_attempted.get());
+        assert!(!keyboard_attempted.get());
+
+        let keyboard_attempted = Cell::new(false);
+        let result = automatic_text(
+            not_executed,
+            || indeterminate(ActionRoute::ClipboardPaste),
+            || {
+                keyboard_attempted.set(true);
+                executed(ActionRoute::VirtualKeyboard)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ActionExecutionFailure::Indeterminate {
+                route: ActionRoute::ClipboardPaste,
+                ..
+            })
+        ));
+        assert!(!keyboard_attempted.get());
+    }
+
+    #[test]
+    fn automatic_stops_after_an_acknowledged_clipboard_transport() {
+        let keyboard_attempted = Cell::new(false);
+        let result = automatic_text(
+            not_executed,
+            || executed(ActionRoute::ClipboardPaste),
+            || {
+                keyboard_attempted.set(true);
+                executed(ActionRoute::VirtualKeyboard)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.route, ActionRoute::ClipboardPaste);
+        assert!(!keyboard_attempted.get());
+    }
+
+    #[test]
+    fn automatic_falls_through_only_definitely_not_executed_routes() {
+        let result = automatic_text(not_executed, not_executed, || {
+            executed(ActionRoute::VirtualKeyboard)
+        })
+        .unwrap();
+
+        assert_eq!(result.route, ActionRoute::VirtualKeyboard);
+    }
+
+    fn executed(route: ActionRoute) -> Result<ActionExecution, ActionExecutionFailure> {
+        Ok(route.into())
+    }
+
+    fn not_executed() -> Result<ActionExecution, ActionExecutionFailure> {
+        Err(ActionExecutionFailure::not_executed(error()))
+    }
+
+    fn indeterminate(route: ActionRoute) -> Result<ActionExecution, ActionExecutionFailure> {
+        Err(ActionExecutionFailure::indeterminate(route, error()))
+    }
+
+    fn error() -> ProtocolError {
+        ProtocolError {
+            code: ErrorCode::BackendFailure,
+            message: "deliberate route boundary".into(),
+            retryable: true,
+        }
+    }
 }

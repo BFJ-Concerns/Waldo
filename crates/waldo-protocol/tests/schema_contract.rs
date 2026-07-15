@@ -1,6 +1,6 @@
 use waldo_protocol::{
-    ActRequest, Action, ClientMessage, LogicalPoint, ObservationId, PointerButton, RequestId,
-    ServerMessage, StopResult, published_schema,
+    ActRequest, Action, ClientMessage, ClipboardRepresentation, LogicalPoint, ObservationId,
+    PointerButton, RequestId, ServerMessage, StopResult, published_schema,
 };
 
 #[test]
@@ -24,6 +24,31 @@ fn action_documents_round_trip_through_the_shared_wire_types() {
     assert_eq!(decoded, message);
     assert!(json.contains(r#""type":"act""#));
     assert!(json.contains(r#""type":"pointer_click""#));
+}
+
+#[test]
+fn atomic_clipboard_offer_is_additive_to_the_single_representation_action() {
+    let old = Action::ClipboardWrite {
+        mime_type: "text/plain".into(),
+        data_base64: "cGxhaW4=".into(),
+    };
+    let offer = Action::ClipboardWriteOffer {
+        representations: vec![
+            ClipboardRepresentation {
+                mime_type: "text/html".into(),
+                data_base64: "PGI+aHRtbDwvYj4=".into(),
+            },
+            ClipboardRepresentation {
+                mime_type: "text/plain".into(),
+                data_base64: "cGxhaW4=".into(),
+            },
+        ],
+    };
+
+    for action in [old, offer] {
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), action);
+    }
 }
 
 #[test]

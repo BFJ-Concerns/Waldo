@@ -55,7 +55,7 @@ pub struct AccessibilitySummary {
 }
 
 #[derive(Debug, Serialize)]
-struct IdentityEvidence {
+pub(crate) struct IdentityEvidence {
     waldo_commit: String,
     verifier_commit: String,
     seed: u64,
@@ -198,8 +198,8 @@ struct FixtureEvent {
     row: u32,
 }
 
-struct ToolObservation {
-    id: u64,
+pub(crate) struct ToolObservation {
+    pub(crate) id: u64,
     source: Value,
     source_pixels: PixelSize,
     model_pixels: PixelSize,
@@ -208,7 +208,7 @@ struct ToolObservation {
     logical_height: f64,
     image: DynamicImage,
     image_digest: String,
-    accessibility: Vec<Value>,
+    pub(crate) accessibility: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,7 +273,7 @@ impl Drop for ScratchDirectory {
     }
 }
 
-struct McpClient {
+pub(crate) struct McpClient {
     child: ChildGuard,
     input: ChildStdin,
     output: mpsc::Receiver<ReaderMessage>,
@@ -330,19 +330,32 @@ impl McpClient {
         Ok(client)
     }
 
-    fn call(&mut self, method: &str, params: Value) -> Result<Value, Box<dyn std::error::Error>> {
+    pub(crate) fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
         self.call_with_timeout(method, params, Duration::from_secs(10))?
             .ok_or_else(|| {
                 format!("Waldo MCP {method} exceeded the 10-second verifier limit").into()
             })
     }
 
-    fn call_with_timeout(
+    pub(crate) fn call_with_timeout(
         &mut self,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+        let id = self.send(method, params)?;
+        self.receive(id, timeout)
+    }
+
+    pub(crate) fn send(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
         let id = self.next_id;
         self.next_id += 1;
         serde_json::to_writer(
@@ -352,6 +365,14 @@ impl McpClient {
         self.input.write_all(b"\n")?;
         self.input.flush()?;
 
+        Ok(id)
+    }
+
+    pub(crate) fn receive(
+        &mut self,
+        id: u64,
+        timeout: Duration,
+    ) -> Result<Option<Value>, Box<dyn std::error::Error>> {
         if let Some(response) = self.deferred.remove(&id) {
             return Ok(Some(response));
         }
@@ -383,16 +404,16 @@ impl McpClient {
     }
 }
 
-struct RuntimeHarness {
+pub(crate) struct RuntimeHarness {
     scratch_path: PathBuf,
     scratch: ScratchDirectory,
     controller: ChildGuard,
-    mcp: McpClient,
+    pub(crate) mcp: McpClient,
     identity: IdentityEvidence,
 }
 
 impl RuntimeHarness {
-    fn start(options: &Options) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) fn start(options: &Options) -> Result<Self, Box<dyn std::error::Error>> {
         prepare_evidence_directory(&options.evidence_directory)?;
         let scratch_path = std::env::temp_dir().join(format!(
             "waldo-verification-{}-{}",
@@ -437,7 +458,9 @@ impl RuntimeHarness {
         })
     }
 
-    fn shutdown(mut self) -> Result<(IdentityEvidence, bool), Box<dyn std::error::Error>> {
+    pub(crate) fn shutdown(
+        mut self,
+    ) -> Result<(IdentityEvidence, bool), Box<dyn std::error::Error>> {
         self.mcp.child.terminate();
         self.controller.terminate();
         self.scratch.remove()?;
@@ -1360,12 +1383,58 @@ fn start_accessibility_fixture(
     ))
 }
 
-fn observe_accessibility(
+pub(crate) fn observe_accessibility(
     mcp: &mut McpClient,
     output_id: &str,
     fixture_title: &str,
     directory: &Path,
     label: &str,
+) -> Result<ToolObservation, Box<dyn std::error::Error>> {
+    observe_output(mcp, output_id, fixture_title, directory, label, true)
+}
+
+pub(crate) fn observe_without_accessibility(
+    mcp: &mut McpClient,
+    output_id: &str,
+    fixture_title: &str,
+    directory: &Path,
+    label: &str,
+) -> Result<ToolObservation, Box<dyn std::error::Error>> {
+    observe_output(mcp, output_id, fixture_title, directory, label, false)
+}
+
+pub(crate) fn observe_accessibility_transient(
+    mcp: &mut McpClient,
+    output_id: &str,
+    fixture_title: &str,
+    private_directory: &Path,
+) -> Result<ToolObservation, Box<dyn std::error::Error>> {
+    focus_niri_window(fixture_title)?;
+    thread::sleep(Duration::from_millis(100));
+    let response = mcp
+        .call_with_timeout(
+            "tools/call",
+            json!({
+                "name": "observe",
+                "arguments": {
+                    "source": {"type": "output", "output_id": output_id},
+                    "continue_from": null,
+                    "include_accessibility": true
+                }
+            }),
+            Duration::from_secs(30),
+        )?
+        .ok_or("transient accessibility Observe exceeded the 30-second verifier limit")?;
+    parse_observation(&response, private_directory, "transient-accessibility")
+}
+
+fn observe_output(
+    mcp: &mut McpClient,
+    output_id: &str,
+    fixture_title: &str,
+    directory: &Path,
+    label: &str,
+    include_accessibility: bool,
 ) -> Result<ToolObservation, Box<dyn std::error::Error>> {
     focus_niri_window(fixture_title)?;
     thread::sleep(Duration::from_millis(100));
@@ -1374,7 +1443,7 @@ fn observe_accessibility(
         "arguments": {
             "source": {"type": "output", "output_id": output_id},
             "continue_from": null,
-            "include_accessibility": true
+            "include_accessibility": include_accessibility
         }
     });
     write_json(
@@ -1383,7 +1452,13 @@ fn observe_accessibility(
     )?;
     let response = mcp
         .call_with_timeout("tools/call", request, Duration::from_secs(30))?
-        .ok_or("accessibility Observe exceeded the 30-second verifier limit")?;
+        .ok_or({
+            if include_accessibility {
+                "accessibility Observe exceeded the 30-second verifier limit"
+            } else {
+                "Observe exceeded the 30-second verifier limit"
+            }
+        })?;
     let observation = parse_observation(&response, directory, &format!("{label}-observe"))?;
     write_redacted_response(
         directory.join(format!("{label}-observe-response.json")),
@@ -1393,32 +1468,39 @@ fn observe_accessibility(
     Ok(observation)
 }
 
-fn focus_niri_window(title: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut socket = Socket::connect()?;
-    let reply = socket.send(Request::Windows)??;
-    let Response::Windows(windows) = reply else {
-        return Err("Niri returned an unexpected response to Windows".into());
+pub(crate) fn focus_niri_window(title: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let window_id = loop {
+        let mut socket = Socket::connect()?;
+        let reply = socket.send(Request::Windows)??;
+        let Response::Windows(windows) = reply else {
+            return Err("Niri returned an unexpected response to Windows".into());
+        };
+        let matches: Vec<_> = windows
+            .iter()
+            .filter(|window| window.title.as_deref() == Some(title))
+            .collect();
+        match matches.as_slice() {
+            [window] => break window.id,
+            [] if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            _ => {
+                return Err(format!(
+                    "expected one Niri fixture window titled {title:?}, found {}",
+                    matches.len()
+                )
+                .into());
+            }
+        }
     };
-    let matches: Vec<_> = windows
-        .iter()
-        .filter(|window| window.title.as_deref() == Some(title))
-        .collect();
-    let [window] = matches.as_slice() else {
-        return Err(format!(
-            "expected one Niri fixture window titled {title:?}, found {}",
-            matches.len()
-        )
-        .into());
-    };
     let mut socket = Socket::connect()?;
-    let reply = socket.send(Request::Action(NiriAction::FocusWindow { id: window.id }))??;
+    let reply = socket.send(Request::Action(NiriAction::FocusWindow { id: window_id }))??;
     if !matches!(reply, Response::Handled) {
         return Err("Niri did not acknowledge fixture focus".into());
     }
     Ok(())
 }
 
-fn accessibility_handle(
+pub(crate) fn accessibility_handle(
     observation: &ToolObservation,
     name: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -1440,7 +1522,31 @@ fn accessibility_handle(
         .ok_or_else(|| format!("accessibility node {name:?} has no string handle").into())
 }
 
-fn accessibility_action(
+pub(crate) fn accessibility_handle_with_role(
+    observation: &ToolObservation,
+    name: &str,
+    role: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let matches: Vec<_> = observation
+        .accessibility
+        .iter()
+        .filter(|node| node["name"].as_str() == Some(name))
+        .filter(|node| node["role"].as_str() == Some(role))
+        .collect();
+    let [node] = matches.as_slice() else {
+        return Err(format!(
+            "expected one accessibility {role} named {name:?}, found {}",
+            matches.len()
+        )
+        .into());
+    };
+    node["handle"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("accessibility {role} {name:?} has no string handle").into())
+}
+
+pub(crate) fn accessibility_action(
     observation: &ToolObservation,
     name: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
@@ -1724,7 +1830,7 @@ fn completion_bool(response: &Value, field: &str) -> Option<bool> {
     response["result"]["structuredContent"]["result"]["completion_evidence"][field].as_bool()
 }
 
-fn focused_output() -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn focused_output() -> Result<String, Box<dyn std::error::Error>> {
     let response = Socket::connect()?
         .send(Request::FocusedOutput)?
         .map_err(std::io::Error::other)?;
@@ -1844,7 +1950,7 @@ fn release_from_complete_jsonl(contents: &str) -> Result<Option<FixtureEvent>, s
     Ok(None)
 }
 
-fn sha256_bytes(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
     let mut child = Command::new("sha256sum")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1892,7 +1998,10 @@ fn git_ref(reference: &str) -> Result<String, Box<dyn std::error::Error>> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-fn write_json(path: PathBuf, value: &impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn write_json(
+    path: PathBuf,
+    value: &impl Serialize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     fs::write(path, bytes)?;
@@ -1918,9 +2027,9 @@ mod tests {
     use waldo_verification::{FixtureRect, TargetGrid};
 
     use super::{
-        FloatPoint, PixelSize, ScratchDirectory, ToolObservation, model_to_logical,
-        prepare_evidence_directory, release_from_complete_jsonl, rgb_near, select_target, unix_ns,
-        wait_for_release,
+        FloatPoint, PixelSize, ScratchDirectory, ToolObservation, accessibility_handle_with_role,
+        model_to_logical, prepare_evidence_directory, release_from_complete_jsonl, rgb_near,
+        select_target, unix_ns, wait_for_release,
     };
 
     fn temporary_path(label: &str) -> PathBuf {
@@ -1976,6 +2085,47 @@ mod tests {
 
         assert_eq!(logical.x, 3840.0);
         assert_eq!(logical.y, 720.0);
+    }
+
+    #[test]
+    fn role_qualified_status_lookup_ignores_the_duplicate_label_node() {
+        let observation = ToolObservation {
+            id: 1,
+            source: serde_json::Value::Null,
+            source_pixels: PixelSize {
+                width: 1,
+                height: 1,
+            },
+            model_pixels: PixelSize {
+                width: 1,
+                height: 1,
+            },
+            logical_origin: FloatPoint { x: 0.0, y: 0.0 },
+            logical_width: 1.0,
+            logical_height: 1.0,
+            image: DynamicImage::ImageRgba8(RgbaImage::new(1, 1)),
+            image_digest: String::new(),
+            accessibility: vec![
+                serde_json::json!({
+                    "handle": "element-9",
+                    "name": "Destination digest matched",
+                    "role": "checkbox",
+                    "states": ["checkable"]
+                }),
+                serde_json::json!({
+                    "handle": "element-13",
+                    "name": "Destination digest matched",
+                    "role": "label",
+                    "states": ["visible"]
+                }),
+            ],
+        };
+
+        assert_eq!(
+            accessibility_handle_with_role(&observation, "Destination digest matched", "checkbox")
+                .unwrap(),
+            "element-9"
+        );
     }
 
     #[test]

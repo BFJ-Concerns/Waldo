@@ -17,14 +17,7 @@ pub(crate) async fn dispatch(
     act_ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> ServerMessage {
     let request_id = message.request_id();
-    let expired = state
-        .controller
-        .lock()
-        .await
-        .expire_idle_lease(state.elapsed());
-    if expired {
-        state.executor.release_all();
-    }
+    state.cleanup_expired_lease().await;
     match message {
         ClientMessage::Hello { .. } => ServerMessage::Error {
             request_id: Some(request_id),
@@ -81,20 +74,28 @@ pub(crate) async fn dispatch(
         }
         ClientMessage::Stop { .. } => stop(request_id, state, connection_id).await,
         ClientMessage::Handover { request, .. } => {
-            let mut controller = state.controller.lock().await;
-            let previous = controller.driving_session().map(|session| session.id());
-            match controller.handover(connection_id, request.target, state.elapsed()) {
-                Ok(session) => {
-                    state.executor.release_all();
-                    ServerMessage::HandedOver {
-                        request_id,
-                        result: HandoverResult {
-                            previous_session: previous.expect("handover requires an active lease"),
-                            driving_session: session.id(),
-                            owner: session.owner(),
-                        },
-                    }
+            let previous = {
+                let mut controller = state.controller.lock().await;
+                if let Err(error) = controller.validate_handover(connection_id, request.target) {
+                    return lease_error(request_id, error);
                 }
+                if let Err(error) = controller.begin_session_cleanup(connection_id) {
+                    return lease_error(request_id, error);
+                }
+                controller.driving_session().map(|session| session.id())
+            };
+            state.wait_for_execution(connection_id).await;
+            state.executor.release_all();
+            let mut controller = state.controller.lock().await;
+            match controller.handover(connection_id, request.target, state.elapsed()) {
+                Ok(session) => ServerMessage::HandedOver {
+                    request_id,
+                    result: HandoverResult {
+                        previous_session: previous.expect("handover requires an active lease"),
+                        driving_session: session.id(),
+                        owner: session.owner(),
+                    },
+                },
                 Err(error) => lease_error(request_id, error),
             }
         }
@@ -124,18 +125,24 @@ async fn stop(
     state: &ServiceState,
     connection_id: ConnectionId,
 ) -> ServerMessage {
-    let (released, stopped) = {
+    let (released, cleanup_started) = {
         let mut controller = state.controller.lock().await;
         let released = controller
             .driving_session()
             .filter(|session| session.owner() == connection_id)
             .map(|session| session.id());
-        (released, controller.stop(connection_id))
+        (released, controller.begin_session_cleanup(connection_id))
     };
-    match stopped {
+    match cleanup_started {
         Ok(()) | Err(LeaseError::NoActiveLease) => {
             state.wait_for_execution(connection_id).await;
             state.executor.release_all();
+            let stopped = state.controller.lock().await.stop(connection_id);
+            if let Err(error) = stopped
+                && error != LeaseError::NoActiveLease
+            {
+                return lease_error(request_id, error);
+            }
             ServerMessage::Stopped {
                 request_id,
                 result: StopResult {
@@ -160,14 +167,14 @@ pub(crate) fn lease_error(request_id: RequestId, error: LeaseError) -> ServerMes
         LeaseError::UnknownConnection(_) => ErrorCode::UnknownConnection,
         LeaseError::HeldBy(_) => ErrorCode::LeaseHeld,
         LeaseError::NoActiveLease | LeaseError::NotOwner { .. } => ErrorCode::NotLeaseOwner,
-        LeaseError::ExecutionInProgress => ErrorCode::LeaseHeld,
+        LeaseError::ExecutionInProgress | LeaseError::CleanupInProgress => ErrorCode::LeaseHeld,
     };
     ServerMessage::Error {
         request_id: Some(request_id),
         error: ProtocolError {
             code,
             message: error.to_string(),
-            retryable: matches!(error, LeaseError::HeldBy(_)),
+            retryable: matches!(error, LeaseError::HeldBy(_) | LeaseError::CleanupInProgress),
         },
     }
 }

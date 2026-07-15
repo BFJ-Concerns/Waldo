@@ -6,9 +6,13 @@ rust-version.workspace = true
 
 [dependencies]
 base64.workspace = true
+nix.workspace = true
 waldo-action = { path = "../waldo-action" }
 waldo-controller = { path = "../waldo-controller" }
 waldo-protocol = { path = "../waldo-protocol" }
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+wayland-protocols-wlr.workspace = true
 wl-clipboard-rs.workspace = true
 
 [lib]

@@ -122,6 +122,9 @@ pub enum ActionOutput {
         mime_type: String,
         data_base64: String,
     },
+    ClipboardPreservation {
+        preservation_id: crate::ClipboardPreservationId,
+    },
 }
 
 /// Why an action batch stopped before nominal completion.

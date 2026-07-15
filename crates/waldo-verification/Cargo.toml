@@ -12,6 +12,7 @@ niri-ipc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+waldo-clipboard = { path = "../waldo-clipboard" }
 waldo-protocol = { path = "../waldo-protocol" }
 
 [lib]
