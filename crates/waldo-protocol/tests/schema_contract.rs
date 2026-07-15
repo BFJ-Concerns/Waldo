@@ -89,4 +89,13 @@ fn published_schema_names_every_top_level_operation() {
     ] {
         assert!(encoded.contains(result), "schema omitted {result}");
     }
+    for evidence in [
+        "application_outcome",
+        "completion_evidence",
+        "frame_state",
+        "settle_deadline_reached",
+        "verification_agreement",
+    ] {
+        assert!(encoded.contains(evidence), "schema omitted {evidence}");
+    }
 }

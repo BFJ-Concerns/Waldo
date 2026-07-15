@@ -490,6 +490,7 @@ mod tests {
             include_accessibility: false,
             cursor_position: None,
             frame_fingerprint: 0,
+            application_frame_fingerprint: 0,
         }
     }
 
