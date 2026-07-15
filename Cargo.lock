@@ -1380,6 +1380,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "waldo-verification"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "image",
+ "niri-ipc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "waldo-protocol",
+]
+
+[[package]]
 name = "waldo-virtual-keyboard"
 version = "0.1.0"
 dependencies = [
