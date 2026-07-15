@@ -300,6 +300,10 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     WEnum::Unknown(_) => false,
                 };
             }
+            zwlr_screencopy_frame_v1::Event::Damage { .. } => {
+                // Damage is change metadata, not a crop. The compositor copies into
+                // the complete offered buffer and Ready always encodes that full extent.
+            }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
                 // Timestamp the completed frame before PNG encoding. Encoding can be
                 // comparatively slow and must not make fresh evidence look newer than it is.

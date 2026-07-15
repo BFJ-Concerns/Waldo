@@ -74,9 +74,21 @@ pub struct WindowState {
     #[serde(default)]
     pub pid: Option<u32>,
     pub logical_bounds: Option<LogicalRect>,
+    /// Whether Niri currently manages this window outside the scrolling layout.
+    #[serde(default)]
+    pub is_floating: bool,
+    /// Whether Waldo can truthfully represent a direct observation of this window.
+    pub capture: WindowCaptureCapability,
     pub focused: bool,
     pub workspace_id: Option<WorkspaceId>,
     pub output_id: Option<OutputId>,
+}
+
+/// Source-specific direct-capture availability for one Niri window.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub struct WindowCaptureCapability {
+    pub available: bool,
+    pub limitation: Option<String>,
 }
 
 /// One workspace in the active Niri session.

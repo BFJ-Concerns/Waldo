@@ -295,7 +295,10 @@ pub(crate) fn enable_action_capabilities(
         && capabilities.virtual_pointer.version.is_some()
     {
         capabilities.virtual_pointer.available = true;
-        capabilities.virtual_pointer.limitation = None;
+        capabilities.virtual_pointer.limitation = Some(
+            "cross-output drag is refused before dispatch; ordinary cross-output motion is supported"
+                .into(),
+        );
     }
     if executor.supports(waldo_protocol::ActionRoute::VirtualKeyboard)
         && capabilities.virtual_keyboard.version.is_some()

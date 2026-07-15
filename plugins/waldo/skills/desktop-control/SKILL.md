@@ -21,6 +21,13 @@ not already authorised.
 2. Observe the relevant output, visible foreground window, or region. Treat the
    returned observation identifier, geometry, focus, target identity, and image
    as one grounding record.
+   `source_pixels` describes the compositor capture; `model_image_pixels`
+   describes the exact decoded image delivered in this result. Convert an image
+   point into `logical_bounds` linearly before sending an absolute pointer action:
+   `logical_x = origin.x + image_x * width / model_image_pixels.width`, with the
+   equivalent formula for y. Never apply an undeclared display or preview scale.
+   Inspect window-specific `capture` availability in Query before requesting a
+   direct window observation; tiled windows may require observing their output.
    A Query `request_id` is only transport correlation and never authorises Act.
    If a direct window observation fails because the window is not foreground,
    observe its output first, use that observation ID for a window-focus Act,

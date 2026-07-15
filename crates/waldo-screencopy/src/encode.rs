@@ -6,20 +6,31 @@ use wayland_client::protocol::wl_shm;
 use crate::{CaptureError, shm::ShmBuffer};
 
 pub(crate) fn png(buffer: &ShmBuffer, y_inverted: bool) -> Result<Vec<u8>, CaptureError> {
-    let rgba = rgba(
+    png_bytes(
         &buffer.map,
         buffer.width,
         buffer.height,
         buffer.stride,
         buffer.format,
         y_inverted,
-    )?;
+    )
+}
+
+fn png_bytes(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: wl_shm::Format,
+    y_inverted: bool,
+) -> Result<Vec<u8>, CaptureError> {
+    let rgba = rgba(source, width, height, stride, format, y_inverted)?;
 
     let mut encoded = Cursor::new(Vec::new());
     PngEncoder::new(&mut encoded).write_image(
         &rgba,
-        buffer.width,
-        buffer.height,
+        width,
+        height,
         image::ExtendedColorType::Rgba8,
     )?;
     Ok(encoded.into_inner())
@@ -87,9 +98,10 @@ fn rgba(
 
 #[cfg(test)]
 mod tests {
+    use image::ImageFormat;
     use wayland_client::protocol::wl_shm;
 
-    use super::rgba;
+    use super::{png_bytes, rgba};
 
     fn native_pixel(argb: u32) -> [u8; 4] {
         argb.to_ne_bytes()
@@ -120,5 +132,44 @@ mod tests {
         let error = rgba(&[0; 4], 1, 2, 8, wl_shm::Format::Xrgb8888, false).unwrap_err();
 
         assert!(error.to_string().contains("pixel exceeds mapped memory"));
+    }
+
+    #[test]
+    fn small_damage_still_encodes_the_complete_seeded_frame() {
+        let width = 4;
+        let height = 3;
+        let damage = (1_u32, 1_u32, 1_u32, 1_u32);
+        let mut source = Vec::new();
+        let mut expected = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let red = (x * 37 + y * 11) as u8;
+                let green = (x * 13 + y * 53) as u8;
+                let blue = (x * 71 + y * 7) as u8;
+                source.extend(native_pixel(
+                    u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue),
+                ));
+                expected.extend([red, green, blue, 0xff]);
+            }
+        }
+        assert!(damage.2 * damage.3 < width * height);
+
+        // Screencopy damage describes which pixels changed; the compositor still
+        // copied a complete buffer, so encoding must consume the complete extent.
+        let png = png_bytes(
+            &source,
+            width,
+            height,
+            width * 4,
+            wl_shm::Format::Xrgb8888,
+            false,
+        )
+        .unwrap();
+        let decoded = image::load_from_memory_with_format(&png, ImageFormat::Png)
+            .unwrap()
+            .into_rgba8();
+
+        assert_eq!(decoded.dimensions(), (width, height));
+        assert_eq!(decoded.into_raw(), expected);
     }
 }

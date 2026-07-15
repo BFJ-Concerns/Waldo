@@ -2,12 +2,13 @@ use std::{
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     path::PathBuf,
-    sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     sync::mpsc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::{io::AsyncWriteExt, sync::oneshot};
 use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
 use waldo_controller::ExecutionToken;
@@ -54,6 +55,11 @@ impl SessionInspector for FixedInspector {
                 application_id: Some("waldo-test".into()),
                 pid: None,
                 logical_bounds: None,
+                is_floating: true,
+                capture: waldo_protocol::WindowCaptureCapability {
+                    available: true,
+                    limitation: None,
+                },
                 focused: true,
                 workspace_id: None,
                 output_id: Some(OutputId("DP-1".into())),
@@ -101,6 +107,17 @@ struct ChangedAfterObservationInspector {
     calls: AtomicUsize,
 }
 
+#[derive(Clone)]
+struct MutableInspector {
+    snapshot: Arc<Mutex<NiriSnapshot>>,
+}
+
+impl SessionInspector for MutableInspector {
+    fn inspect(&self, _include_windows: bool) -> Result<NiriSnapshot, waldo_niri::InspectionError> {
+        Ok(self.snapshot.lock().unwrap().clone())
+    }
+}
+
 impl SessionInspector for ChangedAfterObservationInspector {
     fn inspect(&self, include_windows: bool) -> Result<NiriSnapshot, waldo_niri::InspectionError> {
         let mut snapshot = FixedInspector.inspect(include_windows)?;
@@ -117,6 +134,113 @@ struct FailingFinalCapturer {
 
 struct SettlingFrameCapturer {
     calls: AtomicUsize,
+}
+
+struct ContinuationCapturer {
+    calls: AtomicUsize,
+}
+
+struct CountingCapturer {
+    calls: Arc<AtomicUsize>,
+}
+
+struct RegionRecordingCapturer {
+    regions: Arc<Mutex<Vec<RecordedRegion>>>,
+}
+
+#[derive(Debug, PartialEq)]
+struct RecordedRegion {
+    output: String,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl ScreenCapturer for RegionRecordingCapturer {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn capture_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        panic!("floating-window observation must use a region capture")
+    }
+
+    fn capture_region(
+        &self,
+        output_name: &str,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.regions.lock().unwrap().push(RecordedRegion {
+            output: output_name.into(),
+            x,
+            y,
+            width,
+            height,
+        });
+        Ok(Capture {
+            png: b"floating-window-marker".to_vec(),
+            width: width as u32,
+            height: height as u32,
+            captured_at_unix_ms: 1,
+        })
+    }
+}
+
+impl ScreenCapturer for CountingCapturer {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn capture_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        FixedCapturer.capture_output("fixture")
+    }
+
+    fn capture_region(
+        &self,
+        output_name: &str,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture_output(output_name)
+    }
+}
+
+impl ScreenCapturer for ContinuationCapturer {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn capture_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Capture {
+            png: if call == 0 {
+                b"seeded-frame-a".to_vec()
+            } else {
+                b"seeded-frame-b".to_vec()
+            },
+            width: 1920,
+            height: 1080,
+            captured_at_unix_ms: call as u64 + 1,
+        })
+    }
+
+    fn capture_region(
+        &self,
+        output_name: &str,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture_output(output_name)
+    }
 }
 
 impl ScreenCapturer for SettlingFrameCapturer {
@@ -182,6 +306,10 @@ struct ReleaseTrackingExecutor {
     releases: Arc<AtomicUsize>,
 }
 
+struct RecordingPointerExecutor {
+    actions: Arc<Mutex<Vec<Action>>>,
+}
+
 impl ActionExecutor for SuccessfulExecutor {
     fn execute(
         &self,
@@ -203,6 +331,21 @@ impl ActionExecutor for ReleaseTrackingExecutor {
 
     fn release_all(&self) {
         self.releases.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl ActionExecutor for RecordingPointerExecutor {
+    fn execute(
+        &self,
+        action: &Action,
+        _cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        self.actions.lock().unwrap().push(action.clone());
+        Ok(ActionRoute::VirtualPointer.into())
+    }
+
+    fn supports(&self, route: ActionRoute) -> bool {
+        route == ActionRoute::VirtualPointer
     }
 }
 
@@ -323,6 +466,538 @@ async fn private_socket_accepts_a_query_from_the_current_user() {
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
     assert!(!path.exists());
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn continued_observation_reports_real_frame_continuity_and_rejects_other_sources() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(ContinuationCapturer {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("continuation-test").unwrap())
+        .await
+        .unwrap();
+    let source = SourceSelector::Output {
+        output_id: OutputId("DP-1".into()),
+    };
+    let first = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: source.clone(),
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed {
+        observation: first, ..
+    } = first
+    else {
+        panic!("initial observation failed")
+    };
+
+    let continued = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(3),
+            request: ObserveRequest {
+                source: source.clone(),
+                continue_from: Some(first.id),
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed {
+        observation: continued,
+        ..
+    } = continued
+    else {
+        panic!("continued observation failed")
+    };
+
+    assert_eq!(
+        BASE64.decode(&first.image.data_base64).unwrap(),
+        b"seeded-frame-a"
+    );
+    assert_eq!(
+        BASE64.decode(&continued.image.data_base64).unwrap(),
+        b"seeded-frame-b"
+    );
+    let continuity = continued.continuation.unwrap();
+    assert_eq!(continuity.from, first.id);
+    assert!(continuity.frame_changed);
+    assert!(!continuity.geometry_changed);
+    assert!(!continuity.focus_changed);
+
+    let incompatible = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(4),
+            request: ObserveRequest {
+                source: SourceSelector::Region {
+                    output_id: OutputId("DP-1".into()),
+                    region: LogicalRect {
+                        origin: LogicalPoint { x: 0.0, y: 0.0 },
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                },
+                continue_from: Some(first.id),
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        incompatible,
+        ServerMessage::Error {
+            error: ProtocolError {
+                code: ErrorCode::InvalidRequest,
+                ..
+            },
+            ..
+        }
+    ));
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn tiled_window_limit_is_queryable_and_refused_before_screencopy() {
+    let path = test_socket();
+    let mut snapshot = FixedInspector.inspect(true).unwrap();
+    snapshot.windows[0].logical_bounds = Some(LogicalRect {
+        origin: LogicalPoint { x: 100.0, y: 100.0 },
+        width: 800.0,
+        height: 600.0,
+    });
+    snapshot.windows[0].is_floating = false;
+    snapshot.windows[0].capture = waldo_protocol::WindowCaptureCapability {
+        available: false,
+        limitation: Some(
+            "tiled-window capture is unavailable; observe the containing output instead".into(),
+        ),
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(MutableInspector {
+            snapshot: Arc::new(Mutex::new(snapshot)),
+        }),
+        Arc::new(CountingCapturer {
+            calls: Arc::clone(&calls),
+        }),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("tiled-capture-test").unwrap())
+        .await
+        .unwrap();
+
+    let queried = client
+        .request(&ClientMessage::Query {
+            request_id: RequestId::new(2),
+            request: QueryRequest {
+                include_windows: true,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Queried { result, .. } = queried else {
+        panic!("window capability query failed")
+    };
+    assert!(!result.windows[0].capture.available);
+    assert!(
+        result.windows[0]
+            .capture
+            .limitation
+            .as_deref()
+            .is_some_and(|limitation| limitation.contains("tiled-window"))
+    );
+
+    let refused = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(3),
+            request: ObserveRequest {
+                source: SourceSelector::Window {
+                    window_id: WindowId("41".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        refused,
+        ServerMessage::Error {
+            error: ProtocolError {
+                code: ErrorCode::UnsupportedCapability,
+                ..
+            },
+            ..
+        }
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn floating_window_reports_the_exact_output_crop_consumed_by_screencopy() {
+    let path = test_socket();
+    let mut snapshot = FixedInspector.inspect(true).unwrap();
+    let bounds = LogicalRect {
+        origin: LogicalPoint { x: 120.0, y: 80.0 },
+        width: 800.0,
+        height: 600.0,
+    };
+    snapshot.windows[0].logical_bounds = Some(bounds);
+    snapshot.windows[0].is_floating = true;
+    snapshot.windows[0].workspace_id = Some(waldo_protocol::WorkspaceId::new(1));
+    snapshot.windows[0].capture = waldo_protocol::WindowCaptureCapability {
+        available: true,
+        limitation: Some("foreground output crop".into()),
+    };
+    snapshot.workspaces = vec![waldo_protocol::WorkspaceState {
+        id: waldo_protocol::WorkspaceId::new(1),
+        index: 1,
+        name: None,
+        output_id: Some(OutputId("DP-1".into())),
+        active: true,
+        focused: true,
+    }];
+    let regions = Arc::new(Mutex::new(Vec::new()));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(MutableInspector {
+            snapshot: Arc::new(Mutex::new(snapshot)),
+        }),
+        Arc::new(RegionRecordingCapturer {
+            regions: Arc::clone(&regions),
+        }),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client =
+        ControllerClient::connect(&path, ClientId::new("floating-capture-test").unwrap())
+            .await
+            .unwrap();
+
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Window {
+                    window_id: WindowId("41".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("floating-window observation failed")
+    };
+    assert_eq!(
+        BASE64.decode(&observation.image.data_base64).unwrap(),
+        b"floating-window-marker"
+    );
+    assert_eq!(
+        observation.capture.route,
+        waldo_protocol::CaptureRoute::VisibleWindowCrop
+    );
+    assert_eq!(observation.capture.output_local_bounds, Some(bounds));
+    assert_eq!(observation.coordinates.logical_bounds, bounds);
+    assert_eq!(
+        observation.coordinates.source_pixels,
+        waldo_protocol::PixelSize {
+            width: 800,
+            height: 600,
+        }
+    );
+    assert_eq!(
+        regions.lock().unwrap().as_slice(),
+        &[RecordedRegion {
+            output: "DP-1".into(),
+            x: 120,
+            y: 80,
+            width: 800,
+            height: 600,
+        }]
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn topology_mutation_refreshes_query_observe_grounding_and_final_dispatch() {
+    let path = test_socket();
+    let snapshot = Arc::new(Mutex::new(FixedInspector.inspect(false).unwrap()));
+    let inspector = MutableInspector {
+        snapshot: Arc::clone(&snapshot),
+    };
+    let recorded_actions = Arc::new(Mutex::new(Vec::new()));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(inspector),
+        Arc::new(ContinuationCapturer {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(RecordingPointerExecutor {
+            actions: Arc::clone(&recorded_actions),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("topology-test").unwrap())
+        .await
+        .unwrap();
+
+    let before = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed {
+        observation: before,
+        ..
+    } = before
+    else {
+        panic!("initial topology observation failed")
+    };
+
+    {
+        let mut topology = snapshot.lock().unwrap();
+        topology.outputs[0].id = OutputId("DP-2".into());
+        topology.outputs[0].name = "DP-2".into();
+        topology.outputs[0].logical_bounds.origin.x = 1920.0;
+    }
+
+    let queried = client
+        .request(&ClientMessage::Query {
+            request_id: RequestId::new(3),
+            request: QueryRequest::default(),
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Queried { result, .. } = queried else {
+        panic!("topology query failed")
+    };
+    assert_eq!(result.outputs[0].id, OutputId("DP-2".into()));
+
+    let stale = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(4),
+            request: waldo_protocol::ActRequest {
+                observation_id: before.id,
+                actions: vec![Action::PointerMoveAbsolute {
+                    position: LogicalPoint { x: 100.0, y: 100.0 },
+                }],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        stale,
+        ServerMessage::Error {
+            error: ProtocolError {
+                code: ErrorCode::TargetLost,
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(recorded_actions.lock().unwrap().is_empty());
+
+    let refreshed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(5),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-2".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed {
+        observation: refreshed,
+        ..
+    } = refreshed
+    else {
+        panic!("refreshed topology observation failed")
+    };
+    let target = LogicalPoint {
+        x: 2220.0,
+        y: 300.0,
+    };
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(6),
+            request: waldo_protocol::ActRequest {
+                observation_id: refreshed.id,
+                actions: vec![Action::PointerMoveAbsolute { position: target }],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(acted, ServerMessage::Acted { .. }));
+    assert_eq!(
+        recorded_actions.lock().unwrap().as_slice(),
+        &[Action::PointerMoveAbsolute { position: target }]
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn cross_output_drag_refusal_reaches_no_input_consumer_and_leaves_no_lease() {
+    let path = test_socket();
+    let mut topology = FixedInspector.inspect(false).unwrap();
+    let mut second = topology.outputs[0].clone();
+    second.id = OutputId("DP-2".into());
+    second.name = "DP-2".into();
+    second.logical_bounds.origin.x = 1920.0;
+    topology.outputs.push(second);
+    let inspector = MutableInspector {
+        snapshot: Arc::new(Mutex::new(topology)),
+    };
+    let recorded_actions = Arc::new(Mutex::new(Vec::new()));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(inspector),
+        Arc::new(FixedCapturer),
+        Arc::new(RecordingPointerExecutor {
+            actions: Arc::clone(&recorded_actions),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("cross-output-test").unwrap())
+        .await
+        .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("cross-output test observation failed")
+    };
+    let refused = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![Action::PointerDrag {
+                    from: LogicalPoint {
+                        x: 1800.0,
+                        y: 500.0,
+                    },
+                    to: LogicalPoint {
+                        x: 2100.0,
+                        y: 500.0,
+                    },
+                    button: waldo_protocol::PointerButton::Primary,
+                    duration_ms: 250,
+                }],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Error { error, .. } = refused else {
+        panic!("cross-output drag was not refused")
+    };
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+    assert!(
+        error
+            .message
+            .contains("before pointer movement or button press")
+    );
+    assert!(recorded_actions.lock().unwrap().is_empty());
+
+    let queried = client
+        .request(&ClientMessage::Query {
+            request_id: RequestId::new(4),
+            request: QueryRequest::default(),
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Queried { result, .. } = queried else {
+        panic!("post-refusal query failed")
+    };
+    assert_eq!(result.driving_session, None);
+    assert_eq!(result.driving_connection, None);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
     let _ = fs::remove_dir_all(path.parent().unwrap());
 }
 

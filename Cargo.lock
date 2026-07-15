@@ -1299,6 +1299,8 @@ dependencies = [
 name = "waldo-mcp"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "image",
  "schemars",
  "serde",
  "serde_json",
