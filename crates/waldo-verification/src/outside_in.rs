@@ -12,7 +12,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::{DynamicImage, GenericImageView, ImageFormat};
-use niri_ipc::{Request, Response, socket::Socket};
+use niri_ipc::{Action as NiriAction, Request, Response, socket::Socket};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use waldo_verification::{FixtureRect, TargetGrid, capture_niri_topology};
@@ -35,6 +35,21 @@ pub struct OutsideInSummary {
     continuous_completion: ContinuousCompletionResult,
     transparent_interception: Option<TransparentInterceptionResult>,
     contradictory_state: Option<ContradictoryStateResult>,
+    controller_socket_removed: bool,
+    sensitive_payloads_retained: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AccessibilitySummary {
+    identity: IdentityEvidence,
+    invoke_reached_application: bool,
+    set_text_reached_application: bool,
+    focus_outcome: &'static str,
+    focus_truthful: bool,
+    set_value_identity_refresh_reached_application: bool,
+    selection_reached_application: bool,
+    stale_replacement_refused: bool,
+    ambiguity_propagated: bool,
     controller_socket_removed: bool,
     sensitive_payloads_retained: bool,
 }
@@ -193,6 +208,21 @@ struct ToolObservation {
     logical_height: f64,
     image: DynamicImage,
     image_digest: String,
+    accessibility: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccessibilityFixtureState {
+    title: String,
+    invoke_count: u64,
+    entry_text: String,
+    entry_focused: bool,
+    entry_generation: u64,
+    spin_value: f64,
+    spin_generation: u64,
+    selected_label: Option<String>,
+    duplicate_open: bool,
+    control_sequence: u64,
 }
 
 struct ChildGuard(Child);
@@ -353,43 +383,71 @@ impl McpClient {
     }
 }
 
-pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Error>> {
-    prepare_evidence_directory(&options.evidence_directory)?;
-    let scratch_path = std::env::temp_dir().join(format!(
-        "waldo-verification-{}-{}",
-        std::process::id(),
-        unix_ns()?
-    ));
-    let scratch = ScratchDirectory::create(scratch_path.clone())?;
-    let runtime = scratch.path().join("runtime");
-    let socket_directory = runtime.join("waldo");
-    fs::create_dir_all(&socket_directory)?;
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
-    fs::set_permissions(&socket_directory, fs::Permissions::from_mode(0o700))?;
-    let socket = socket_directory.join("controller.sock");
+struct RuntimeHarness {
+    scratch_path: PathBuf,
+    scratch: ScratchDirectory,
+    controller: ChildGuard,
+    mcp: McpClient,
+    identity: IdentityEvidence,
+}
 
-    let mut controller = ChildGuard(
-        Command::new(&options.waldod)
-            .args(["--socket", socket.to_str().ok_or("non-UTF-8 socket path")?])
-            .stderr(Stdio::inherit())
-            .spawn()?,
-    );
-    wait_for_path(&socket, Duration::from_secs(5))?;
-    let mut mcp = McpClient::start(&options.mcp, &runtime)?;
-    let current_exe = std::env::current_exe()?;
-    let identity = IdentityEvidence {
-        waldo_commit: git_ref("main")?,
-        verifier_commit: git_ref("HEAD")?,
-        seed: options.seed,
-        binaries: vec![
-            file_identity(&options.waldod)?,
-            file_identity(&options.mcp)?,
-            file_identity(&current_exe)?,
-        ],
-        fixture: file_identity(&options.fixture)?,
-    };
-    write_json(options.evidence_directory.join("identity.json"), &identity)?;
-    let query = mcp.call(
+impl RuntimeHarness {
+    fn start(options: &Options) -> Result<Self, Box<dyn std::error::Error>> {
+        prepare_evidence_directory(&options.evidence_directory)?;
+        let scratch_path = std::env::temp_dir().join(format!(
+            "waldo-verification-{}-{}",
+            std::process::id(),
+            unix_ns()?
+        ));
+        let scratch = ScratchDirectory::create(scratch_path.clone())?;
+        let runtime = scratch.path().join("runtime");
+        let socket_directory = runtime.join("waldo");
+        fs::create_dir_all(&socket_directory)?;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&socket_directory, fs::Permissions::from_mode(0o700))?;
+        let socket = socket_directory.join("controller.sock");
+
+        let controller = ChildGuard(
+            Command::new(&options.waldod)
+                .args(["--socket", socket.to_str().ok_or("non-UTF-8 socket path")?])
+                .stderr(Stdio::inherit())
+                .spawn()?,
+        );
+        wait_for_path(&socket, Duration::from_secs(5))?;
+        let mcp = McpClient::start(&options.mcp, &runtime)?;
+        let current_exe = std::env::current_exe()?;
+        let identity = IdentityEvidence {
+            waldo_commit: git_ref("main")?,
+            verifier_commit: git_ref("HEAD")?,
+            seed: options.seed,
+            binaries: vec![
+                file_identity(&options.waldod)?,
+                file_identity(&options.mcp)?,
+                file_identity(&current_exe)?,
+            ],
+            fixture: file_identity(&options.fixture)?,
+        };
+        write_json(options.evidence_directory.join("identity.json"), &identity)?;
+        Ok(Self {
+            scratch_path,
+            scratch,
+            controller,
+            mcp,
+            identity,
+        })
+    }
+
+    fn shutdown(mut self) -> Result<(IdentityEvidence, bool), Box<dyn std::error::Error>> {
+        self.mcp.child.terminate();
+        self.controller.terminate();
+        self.scratch.remove()?;
+        Ok((self.identity, !self.scratch_path.exists()))
+    }
+}
+
+pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Error>> {
+    let mut harness = RuntimeHarness::start(&options)?;
+    let query = harness.mcp.call(
         "tools/call",
         json!({"name": "query", "arguments": {"include_windows": false}}),
     )?;
@@ -398,15 +456,19 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
         &query,
     )?;
 
-    let delayed = run_delayed(&options, &mut mcp)?;
-    let _ = mcp.call("tools/call", json!({"name": "stop", "arguments": {}}));
-    let continuous = run_continuous(&options, &mut mcp)?;
-    let _ = mcp.call("tools/call", json!({"name": "stop", "arguments": {}}));
+    let delayed = run_delayed(&options, &mut harness.mcp)?;
+    let _ = harness
+        .mcp
+        .call("tools/call", json!({"name": "stop", "arguments": {}}));
+    let continuous = run_continuous(&options, &mut harness.mcp)?;
+    let _ = harness
+        .mcp
+        .call("tools/call", json!({"name": "stop", "arguments": {}}));
     let (transparent_interception, contradictory_state) = if continuous.outcome == "passed" {
         {
-            let interception = run_transparent_interception(&options, &mut mcp)?;
+            let interception = run_transparent_interception(&options, &mut harness.mcp)?;
             let contradiction = if interception.service_healthy_after_stop {
-                Some(run_contradictory_state(&options, &mut mcp)?)
+                Some(run_contradictory_state(&options, &mut harness.mcp)?)
             } else {
                 None
             };
@@ -417,9 +479,7 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
     };
 
     let output_id = delayed.output_id.clone();
-    mcp.child.terminate();
-    controller.terminate();
-    scratch.remove()?;
+    let (identity, controller_socket_removed) = harness.shutdown()?;
 
     let summary = OutsideInSummary {
         identity,
@@ -429,7 +489,215 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
         continuous_completion: continuous,
         transparent_interception,
         contradictory_state,
-        controller_socket_removed: !scratch_path.exists(),
+        controller_socket_removed,
+        sensitive_payloads_retained: false,
+    };
+    write_json(options.evidence_directory.join("summary.json"), &summary)?;
+    Ok(summary)
+}
+
+pub fn run_accessibility(
+    options: Options,
+) -> Result<AccessibilitySummary, Box<dyn std::error::Error>> {
+    let mut harness = RuntimeHarness::start(&options)?;
+    let directory = options.evidence_directory.join("accessibility");
+    fs::create_dir_all(&directory)?;
+    let state_path = directory.join("fixture-state.json");
+    let control_path = directory.join("fixture-control.json");
+    write_json(
+        control_path.clone(),
+        &json!({"sequence": 0, "action": "none"}),
+    )?;
+    let mut fixture = start_accessibility_fixture(&options, &state_path, &control_path)?;
+    let initial = wait_for_accessibility_state(&state_path, |_| true)?;
+    thread::sleep(Duration::from_millis(500));
+    let output_id = focused_output()?;
+    write_json(
+        directory.join("niri-topology.json"),
+        &capture_niri_topology()?,
+    )?;
+
+    let fixture_title = initial.title.clone();
+    let observed = observe_accessibility(
+        &mut harness.mcp,
+        &output_id,
+        &fixture_title,
+        &directory,
+        "initial",
+    )?;
+    let (invoke_handle, invoke_action) =
+        accessibility_action(&observed, "Invoke accessibility action")?;
+    let invoke_response = accessibility_act(
+        &mut harness.mcp,
+        &observed,
+        &invoke_handle,
+        json!({"type": "invoke", "action": invoke_action}),
+    )?;
+    write_json(directory.join("invoke-response.json"), &invoke_response)?;
+    let invoked = wait_for_accessibility_state(&state_path, |state| state.invoke_count == 1)?;
+
+    let observed = observe_accessibility(
+        &mut harness.mcp,
+        &output_id,
+        &fixture_title,
+        &directory,
+        "set-text",
+    )?;
+    let entry_handle = accessibility_handle(&observed, "Focus and SetText target")?;
+    let set_text_response = accessibility_act(
+        &mut harness.mcp,
+        &observed,
+        &entry_handle,
+        json!({"type": "set_text", "text": "E2E016 exact text"}),
+    )?;
+    write_json(directory.join("set-text-response.json"), &set_text_response)?;
+    let text_set =
+        wait_for_accessibility_state(&state_path, |state| state.entry_text == "E2E016 exact text")?;
+
+    let observed = observe_accessibility(
+        &mut harness.mcp,
+        &output_id,
+        &fixture_title,
+        &directory,
+        "focus",
+    )?;
+    let entry_handle = accessibility_handle(&observed, "Focus and SetText target")?;
+    let focus_response = accessibility_act(
+        &mut harness.mcp,
+        &observed,
+        &entry_handle,
+        json!({"type": "focus"}),
+    )?;
+    write_json(directory.join("focus-response.json"), &focus_response)?;
+    let focused = read_accessibility_state(&state_path)?;
+    let focus_error = first_receipt_error(&focus_response);
+    let focus_supported =
+        focused.entry_focused && first_receipt_status(&focus_response) == Some("executed".into());
+    let focus_refused = focus_error.as_ref().is_some_and(|error| {
+        error["code"] == "unsupported_capability" && error["retryable"] == false
+    });
+    let (focus_outcome, focus_truthful) = if focus_supported {
+        ("supported_and_focused", true)
+    } else if focus_refused && !focused.entry_focused {
+        ("unsupported_before_mutation", true)
+    } else {
+        ("failed", false)
+    };
+
+    let observed = observe_accessibility(
+        &mut harness.mcp,
+        &output_id,
+        &fixture_title,
+        &directory,
+        "set-value",
+    )?;
+    let value_handle = accessibility_handle(&observed, "SetValue target")?;
+    write_json(
+        control_path.clone(),
+        &json!({"sequence": 1, "action": "refresh_value"}),
+    )?;
+    wait_for_accessibility_state(&state_path, |state| state.spin_generation == 1)?;
+    thread::sleep(Duration::from_millis(200));
+    let set_value_response = accessibility_act(
+        &mut harness.mcp,
+        &observed,
+        &value_handle,
+        json!({"type": "set_value", "value": "37"}),
+    )?;
+    write_json(
+        directory.join("set-value-response.json"),
+        &set_value_response,
+    )?;
+    let valued = wait_for_accessibility_state(&state_path, |state| {
+        (state.spin_value - 37.0).abs() < f64::EPSILON
+    })?;
+
+    let observed = observe_accessibility(
+        &mut harness.mcp,
+        &output_id,
+        &fixture_title,
+        &directory,
+        "select",
+    )?;
+    let selection_handle = accessibility_parent_handle(&observed, "Beta selection")?;
+    let select_response = accessibility_act(
+        &mut harness.mcp,
+        &observed,
+        &selection_handle,
+        json!({"type": "select"}),
+    )?;
+    write_json(directory.join("select-response.json"), &select_response)?;
+    let selected = wait_for_accessibility_state(&state_path, |state| {
+        state.selected_label.as_deref() == Some("Beta selection")
+    })?;
+
+    let observed = observe_accessibility(
+        &mut harness.mcp,
+        &output_id,
+        &fixture_title,
+        &directory,
+        "stale",
+    )?;
+    let stale_handle = accessibility_handle(&observed, "Focus and SetText target")?;
+    write_json(
+        control_path.clone(),
+        &json!({"sequence": 2, "action": "recreate_entry"}),
+    )?;
+    let recreated = wait_for_accessibility_state(&state_path, |state| state.entry_generation == 1)?;
+    let stale_response = accessibility_act(
+        &mut harness.mcp,
+        &observed,
+        &stale_handle,
+        json!({"type": "set_text", "text": "must not be written"}),
+    )?;
+    write_json(directory.join("stale-response.json"), &stale_response)?;
+    let after_stale = read_accessibility_state(&state_path)?;
+    let stale_replacement_refused = first_receipt_error(&stale_response)
+        .is_some_and(|error| error["code"] == "stale_accessibility_target")
+        && recreated.entry_text.is_empty()
+        && after_stale.entry_text.is_empty();
+
+    write_json(
+        control_path,
+        &json!({"sequence": 3, "action": "open_duplicate"}),
+    )?;
+    let duplicate = wait_for_accessibility_state(&state_path, |state| state.duplicate_open)?;
+    thread::sleep(Duration::from_millis(500));
+    let ambiguous_request = json!({
+        "name": "observe",
+        "arguments": {
+            "source": {"type": "output", "output_id": output_id},
+            "continue_from": null,
+            "include_accessibility": true
+        }
+    });
+    let ambiguous_response = harness.mcp.call("tools/call", ambiguous_request)?;
+    write_json(
+        directory.join("ambiguity-response.json"),
+        &ambiguous_response,
+    )?;
+    let ambiguity_propagated = ambiguous_response["result"]["isError"] == true
+        && ambiguous_response["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("ambiguous_target:"));
+
+    let _ = harness
+        .mcp
+        .call("tools/call", json!({"name": "stop", "arguments": {}}));
+    fixture.terminate();
+    let (identity, controller_socket_removed) = harness.shutdown()?;
+    let summary = AccessibilitySummary {
+        identity,
+        invoke_reached_application: initial.invoke_count == 0 && invoked.invoke_count == 1,
+        set_text_reached_application: text_set.entry_text == "E2E016 exact text",
+        focus_outcome,
+        focus_truthful,
+        set_value_identity_refresh_reached_application: valued.spin_generation == 1
+            && (valued.spin_value - 37.0).abs() < f64::EPSILON,
+        selection_reached_application: selected.selected_label.as_deref() == Some("Beta selection"),
+        stale_replacement_refused,
+        ambiguity_propagated: duplicate.control_sequence == 3 && ambiguity_propagated,
+        controller_socket_removed,
         sensitive_payloads_retained: false,
     };
     write_json(options.evidence_directory.join("summary.json"), &summary)?;
@@ -1073,6 +1341,220 @@ fn start_fixture(
     ))
 }
 
+fn start_accessibility_fixture(
+    options: &Options,
+    state: &Path,
+    control: &Path,
+) -> Result<ChildGuard, Box<dyn std::error::Error>> {
+    Ok(ChildGuard(
+        Command::new(&options.python)
+            .arg(&options.fixture)
+            .args(["--state", state.to_str().ok_or("non-UTF-8 state path")?])
+            .args([
+                "--control",
+                control.to_str().ok_or("non-UTF-8 control path")?,
+            ])
+            .args(["--seed", &options.seed.to_string()])
+            .stderr(Stdio::inherit())
+            .spawn()?,
+    ))
+}
+
+fn observe_accessibility(
+    mcp: &mut McpClient,
+    output_id: &str,
+    fixture_title: &str,
+    directory: &Path,
+    label: &str,
+) -> Result<ToolObservation, Box<dyn std::error::Error>> {
+    focus_niri_window(fixture_title)?;
+    thread::sleep(Duration::from_millis(100));
+    let request = json!({
+        "name": "observe",
+        "arguments": {
+            "source": {"type": "output", "output_id": output_id},
+            "continue_from": null,
+            "include_accessibility": true
+        }
+    });
+    write_json(
+        directory.join(format!("{label}-observe-request.json")),
+        &request,
+    )?;
+    let response = mcp
+        .call_with_timeout("tools/call", request, Duration::from_secs(30))?
+        .ok_or("accessibility Observe exceeded the 30-second verifier limit")?;
+    let observation = parse_observation(&response, directory, &format!("{label}-observe"))?;
+    write_redacted_response(
+        directory.join(format!("{label}-observe-response.json")),
+        &response,
+        &observation,
+    )?;
+    Ok(observation)
+}
+
+fn focus_niri_window(title: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut socket = Socket::connect()?;
+    let reply = socket.send(Request::Windows)??;
+    let Response::Windows(windows) = reply else {
+        return Err("Niri returned an unexpected response to Windows".into());
+    };
+    let matches: Vec<_> = windows
+        .iter()
+        .filter(|window| window.title.as_deref() == Some(title))
+        .collect();
+    let [window] = matches.as_slice() else {
+        return Err(format!(
+            "expected one Niri fixture window titled {title:?}, found {}",
+            matches.len()
+        )
+        .into());
+    };
+    let mut socket = Socket::connect()?;
+    let reply = socket.send(Request::Action(NiriAction::FocusWindow { id: window.id }))??;
+    if !matches!(reply, Response::Handled) {
+        return Err("Niri did not acknowledge fixture focus".into());
+    }
+    Ok(())
+}
+
+fn accessibility_handle(
+    observation: &ToolObservation,
+    name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let matches: Vec<_> = observation
+        .accessibility
+        .iter()
+        .filter(|node| node["name"].as_str() == Some(name))
+        .collect();
+    let [node] = matches.as_slice() else {
+        return Err(format!(
+            "expected one accessibility node named {name:?}, found {}",
+            matches.len()
+        )
+        .into());
+    };
+    node["handle"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("accessibility node {name:?} has no string handle").into())
+}
+
+fn accessibility_action(
+    observation: &ToolObservation,
+    name: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let matches: Vec<_> = observation
+        .accessibility
+        .iter()
+        .filter(|node| node["name"].as_str() == Some(name))
+        .filter_map(|node| {
+            let action = node["actions"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|action| action.eq_ignore_ascii_case("click"))?;
+            Some((node["handle"].as_str()?.to_owned(), action.to_owned()))
+        })
+        .collect();
+    let [selected] = matches.as_slice() else {
+        return Err(format!(
+            "expected one clickable accessibility node named {name:?}, found {}",
+            matches.len()
+        )
+        .into());
+    };
+    Ok(selected.clone())
+}
+
+fn accessibility_parent_handle(
+    observation: &ToolObservation,
+    child_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let child = accessibility_handle(observation, child_name)?;
+    let matches: Vec<_> = observation
+        .accessibility
+        .iter()
+        .filter(|node| {
+            node["children"]
+                .as_array()
+                .is_some_and(|children| children.iter().any(|handle| handle == &child))
+        })
+        .collect();
+    let [parent] = matches.as_slice() else {
+        return Err(format!(
+            "expected one accessibility parent for {child_name:?}, found {}",
+            matches.len()
+        )
+        .into());
+    };
+    parent["handle"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("accessibility parent for {child_name:?} has no handle").into())
+}
+
+fn accessibility_act(
+    mcp: &mut McpClient,
+    observation: &ToolObservation,
+    element: &str,
+    operation: Value,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    mcp.call_with_timeout(
+        "tools/call",
+        json!({
+            "name": "act",
+            "arguments": {
+                "observation_id": observation.id,
+                "actions": [{
+                    "type": "accessibility",
+                    "element": element,
+                    "operation": operation
+                }],
+                "verification": []
+            }
+        }),
+        Duration::from_secs(30),
+    )?
+    .ok_or_else(|| "accessibility Act exceeded the 30-second verifier limit".into())
+}
+
+fn first_receipt_error(response: &Value) -> Option<Value> {
+    response["result"]["structuredContent"]["result"]["receipts"]
+        .as_array()?
+        .first()?
+        .get("error")
+        .cloned()
+}
+
+fn read_accessibility_state(
+    path: &Path,
+) -> Result<AccessibilityFixtureState, Box<dyn std::error::Error>> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn wait_for_accessibility_state(
+    path: &Path,
+    predicate: impl Fn(&AccessibilityFixtureState) -> bool,
+) -> Result<AccessibilityFixtureState, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(state) = read_accessibility_state(path)
+            && predicate(&state)
+        {
+            return Ok(state);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for accessibility fixture at {}",
+                path.display()
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn parse_observation(
     response: &Value,
     directory: &Path,
@@ -1137,6 +1619,10 @@ fn parse_observation(
             .ok_or("logical height is not numeric")?,
         image,
         image_digest,
+        accessibility: observation["accessibility"]
+            .as_array()
+            .cloned()
+            .ok_or("observation accessibility is not an array")?,
     })
 }
 
@@ -1483,6 +1969,7 @@ mod tests {
             logical_height: 1440.0,
             image: DynamicImage::ImageRgba8(RgbaImage::new(1, 1)),
             image_digest: String::new(),
+            accessibility: Vec::new(),
         };
 
         let logical = model_to_logical(&observation, 1024, 576);

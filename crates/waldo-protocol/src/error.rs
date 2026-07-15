@@ -13,6 +13,7 @@ pub enum ErrorCode {
     NotLeaseOwner,
     StaleObservation,
     StaleAccessibilityTarget,
+    AmbiguousTarget,
     TargetLost,
     GeometryChanged,
     FocusChanged,

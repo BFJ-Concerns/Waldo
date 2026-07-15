@@ -145,6 +145,9 @@ pub(crate) async fn capture_observation(
                 .await
                 {
                     Ok(Ok(snapshot)) => (snapshot.nodes, snapshot.focused, true),
+                    Ok(Err(error)) if error.code == ErrorCode::AmbiguousTarget => {
+                        return Err(error);
+                    }
                     _ => (Vec::new(), None, false),
                 }
             }
