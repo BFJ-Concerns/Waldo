@@ -31,7 +31,7 @@ pub struct ObservationGrounding {
     /// Whether the observation requested an AT-SPI semantic overlay.
     pub include_accessibility: bool,
     pub cursor_position: Option<waldo_protocol::LogicalPoint>,
-    /// Process-local fingerprint used only for exact frame-change predicates.
+    /// Cursor-inclusive fingerprint used for continuation and cursor-only evidence.
     pub frame_fingerprint: u64,
     /// Cursor-free fingerprint used for application-state change predicates.
     pub application_frame_fingerprint: u64,

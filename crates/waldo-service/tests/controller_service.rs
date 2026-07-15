@@ -140,6 +140,10 @@ struct CursorOnlyCapturer {
     composite_calls: AtomicUsize,
 }
 
+struct ApplicationChangeCapturer {
+    application_calls: AtomicUsize,
+}
+
 struct ContinuousApplicationCapturer {
     calls: AtomicUsize,
 }
@@ -314,6 +318,46 @@ impl ScreenCapturer for CursorOnlyCapturer {
             width: 1920,
             height: 1080,
             captured_at_unix_ms: 1,
+        })
+    }
+}
+
+impl ScreenCapturer for ApplicationChangeCapturer {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn capture_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        Ok(Capture {
+            png: b"cursor-inclusive-frame".to_vec(),
+            width: 1920,
+            height: 1080,
+            captured_at_unix_ms: 1,
+        })
+    }
+
+    fn capture_region(
+        &self,
+        output_name: &str,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture_output(output_name)
+    }
+
+    fn capture_application_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        let call = self.application_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Capture {
+            png: if call == 0 {
+                b"application-before".to_vec()
+            } else {
+                b"application-after".to_vec()
+            },
+            width: 1920,
+            height: 1080,
+            captured_at_unix_ms: call as u64 + 1,
         })
     }
 }
@@ -1891,6 +1935,91 @@ async fn cursor_only_damage_cannot_satisfy_application_frame_change() {
         result.completion_evidence.frame_state,
         ApplicationFrameState::CursorOnly
     );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn application_frame_change_satisfies_wait_at_the_final_consumer() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(ApplicationChangeCapturer {
+            application_calls: AtomicUsize::new(0),
+        }),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client =
+        ControllerClient::connect(&path, ClientId::new("application-change-test").unwrap())
+            .await
+            .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![
+                    Action::PointerClick {
+                        position: LogicalPoint { x: 20.0, y: 20.0 },
+                        button: waldo_protocol::PointerButton::Primary,
+                        count: 1,
+                    },
+                    Action::Wait {
+                        predicate: Predicate::FrameChanged {
+                            from: observation.id,
+                        },
+                        timeout_ms: 50,
+                    },
+                ],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("application-change batch did not return an Act result")
+    };
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(
+        result.receipts[0].status,
+        waldo_protocol::ReceiptStatus::Executed
+    );
+    assert_eq!(
+        result.receipts[1].status,
+        waldo_protocol::ReceiptStatus::Executed
+    );
+    assert_eq!(result.receipts[1].predicate_result, Some(true));
+    assert_eq!(
+        result.completion_evidence.frame_state,
+        ApplicationFrameState::Settled
+    );
+    assert!(!result.completion_evidence.settle_deadline_reached);
 
     drop(client);
     shutdown_tx.send(()).unwrap();
