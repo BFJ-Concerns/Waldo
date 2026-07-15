@@ -183,6 +183,7 @@ pub enum GroundingFailure {
     GeometryChanged,
     FocusChanged,
     CrossOutputDragUnsupported,
+    MissingCursorGrounding,
     TargetOutsideObservation,
 }
 
@@ -194,6 +195,7 @@ impl GroundingFailure {
             Self::GeometryChanged => ErrorCode::GeometryChanged,
             Self::FocusChanged => ErrorCode::FocusChanged,
             Self::CrossOutputDragUnsupported => ErrorCode::UnsupportedCapability,
+            Self::MissingCursorGrounding => ErrorCode::InvalidRequest,
             Self::TargetOutsideObservation => ErrorCode::InvalidRequest,
         }
     }
@@ -205,6 +207,7 @@ impl GroundingFailure {
             Self::GeometryChanged => StopReason::GeometryChanged,
             Self::FocusChanged => StopReason::FocusChanged,
             Self::CrossOutputDragUnsupported => StopReason::ExecutionFailed,
+            Self::MissingCursorGrounding => StopReason::ExecutionFailed,
             Self::TargetOutsideObservation => StopReason::ExecutionFailed,
         }
     }
@@ -219,6 +222,9 @@ impl GroundingFailure {
             Self::FocusChanged => "foreground focus changed after the cited observation",
             Self::CrossOutputDragUnsupported => {
                 "cross-output drag is unsupported and was refused before pointer movement or button press"
+            }
+            Self::MissingCursorGrounding => {
+                "the action requires a cursor position, but the cited observation and preceding executed actions provide none"
             }
             Self::TargetOutsideObservation => {
                 "an absolute pointer target lies outside the pixels in the cited observation"
@@ -299,13 +305,11 @@ pub fn validate_grounding(
     if contains_cross_output_drag(actions, outputs) {
         return Err(GroundingFailure::CrossOutputDragUnsupported);
     }
-    if !pointer_targets_within(
+    pointer_targets_within(
         actions,
         recorded.observed_logical_bounds,
         recorded.cursor_position,
-    ) {
-        return Err(GroundingFailure::TargetOutsideObservation);
-    }
+    )?;
     Ok(())
 }
 
@@ -328,18 +332,18 @@ fn pointer_targets_within(
     actions: &[Action],
     bounds: LogicalRect,
     mut cursor: Option<LogicalPoint>,
-) -> bool {
+) -> Result<(), GroundingFailure> {
     for action in actions {
         match action {
             Action::PointerMoveAbsolute { position } | Action::PointerClick { position, .. } => {
                 if !point_within(*position, bounds) {
-                    return false;
+                    return Err(GroundingFailure::TargetOutsideObservation);
                 }
                 cursor = Some(*position);
             }
             Action::PointerDrag { from, to, .. } => {
                 if !point_within(*from, bounds) || !point_within(*to, bounds) {
-                    return false;
+                    return Err(GroundingFailure::TargetOutsideObservation);
                 }
                 cursor = Some(*to);
             }
@@ -349,32 +353,35 @@ fn pointer_targets_within(
                     .copied()
                     .all(|point| point_within(point, bounds))
                 {
-                    return false;
+                    return Err(GroundingFailure::TargetOutsideObservation);
                 }
                 cursor = points.last().copied().or(cursor);
             }
             Action::PointerMoveRelative { delta } => {
                 let Some(current) = cursor else {
-                    return false;
+                    return Err(GroundingFailure::MissingCursorGrounding);
                 };
                 let destination = LogicalPoint {
                     x: current.x + delta.x,
                     y: current.y + delta.y,
                 };
                 if !point_within(destination, bounds) {
-                    return false;
+                    return Err(GroundingFailure::TargetOutsideObservation);
                 }
                 cursor = Some(destination);
             }
-            Action::PointerButton { .. } | Action::Scroll { .. }
-                if !cursor.is_some_and(|point| point_within(point, bounds)) =>
-            {
-                return false;
+            Action::PointerButton { .. } | Action::Scroll { .. } => {
+                let Some(position) = cursor else {
+                    return Err(GroundingFailure::MissingCursorGrounding);
+                };
+                if !point_within(position, bounds) {
+                    return Err(GroundingFailure::TargetOutsideObservation);
+                }
             }
             _ => {}
         }
     }
-    true
+    Ok(())
 }
 
 fn point_within(point: LogicalPoint, bounds: LogicalRect) -> bool {
@@ -895,7 +902,7 @@ mod tests {
                 Some(&WindowId("41".into())),
                 &actions
             ),
-            Err(GroundingFailure::TargetOutsideObservation)
+            Err(GroundingFailure::MissingCursorGrounding)
         );
     }
 

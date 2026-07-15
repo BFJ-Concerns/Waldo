@@ -116,10 +116,10 @@ struct KeyboardState {
     queue: EventQueue<WaylandState>,
     keyboard: ZwpVirtualKeyboardV1,
     strokes: BTreeMap<u32, KeyStroke>,
+    named_keycodes: BTreeMap<u32, u32>,
     shift_keycode: u32,
-    modifiers_by_keycode: BTreeMap<u32, u32>,
-    depressed_modifiers: u32,
-    held_keys: BTreeSet<u32>,
+    shift_mask: u32,
+    model: KeyboardModel,
 }
 
 impl KeyboardState {
@@ -127,8 +127,11 @@ impl KeyboardState {
         let CompiledKeymap {
             bytes: keymap_bytes,
             strokes,
+            named_keycodes,
             shift_keycode,
+            shift_mask,
             modifiers_by_keycode,
+            locking_modifiers_by_keycode,
         } = compile_keymap(layout)?;
 
         let connection = Connection::connect_to_env()
@@ -165,10 +168,10 @@ impl KeyboardState {
             queue,
             keyboard,
             strokes,
+            named_keycodes,
             shift_keycode,
-            modifiers_by_keycode,
-            depressed_modifiers: 0,
-            held_keys: BTreeSet::new(),
+            shift_mask,
+            model: KeyboardModel::new(modifiers_by_keycode, locking_modifiers_by_keycode),
         })
     }
 
@@ -176,28 +179,12 @@ impl KeyboardState {
         let prepared = self
             .prepare(action)
             .map_err(ActionExecutionFailure::not_executed)?;
-        match prepared {
-            PreparedKeyboardAction::Key { keycode, state } => self.key(keycode, state),
-            PreparedKeyboardAction::Chord(keycodes) => {
-                for keycode in &keycodes {
-                    self.key(*keycode, InputState::Pressed);
-                }
-                for keycode in keycodes.iter().rev() {
-                    self.key(*keycode, InputState::Released);
-                }
-            }
-            PreparedKeyboardAction::Text(strokes) => {
-                for stroke in strokes {
-                    if stroke.shift {
-                        self.key(self.shift_keycode, InputState::Pressed);
-                    }
-                    self.key(stroke.keycode, InputState::Pressed);
-                    self.key(stroke.keycode, InputState::Released);
-                    if stroke.shift {
-                        self.key(self.shift_keycode, InputState::Released);
-                    }
-                }
-            }
+        let transitions = self
+            .model
+            .plan(prepared, self.shift_keycode, self.shift_mask)
+            .map_err(ActionExecutionFailure::not_executed)?;
+        for transition in transitions {
+            self.emit(transition);
         }
         self.connection.flush().map_err(|error| {
             ActionExecutionFailure::indeterminate(
@@ -243,6 +230,14 @@ impl KeyboardState {
                         retryable: false,
                     });
                 }
+                if self.model.has_active_modifiers() {
+                    return Err(ProtocolError {
+                        code: ErrorCode::UnsupportedCapability,
+                        message: "virtual-keyboard text is unavailable while an explicit modifier or lock state is active"
+                            .into(),
+                        retryable: false,
+                    });
+                }
                 Ok(PreparedKeyboardAction::Text(self.resolve_text(text)?))
             }
             _ => Err(ProtocolError {
@@ -259,20 +254,23 @@ impl KeyboardState {
                 "key name {name:?} is not recognised by the virtual keyboard"
             ))
         })?;
-        self.find_stroke(keysym)
-            .map(|stroke| stroke.keycode)
+        self.named_keycodes
+            .get(&keysym.raw())
+            .copied()
             .ok_or_else(|| invalid(format!("key {name:?} is absent from the virtual keymap")))
     }
 
     fn resolve_character(&self, character: char) -> Result<KeyStroke, ProtocolError> {
         let keysym = text_keysym(character);
-        self.find_stroke(keysym).ok_or_else(|| ProtocolError {
-            code: ErrorCode::UnsupportedCapability,
-            message: format!(
-                "character {character:?} cannot be typed by the active virtual-keyboard keymap"
-            ),
-            retryable: false,
-        })
+        self.find_stroke(keysym)
+            .filter(|stroke| stroke.modifiers == 0 || stroke.modifiers == self.shift_mask)
+            .ok_or_else(|| ProtocolError {
+                code: ErrorCode::UnsupportedCapability,
+                message: format!(
+                    "character {character:?} cannot be typed exactly by the active virtual-keyboard keymap"
+                ),
+                retryable: false,
+            })
     }
 
     fn resolve_text(&self, text: &str) -> Result<Vec<KeyStroke>, ProtocolError> {
@@ -292,25 +290,22 @@ impl KeyboardState {
         self.strokes.get(&target.raw()).copied()
     }
 
-    fn key(&mut self, keycode: u32, state: InputState) {
-        let wire_state = match state {
-            InputState::Pressed => {
-                self.held_keys.insert(keycode);
-                KEY_PRESSED
-            }
-            InputState::Released => {
-                self.held_keys.remove(&keycode);
-                KEY_RELEASED
-            }
-        };
-        self.keyboard.key(timestamp(), keycode, wire_state);
-        if self.modifiers_by_keycode.contains_key(&keycode) {
-            self.depressed_modifiers = self
-                .held_keys
-                .iter()
-                .filter_map(|held| self.modifiers_by_keycode.get(held))
-                .fold(0, |state, mask| state | mask);
-            self.keyboard.modifiers(self.depressed_modifiers, 0, 0, 0);
+    fn emit(&self, transition: KeyboardTransition) {
+        match transition {
+            KeyboardTransition::Key { keycode, state } => self.keyboard.key(
+                timestamp(),
+                keycode,
+                match state {
+                    InputState::Pressed => KEY_PRESSED,
+                    InputState::Released => KEY_RELEASED,
+                },
+            ),
+            KeyboardTransition::Modifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            } => self.keyboard.modifiers(depressed, latched, locked, group),
         }
     }
 }
@@ -318,8 +313,154 @@ impl KeyboardState {
 struct CompiledKeymap {
     bytes: Vec<u8>,
     strokes: BTreeMap<u32, KeyStroke>,
+    named_keycodes: BTreeMap<u32, u32>,
     shift_keycode: u32,
+    shift_mask: u32,
     modifiers_by_keycode: BTreeMap<u32, u32>,
+    locking_modifiers_by_keycode: BTreeMap<u32, u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyboardTransition {
+    Key {
+        keycode: u32,
+        state: InputState,
+    },
+    Modifiers {
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    },
+}
+
+struct KeyboardModel {
+    modifiers_by_keycode: BTreeMap<u32, u32>,
+    locking_modifiers_by_keycode: BTreeMap<u32, u32>,
+    depressed_modifiers: u32,
+    locked_modifiers: u32,
+    held_keys: BTreeSet<u32>,
+}
+
+impl KeyboardModel {
+    fn new(
+        modifiers_by_keycode: BTreeMap<u32, u32>,
+        locking_modifiers_by_keycode: BTreeMap<u32, u32>,
+    ) -> Self {
+        Self {
+            modifiers_by_keycode,
+            locking_modifiers_by_keycode,
+            depressed_modifiers: 0,
+            locked_modifiers: 0,
+            held_keys: BTreeSet::new(),
+        }
+    }
+
+    fn has_active_modifiers(&self) -> bool {
+        self.depressed_modifiers != 0 || self.locked_modifiers != 0
+    }
+
+    fn clear_modifier_state(&mut self) -> Option<KeyboardTransition> {
+        if !self.has_active_modifiers() {
+            return None;
+        }
+        self.depressed_modifiers = 0;
+        self.locked_modifiers = 0;
+        Some(KeyboardTransition::Modifiers {
+            depressed: 0,
+            latched: 0,
+            locked: 0,
+            group: 0,
+        })
+    }
+
+    fn plan(
+        &mut self,
+        prepared: PreparedKeyboardAction,
+        shift_keycode: u32,
+        shift_mask: u32,
+    ) -> Result<Vec<KeyboardTransition>, ProtocolError> {
+        if let PreparedKeyboardAction::Text(strokes) = &prepared
+            && strokes
+                .iter()
+                .any(|stroke| stroke.modifiers != 0 && stroke.modifiers != shift_mask)
+        {
+            return Err(ProtocolError {
+                code: ErrorCode::UnsupportedCapability,
+                message: "virtual-keyboard text requires an unsupported non-Shift modifier".into(),
+                retryable: false,
+            });
+        }
+        let mut transitions = Vec::new();
+        match prepared {
+            PreparedKeyboardAction::Key { keycode, state } => {
+                self.push_key(&mut transitions, keycode, state);
+            }
+            PreparedKeyboardAction::Chord(mut keycodes) => {
+                keycodes.sort_by_key(|keycode| !self.modifiers_by_keycode.contains_key(keycode));
+                for keycode in &keycodes {
+                    self.push_key(&mut transitions, *keycode, InputState::Pressed);
+                }
+                for keycode in keycodes.iter().rev() {
+                    self.push_key(&mut transitions, *keycode, InputState::Released);
+                }
+            }
+            PreparedKeyboardAction::Text(strokes) => {
+                for stroke in strokes {
+                    let shifted = stroke.modifiers != 0;
+                    if shifted {
+                        self.push_key(&mut transitions, shift_keycode, InputState::Pressed);
+                    }
+                    self.push_key(&mut transitions, stroke.keycode, InputState::Pressed);
+                    self.push_key(&mut transitions, stroke.keycode, InputState::Released);
+                    if shifted {
+                        self.push_key(&mut transitions, shift_keycode, InputState::Released);
+                    }
+                }
+            }
+        }
+        Ok(transitions)
+    }
+
+    fn push_key(
+        &mut self,
+        transitions: &mut Vec<KeyboardTransition>,
+        keycode: u32,
+        state: InputState,
+    ) {
+        let was_held = self.held_keys.contains(&keycode);
+        match state {
+            InputState::Pressed => {
+                self.held_keys.insert(keycode);
+            }
+            InputState::Released => {
+                self.held_keys.remove(&keycode);
+            }
+        }
+        transitions.push(KeyboardTransition::Key { keycode, state });
+
+        let mut modifiers_changed = self.modifiers_by_keycode.contains_key(&keycode);
+        if state == InputState::Pressed
+            && !was_held
+            && let Some(mask) = self.locking_modifiers_by_keycode.get(&keycode)
+        {
+            self.locked_modifiers ^= mask;
+            modifiers_changed = true;
+        }
+        if modifiers_changed {
+            self.depressed_modifiers = self
+                .held_keys
+                .iter()
+                .filter_map(|held| self.modifiers_by_keycode.get(held))
+                .fold(0, |state, mask| state | mask);
+            transitions.push(KeyboardTransition::Modifiers {
+                depressed: self.depressed_modifiers,
+                latched: 0,
+                locked: self.locked_modifiers,
+                group: 0,
+            });
+        }
+    }
 }
 
 fn compile_keymap(layout: &str) -> Result<CompiledKeymap, ProtocolError> {
@@ -330,22 +471,35 @@ fn compile_keymap(layout: &str) -> Result<CompiledKeymap, ProtocolError> {
                 backend_failure(format!("compile active XKB layout {layout:?}"), false)
             })?;
 
+    let shift_mask = modifier_mask(&keymap, "Shift")?;
     let mut strokes = BTreeMap::new();
+    let mut named_keycodes = BTreeMap::new();
     for raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
         let xkb_keycode = xkb::Keycode::new(raw);
         let Some(keycode) = evdev_keycode(xkb_keycode) else {
             continue;
         };
-        // Supported layouts use level zero for an unmodified key and level one
-        // for Shift. Higher levels would require modifiers this
-        // backend does not currently synthesise and are deliberately omitted.
+        // The text route deliberately supports only unmodified and Shift
+        // levels. Compose, AltGr, dead-key and input-method paths fail closed.
         let supported_levels = keymap.num_levels_for_key(xkb_keycode, 0).min(2);
         for level in 0..supported_levels {
+            let mut masks = [0; 8];
+            let mask_count = keymap.key_get_mods_for_level(xkb_keycode, 0, level, &mut masks);
             for keysym in keymap.key_get_syms_by_level(xkb_keycode, 0, level) {
-                strokes.entry(keysym.raw()).or_insert(KeyStroke {
-                    keycode,
-                    shift: level == 1,
-                });
+                named_keycodes.entry(keysym.raw()).or_insert(keycode);
+            }
+            let available_masks = &masks[..mask_count.min(masks.len())];
+            let Some(modifiers) = available_masks
+                .iter()
+                .copied()
+                .find(|mask| *mask == 0 || *mask == shift_mask)
+            else {
+                continue;
+            };
+            for keysym in keymap.key_get_syms_by_level(xkb_keycode, 0, level) {
+                strokes
+                    .entry(keysym.raw())
+                    .or_insert(KeyStroke { keycode, modifiers });
             }
         }
     }
@@ -369,19 +523,26 @@ fn compile_keymap(layout: &str) -> Result<CompiledKeymap, ProtocolError> {
             [xkb::keysyms::KEY_Super_L, xkb::keysyms::KEY_Super_R],
         ),
     ] {
-        let index = keymap.mod_get_index(modifier_name);
-        if index == xkb::MOD_INVALID || index >= u32::BITS {
-            return Err(backend_failure(
-                format!("compiled keymap has no representable {modifier_name} modifier"),
-                false,
-            ));
-        }
-        let mask = 1 << index;
+        let mask = modifier_mask(&keymap, modifier_name)?;
         for keysym in keysyms {
             if let Some(stroke) = strokes.get(&keysym) {
                 modifiers_by_keycode.insert(stroke.keycode, mask);
             }
         }
+    }
+    let mut locking_modifiers_by_keycode = BTreeMap::new();
+    for (modifier_name, keysym) in [
+        ("Lock", xkb::keysyms::KEY_Caps_Lock),
+        ("Mod2", xkb::keysyms::KEY_Num_Lock),
+    ] {
+        let mask = modifier_mask(&keymap, modifier_name)?;
+        let keycode = named_keycodes.get(&keysym).ok_or_else(|| {
+            backend_failure(
+                format!("compiled keymap has no {modifier_name} lock key"),
+                false,
+            )
+        })?;
+        locking_modifiers_by_keycode.insert(*keycode, mask);
     }
     let mut bytes = keymap
         .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
@@ -391,9 +552,23 @@ fn compile_keymap(layout: &str) -> Result<CompiledKeymap, ProtocolError> {
     Ok(CompiledKeymap {
         bytes,
         strokes,
+        named_keycodes,
         shift_keycode,
+        shift_mask,
         modifiers_by_keycode,
+        locking_modifiers_by_keycode,
     })
+}
+
+fn modifier_mask(keymap: &xkb::Keymap, name: &str) -> Result<u32, ProtocolError> {
+    let index = keymap.mod_get_index(name);
+    if index == xkb::MOD_INVALID || index >= u32::BITS {
+        return Err(backend_failure(
+            format!("compiled keymap has no representable {name} modifier"),
+            false,
+        ));
+    }
+    Ok(1 << index)
 }
 
 fn xkb_layout_for_niri_name(name: &str) -> Result<&'static str, ProtocolError> {
@@ -410,11 +585,25 @@ fn xkb_layout_for_niri_name(name: &str) -> Result<&'static str, ProtocolError> {
 
 impl Drop for KeyboardState {
     fn drop(&mut self) {
-        for keycode in std::mem::take(&mut self.held_keys) {
-            self.keyboard.key(timestamp(), keycode, KEY_RELEASED);
+        let held_keys = self.model.held_keys.iter().copied().collect::<Vec<_>>();
+        for keycode in held_keys {
+            let transitions = self
+                .model
+                .plan(
+                    PreparedKeyboardAction::Key {
+                        keycode,
+                        state: InputState::Released,
+                    },
+                    self.shift_keycode,
+                    self.shift_mask,
+                )
+                .expect("explicit key release never requires text modifiers");
+            for transition in transitions {
+                self.emit(transition);
+            }
         }
-        if self.depressed_modifiers != 0 {
-            self.keyboard.modifiers(0, 0, 0, 0);
+        if let Some(transition) = self.model.clear_modifier_state() {
+            self.emit(transition);
         }
         self.keyboard.destroy();
         let _ = self.connection.flush();
@@ -430,7 +619,7 @@ enum PreparedKeyboardAction {
 #[derive(Clone, Copy)]
 struct KeyStroke {
     keycode: u32,
-    shift: bool,
+    modifiers: u32,
 }
 
 fn named_keysym(name: &str) -> Option<xkb::Keysym> {
@@ -442,6 +631,9 @@ fn named_keysym(name: &str) -> Option<xkb::Keysym> {
         "enter" | "return" => "Return",
         "esc" | "escape" => "Escape",
         "backspace" => "BackSpace",
+        "capslock" | "caps_lock" => "Caps_Lock",
+        "numlock" | "num_lock" => "Num_Lock",
+        "keypad1" | "numpad1" | "kp1" => "KP_1",
         "tab" => "Tab",
         "space" => "space",
         "left" => "Left",
@@ -559,9 +751,11 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for WaylandState {
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_keymap, evdev_keycode, named_keysym, text_keysym, xkb_layout_for_niri_name,
+        CompiledKeymap, KeyStroke, KeyboardModel, KeyboardTransition, PreparedKeyboardAction,
+        XKB_EVDEV_OFFSET, compile_keymap, evdev_keycode, named_keysym, text_keysym,
+        xkb_layout_for_niri_name,
     };
-    use waldo_protocol::ErrorCode;
+    use waldo_protocol::{ErrorCode, InputState};
     use xkbcommon::xkb;
 
     #[test]
@@ -572,6 +766,11 @@ mod tests {
             Some(xkb::keysyms::KEY_Control_L.into())
         );
         assert_eq!(named_keysym("A"), Some(xkb::Keysym::from_char('a')));
+        assert_eq!(
+            named_keysym("CapsLock"),
+            Some(xkb::keysyms::KEY_Caps_Lock.into())
+        );
+        assert_eq!(named_keysym("Numpad1"), Some(xkb::keysyms::KEY_KP_1.into()));
         assert_eq!(named_keysym("not-a-real-key"), None);
     }
 
@@ -593,15 +792,204 @@ mod tests {
     fn active_layout_mapping_marks_level_one_characters_as_shifted() {
         let keymap = compile_keymap("gb").expect("compile keymap");
 
-        assert!(!keymap.strokes[&xkb::Keysym::from_char('w').raw()].shift);
-        assert!(keymap.strokes[&xkb::Keysym::from_char('W').raw()].shift);
-        assert!(!keymap.strokes[&xkb::Keysym::from_char('1').raw()].shift);
-        assert!(keymap.strokes[&xkb::Keysym::from_char('!').raw()].shift);
+        assert_eq!(
+            keymap.strokes[&xkb::Keysym::from_char('w').raw()].modifiers,
+            0
+        );
+        assert_eq!(
+            keymap.strokes[&xkb::Keysym::from_char('W').raw()].modifiers,
+            keymap.shift_mask
+        );
+        assert_eq!(
+            keymap.strokes[&xkb::Keysym::from_char('1').raw()].modifiers,
+            0
+        );
+        assert_eq!(
+            keymap.strokes[&xkb::Keysym::from_char('!').raw()].modifiers,
+            keymap.shift_mask
+        );
         assert!(
             keymap
                 .modifiers_by_keycode
                 .contains_key(&keymap.shift_keycode)
         );
+    }
+
+    #[test]
+    fn chord_modifiers_surround_keys_even_when_the_request_lists_them_last() {
+        let keymap = compile_keymap("gb").expect("compile keymap");
+        let shift = keycode(&keymap, xkb::keysyms::KEY_Shift_L.into());
+        let at = keycode(&keymap, xkb::Keysym::from_char('@'));
+        let mut model = model(&keymap);
+
+        let transitions = model
+            .plan(
+                PreparedKeyboardAction::Chord(vec![at, shift]),
+                shift,
+                keymap.shift_mask,
+            )
+            .expect("plan chord");
+
+        assert_eq!(
+            key_events(&transitions),
+            vec![
+                (shift, InputState::Pressed),
+                (at, InputState::Pressed),
+                (at, InputState::Released),
+                (shift, InputState::Released),
+            ]
+        );
+        assert_eq!(
+            pressed_symbols("gb", &transitions),
+            vec![
+                xkb::keysyms::KEY_Shift_L.into(),
+                xkb::Keysym::from_char('@')
+            ]
+        );
+    }
+
+    #[test]
+    fn locks_persist_and_preserve_keypad_identity_at_the_consumer() {
+        let keymap = compile_keymap("gb").expect("compile keymap");
+        let shift = keycode(&keymap, xkb::keysyms::KEY_Shift_L.into());
+        let caps = keycode(&keymap, xkb::keysyms::KEY_Caps_Lock.into());
+        let num = keycode(&keymap, xkb::keysyms::KEY_Num_Lock.into());
+        let a = keycode(&keymap, xkb::Keysym::from_char('a'));
+        let keypad_one = keycode(&keymap, xkb::keysyms::KEY_KP_1.into());
+        let mut model = model(&keymap);
+        let mut transitions = Vec::new();
+        for (keycode, state) in [
+            (caps, InputState::Pressed),
+            (caps, InputState::Released),
+            (a, InputState::Pressed),
+            (a, InputState::Released),
+            (num, InputState::Pressed),
+            (num, InputState::Released),
+            (keypad_one, InputState::Pressed),
+            (keypad_one, InputState::Released),
+        ] {
+            transitions.extend(
+                model
+                    .plan(
+                        PreparedKeyboardAction::Key { keycode, state },
+                        shift,
+                        keymap.shift_mask,
+                    )
+                    .expect("plan key transition"),
+            );
+        }
+
+        assert_eq!(
+            pressed_symbols("gb", &transitions),
+            vec![
+                xkb::keysyms::KEY_Caps_Lock.into(),
+                xkb::Keysym::from_char('A'),
+                xkb::keysyms::KEY_Num_Lock.into(),
+                xkb::keysyms::KEY_KP_1.into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_delivers_exact_tabs_and_supported_layout_characters() {
+        let keymap = compile_keymap("gb").expect("compile keymap");
+        let mut model = model(&keymap);
+        let strokes = "\t£@"
+            .chars()
+            .map(|character| keymap.strokes[&text_keysym(character).raw()])
+            .collect();
+
+        let transitions = model
+            .plan(
+                PreparedKeyboardAction::Text(strokes),
+                keymap.shift_keycode,
+                keymap.shift_mask,
+            )
+            .expect("plan supported text");
+
+        assert_eq!(pressed_text("gb", &transitions), "\t£@");
+    }
+
+    #[test]
+    fn every_indexed_text_character_reaches_the_consumer_exactly() {
+        for layout in ["gb", "us"] {
+            let keymap = compile_keymap(layout).expect("compile keymap");
+            for (&raw_keysym, &stroke) in &keymap.strokes {
+                let keysym = xkb::Keysym::new(raw_keysym);
+                let Some(character) = keysym.key_char() else {
+                    continue;
+                };
+                if text_keysym(character) != keysym {
+                    continue;
+                }
+                let mut model = model(&keymap);
+                let transitions = model
+                    .plan(
+                        PreparedKeyboardAction::Text(vec![stroke]),
+                        keymap.shift_keycode,
+                        keymap.shift_mask,
+                    )
+                    .expect("plan indexed text character");
+
+                assert_eq!(
+                    pressed_text(layout, &transitions),
+                    character.to_string(),
+                    "layout {layout} did not preserve {character:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_shift_text_modifiers_are_rejected_before_planning_events() {
+        let keymap = compile_keymap("gb").expect("compile keymap");
+        let mut model = model(&keymap);
+        let unsupported_mask = if keymap.shift_mask == 1 { 2 } else { 1 };
+
+        let error = model
+            .plan(
+                PreparedKeyboardAction::Text(vec![KeyStroke {
+                    keycode: keycode(&keymap, xkb::Keysym::from_char('a')),
+                    modifiers: unsupported_mask,
+                }]),
+                keymap.shift_keycode,
+                keymap.shift_mask,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+        assert!(model.held_keys.is_empty());
+    }
+
+    #[test]
+    fn teardown_clears_locked_modifier_state() {
+        let keymap = compile_keymap("gb").expect("compile keymap");
+        let mut model = model(&keymap);
+        let caps = keycode(&keymap, xkb::keysyms::KEY_Caps_Lock.into());
+        for state in [InputState::Pressed, InputState::Released] {
+            model
+                .plan(
+                    PreparedKeyboardAction::Key {
+                        keycode: caps,
+                        state,
+                    },
+                    keymap.shift_keycode,
+                    keymap.shift_mask,
+                )
+                .expect("plan Caps Lock transition");
+        }
+
+        assert!(model.has_active_modifiers());
+        assert_eq!(
+            model.clear_modifier_state(),
+            Some(KeyboardTransition::Modifiers {
+                depressed: 0,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            })
+        );
+        assert!(!model.has_active_modifiers());
     }
 
     #[test]
@@ -614,5 +1002,70 @@ mod tests {
                 .code,
             ErrorCode::UnsupportedCapability
         );
+    }
+
+    fn model(keymap: &CompiledKeymap) -> KeyboardModel {
+        KeyboardModel::new(
+            keymap.modifiers_by_keycode.clone(),
+            keymap.locking_modifiers_by_keycode.clone(),
+        )
+    }
+
+    fn keycode(keymap: &CompiledKeymap, keysym: xkb::Keysym) -> u32 {
+        keymap.named_keycodes[&keysym.raw()]
+    }
+
+    fn key_events(transitions: &[KeyboardTransition]) -> Vec<(u32, InputState)> {
+        transitions
+            .iter()
+            .filter_map(|transition| match transition {
+                KeyboardTransition::Key { keycode, state } => Some((*keycode, *state)),
+                KeyboardTransition::Modifiers { .. } => None,
+            })
+            .collect()
+    }
+
+    fn pressed_symbols(layout: &str, transitions: &[KeyboardTransition]) -> Vec<xkb::Keysym> {
+        consume(layout, transitions)
+            .into_iter()
+            .map(|(keysym, _)| keysym)
+            .collect()
+    }
+
+    fn pressed_text(layout: &str, transitions: &[KeyboardTransition]) -> String {
+        consume(layout, transitions)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    fn consume(layout: &str, transitions: &[KeyboardTransition]) -> Vec<(xkb::Keysym, String)> {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_ENVIRONMENT_NAMES);
+        let keymap =
+            xkb::Keymap::new_from_names(&context, "", "", layout, "", None, xkb::COMPILE_NO_FLAGS)
+                .expect("compile consumer keymap");
+        let mut state = xkb::State::new(&keymap);
+        let mut pressed = Vec::new();
+        for transition in transitions {
+            match *transition {
+                KeyboardTransition::Key {
+                    keycode,
+                    state: InputState::Pressed,
+                } => {
+                    let keycode = xkb::Keycode::new(keycode + XKB_EVDEV_OFFSET);
+                    pressed.push((state.key_get_one_sym(keycode), state.key_get_utf8(keycode)));
+                }
+                KeyboardTransition::Key { .. } => {}
+                KeyboardTransition::Modifiers {
+                    depressed,
+                    latched,
+                    locked,
+                    group,
+                } => {
+                    state.update_mask(depressed, latched, locked, 0, 0, group);
+                }
+            }
+        }
+        pressed
     }
 }

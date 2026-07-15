@@ -13,8 +13,8 @@ use waldo_action::{
 use waldo_controller::{ExecutionToken, ObservationGrounding};
 use waldo_niri::SessionInspector;
 use waldo_protocol::{
-    Action, ActionRoute, ErrorCode, ObservationId, Predicate, ProtocolError, SourceSelector,
-    WindowOperation, WorkspaceOperation,
+    Action, ActionRoute, ErrorCode, LogicalPoint, ObservationId, Predicate, ProtocolError,
+    SourceSelector, WindowOperation, WorkspaceOperation,
 };
 use waldo_screencopy::ScreenCapturer;
 
@@ -31,6 +31,7 @@ pub(crate) struct BatchActionExecutor {
     grounding: ObservationGrounding,
     referenced_frames: BTreeMap<ObservationId, ObservationGrounding>,
     invalidated_grounding: Mutex<Option<GroundingFailure>>,
+    cursor_position: Mutex<Option<LogicalPoint>>,
 }
 
 impl BatchActionExecutor {
@@ -42,6 +43,7 @@ impl BatchActionExecutor {
         grounding: ObservationGrounding,
         referenced_frames: BTreeMap<ObservationId, ObservationGrounding>,
     ) -> Self {
+        let cursor_position = grounding.cursor_position;
         Self {
             desktop,
             inspector,
@@ -50,6 +52,7 @@ impl BatchActionExecutor {
             grounding,
             referenced_frames,
             invalidated_grounding: Mutex::new(None),
+            cursor_position: Mutex::new(cursor_position),
         }
     }
 
@@ -185,8 +188,16 @@ impl BatchActionExecutor {
                 retryable: true,
             })
         })?;
+        let mut current_grounding = self.grounding.clone();
+        current_grounding.cursor_position = *self.cursor_position.lock().map_err(|_| {
+            ActionExecutionFailure::not_executed(ProtocolError {
+                code: ErrorCode::Internal,
+                message: "batch cursor grounding state is unavailable".into(),
+                retryable: true,
+            })
+        })?;
         validate_grounding(
-            Some(&self.grounding),
+            Some(&current_grounding),
             &snapshot.outputs,
             &snapshot.windows,
             &snapshot.workspaces,
@@ -194,6 +205,50 @@ impl BatchActionExecutor {
             std::slice::from_ref(action),
         )
         .map_err(|failure| ActionExecutionFailure::not_executed(failure.protocol_error()))
+    }
+
+    fn record_pointer_position(&self, action: &Action) -> Result<(), ActionExecutionFailure> {
+        if !matches!(
+            action,
+            Action::PointerMoveAbsolute { .. }
+                | Action::PointerMoveRelative { .. }
+                | Action::PointerClick { .. }
+                | Action::PointerDrag { .. }
+                | Action::PointerPath { .. }
+        ) {
+            return Ok(());
+        }
+        let mut cursor = self.cursor_position.lock().map_err(|_| {
+            ActionExecutionFailure::indeterminate(
+                ActionRoute::VirtualPointer,
+                ProtocolError {
+                    code: ErrorCode::Internal,
+                    message: "batch cursor grounding state is unavailable after pointer dispatch"
+                        .into(),
+                    retryable: true,
+                },
+            )
+        })?;
+        match action {
+            Action::PointerMoveAbsolute { position } | Action::PointerClick { position, .. } => {
+                *cursor = Some(*position);
+            }
+            Action::PointerMoveRelative { delta } => {
+                let current = (*cursor).expect("relative motion was grounded before dispatch");
+                *cursor = Some(LogicalPoint {
+                    x: current.x + delta.x,
+                    y: current.y + delta.y,
+                });
+            }
+            Action::PointerDrag { to, .. } => *cursor = Some(*to),
+            Action::PointerPath { points, .. } => {
+                if let Some(position) = points.last() {
+                    *cursor = Some(*position);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn record_grounding_invalidation(&self, action: &Action) -> Result<(), ActionExecutionFailure> {
@@ -235,6 +290,7 @@ impl ActionExecutor for BatchActionExecutor {
             _ => {
                 self.validate_before_dispatch(action)?;
                 let execution = self.desktop.execute(action, cancellation)?;
+                self.record_pointer_position(action)?;
                 self.record_grounding_invalidation(action)?;
                 Ok(execution)
             }
@@ -312,8 +368,8 @@ mod tests {
     use waldo_action::execute_batch;
     use waldo_niri::{InspectionError, NiriSnapshot};
     use waldo_protocol::{
-        ClientId, LogicalPoint, LogicalRect, OutputId, OutputState, OutputTransform, PointerButton,
-        ReceiptStatus, WindowId, WindowState,
+        ClientId, InputState, LogicalDelta, LogicalPoint, LogicalRect, OutputId, OutputState,
+        OutputTransform, PointerButton, ReceiptStatus, WindowId, WindowState,
     };
     use waldo_screencopy::UnavailableCapturer;
 
@@ -330,6 +386,12 @@ mod tests {
     #[derive(Default)]
     struct CountingExecutor(AtomicUsize);
 
+    #[derive(Default)]
+    struct RecordingExecutor {
+        actions: Mutex<Vec<Action>>,
+        fail_on_attempt: Option<usize>,
+    }
+
     impl ActionExecutor for CountingExecutor {
         fn execute(
             &self,
@@ -339,6 +401,102 @@ mod tests {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(ActionRoute::NiriIpc.into())
         }
+    }
+
+    impl ActionExecutor for RecordingExecutor {
+        fn execute(
+            &self,
+            action: &Action,
+            _cancellation: &ExecutionToken,
+        ) -> Result<ActionExecution, ActionExecutionFailure> {
+            let mut actions = self.actions.lock().expect("recording executor lock");
+            let attempt = actions.len();
+            actions.push(action.clone());
+            if self.fail_on_attempt == Some(attempt) {
+                return Err(ActionExecutionFailure::not_executed(ProtocolError {
+                    code: ErrorCode::BackendFailure,
+                    message: "deliberate pointer dispatch failure".into(),
+                    retryable: true,
+                }));
+            }
+            Ok(ActionRoute::VirtualPointer.into())
+        }
+    }
+
+    #[test]
+    fn executed_absolute_motion_grounds_following_button_and_scroll_dispatch() {
+        let desktop = Arc::new(RecordingExecutor::default());
+        let mut recorded = grounding();
+        recorded.cursor_position = None;
+        let executor = BatchActionExecutor::new(
+            desktop.clone(),
+            Arc::new(FixedInspector(snapshot())),
+            Arc::new(UnavailableCapturer),
+            None,
+            recorded,
+            BTreeMap::new(),
+        );
+        let actions = vec![
+            Action::PointerMoveAbsolute {
+                position: LogicalPoint { x: 100.0, y: 100.0 },
+            },
+            Action::PointerButton {
+                button: PointerButton::Primary,
+                state: InputState::Pressed,
+            },
+            Action::PointerButton {
+                button: PointerButton::Primary,
+                state: InputState::Released,
+            },
+            Action::Scroll {
+                delta: LogicalDelta { x: 2.0, y: 3.0 },
+            },
+        ];
+
+        let execution = execute_batch(&executor, &actions, &test_token());
+
+        assert_eq!(
+            execution
+                .receipts
+                .iter()
+                .map(|receipt| receipt.status)
+                .collect::<Vec<_>>(),
+            vec![ReceiptStatus::Executed; 4]
+        );
+        assert_eq!(*desktop.actions.lock().expect("recorded actions"), actions);
+    }
+
+    #[test]
+    fn failed_absolute_motion_prevents_following_pointer_dispatch() {
+        let desktop = Arc::new(RecordingExecutor {
+            actions: Mutex::new(Vec::new()),
+            fail_on_attempt: Some(0),
+        });
+        let mut recorded = grounding();
+        recorded.cursor_position = None;
+        let executor = BatchActionExecutor::new(
+            desktop.clone(),
+            Arc::new(FixedInspector(snapshot())),
+            Arc::new(UnavailableCapturer),
+            None,
+            recorded,
+            BTreeMap::new(),
+        );
+        let actions = [
+            Action::PointerMoveAbsolute {
+                position: LogicalPoint { x: 100.0, y: 100.0 },
+            },
+            Action::PointerButton {
+                button: PointerButton::Primary,
+                state: InputState::Pressed,
+            },
+        ];
+
+        let execution = execute_batch(&executor, &actions, &test_token());
+
+        assert_eq!(execution.receipts[0].status, ReceiptStatus::Failed);
+        assert_eq!(execution.receipts[1].status, ReceiptStatus::NotExecuted);
+        assert_eq!(desktop.actions.lock().expect("recorded actions").len(), 1);
     }
 
     #[test]
