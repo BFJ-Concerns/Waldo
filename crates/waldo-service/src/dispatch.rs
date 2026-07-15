@@ -34,6 +34,7 @@ pub(crate) async fn dispatch(
             observe(
                 request_id,
                 request.source,
+                request.continue_from,
                 request.include_accessibility,
                 state,
                 connection_id,

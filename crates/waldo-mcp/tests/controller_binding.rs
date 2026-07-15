@@ -1,14 +1,17 @@
 use std::{
     fs,
+    io::Cursor,
     path::PathBuf,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgba};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream},
@@ -54,7 +57,41 @@ impl SessionInspector for FixedInspector {
 }
 
 #[derive(Clone, Copy)]
+struct GridInspector;
+
+impl SessionInspector for GridInspector {
+    fn inspect(&self, _include_windows: bool) -> Result<NiriSnapshot, waldo_niri::InspectionError> {
+        let mut snapshot = NiriSnapshot::unavailable("MCP grid session");
+        snapshot.outputs = vec![OutputState {
+            id: OutputId("GRID-1".into()),
+            name: "GRID-1".into(),
+            logical_bounds: LogicalRect {
+                origin: LogicalPoint { x: 0.0, y: 0.0 },
+                width: 2560.0,
+                height: 1440.0,
+            },
+            pixel_size: Some(waldo_protocol::PixelSize {
+                width: 2560,
+                height: 1440,
+            }),
+            scale: 1.0,
+            transform: OutputTransform::Normal,
+            focused: true,
+        }];
+        Ok(snapshot)
+    }
+}
+
+#[derive(Clone, Copy)]
 struct FixedCapturer;
+
+fn encoded_image(width: u32, height: u32, pixel: impl Fn(u32, u32) -> Rgba<u8>) -> Vec<u8> {
+    let mut png = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(ImageBuffer::from_fn(width, height, pixel))
+        .write_to(&mut png, ImageFormat::Png)
+        .unwrap();
+    png.into_inner()
+}
 
 impl ScreenCapturer for FixedCapturer {
     fn available(&self) -> bool {
@@ -63,9 +100,9 @@ impl ScreenCapturer for FixedCapturer {
 
     fn capture_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
         Ok(Capture {
-            png: b"test-png".to_vec(),
-            width: 1920,
-            height: 1080,
+            png: encoded_image(4, 2, |x, y| Rgba([x as u8, y as u8, 0x80, 0xff])),
+            width: 4,
+            height: 2,
             captured_at_unix_ms: 1,
         })
     }
@@ -79,6 +116,62 @@ impl ScreenCapturer for FixedCapturer {
         _height: i32,
     ) -> Result<Capture, CaptureError> {
         self.capture_output(output_name)
+    }
+}
+
+struct GridCapturer {
+    before: Vec<u8>,
+    after: Vec<u8>,
+    calls: AtomicUsize,
+}
+
+impl ScreenCapturer for GridCapturer {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn capture_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Capture {
+            png: if call == 0 {
+                self.before.clone()
+            } else {
+                self.after.clone()
+            },
+            width: 2560,
+            height: 1440,
+            captured_at_unix_ms: call as u64 + 1,
+        })
+    }
+
+    fn capture_region(
+        &self,
+        output_name: &str,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture_output(output_name)
+    }
+}
+
+struct RecordingExecutor {
+    actions: Arc<Mutex<Vec<Action>>>,
+}
+
+impl ActionExecutor for RecordingExecutor {
+    fn execute(
+        &self,
+        action: &Action,
+        _cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        self.actions.lock().unwrap().push(action.clone());
+        Ok(waldo_protocol::ActionRoute::VirtualPointer.into())
+    }
+
+    fn supports(&self, route: waldo_protocol::ActionRoute) -> bool {
+        route == waldo_protocol::ActionRoute::VirtualPointer
     }
 }
 
@@ -236,6 +329,149 @@ async fn stop_overtakes_and_quiesces_an_active_mcp_act() {
     );
     assert!(responses.iter().any(|response| response["id"] == 4));
     assert!(finished.load(Ordering::Acquire));
+
+    drop(client_writer);
+    mcp_task.await.unwrap().unwrap();
+    shutdown_tx.send(()).unwrap();
+    service_task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn resized_model_grid_maps_to_the_exact_final_pointer_consumer() {
+    let path = test_socket();
+    let colour = |x: u32, y: u32| {
+        let column = x / 512;
+        let row = y / 480;
+        let cell = column + row * 5;
+        Rgba([
+            (cell * 29 + 17) as u8,
+            (cell * 13 + 61) as u8,
+            (cell * 7 + 101) as u8,
+            0xff,
+        ])
+    };
+    let before = encoded_image(2560, 1440, colour);
+    let after = encoded_image(2560, 1440, |x, y| {
+        if x == 0 && y == 0 {
+            Rgba([0xff, 0xff, 0xff, 0xff])
+        } else {
+            colour(x, y)
+        }
+    });
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(GridInspector),
+        Arc::new(GridCapturer {
+            before,
+            after,
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(RecordingExecutor {
+            actions: Arc::clone(&recorded),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let service_task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let (mut client_writer, server_reader) = tokio::io::duplex(64 * 1024);
+    let (server_writer, client_reader) = tokio::io::duplex(2 * 1024 * 1024);
+    let server = McpServer::new(path.clone()).unwrap();
+    let mcp_task = tokio::spawn(async move { server.run(server_reader, server_writer).await });
+    let mut client_reader = BufReader::new(client_reader).lines();
+
+    send(
+        &mut client_writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18" }
+        }),
+    )
+    .await;
+    let _ = receive(&mut client_reader).await;
+    send(
+        &mut client_writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "observe",
+                "arguments": {
+                    "source": { "type": "output", "output_id": "GRID-1" },
+                    "continue_from": null,
+                    "include_accessibility": false
+                }
+            }
+        }),
+    )
+    .await;
+    let observed = receive(&mut client_reader).await;
+    let delivered_png = BASE64
+        .decode(observed["result"]["content"][1]["data"].as_str().unwrap())
+        .unwrap();
+    let delivered = image::load_from_memory_with_format(&delivered_png, ImageFormat::Png).unwrap();
+    assert_eq!(delivered.dimensions(), (2048, 1152));
+    let mapping = &observed["result"]["structuredContent"]["observation"]["coordinates"];
+    assert_eq!(
+        mapping["source_pixels"],
+        json!({"width": 2560, "height": 1440})
+    );
+    assert_eq!(
+        mapping["model_image_pixels"],
+        json!({"width": 2048, "height": 1152})
+    );
+
+    let model_x = 3.5 * 2048.0 / 5.0;
+    let model_y = 1.5 * 1152.0 / 3.0;
+    let target = LogicalPoint {
+        x: model_x * 2560.0 / 2048.0,
+        y: model_y * 1440.0 / 1152.0,
+    };
+    let sampled = delivered
+        .to_rgba8()
+        .get_pixel(model_x as u32, model_y as u32)
+        .0;
+    assert_eq!(sampled, colour(3 * 512 + 256, 480 + 240).0);
+    let observation_id = observed["result"]["structuredContent"]["observation"]["id"].clone();
+    send(
+        &mut client_writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "act",
+                "arguments": {
+                    "observation_id": observation_id,
+                    "actions": [{
+                        "type": "pointer_click",
+                        "position": {"x": target.x, "y": target.y},
+                        "button": "primary",
+                        "count": 1
+                    }],
+                    "verification": []
+                }
+            }
+        }),
+    )
+    .await;
+    let acted = receive(&mut client_reader).await;
+    assert_eq!(acted["id"], 3);
+    assert_eq!(
+        recorded.lock().unwrap().as_slice(),
+        &[Action::PointerClick {
+            position: target,
+            button: waldo_protocol::PointerButton::Primary,
+            count: 1,
+        }]
+    );
 
     drop(client_writer);
     mcp_task.await.unwrap().unwrap();

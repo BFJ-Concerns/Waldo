@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use niri_ipc::{Output, Transform, Window, Workspace};
 use waldo_protocol::{
-    LogicalPoint, LogicalRect, OutputId, OutputState, OutputTransform, PixelSize, WindowId,
-    WindowState, WorkspaceId, WorkspaceState,
+    LogicalPoint, LogicalRect, OutputId, OutputState, OutputTransform, PixelSize,
+    WindowCaptureCapability, WindowId, WindowState, WorkspaceId, WorkspaceState,
 };
 
 pub(crate) fn outputs(
@@ -93,18 +93,48 @@ pub(crate) fn windows(
             let logical_bounds = output_name
                 .and_then(|name| output_bounds.get(name.as_str()).copied())
                 .and_then(|output| window_bounds(&window, output));
+            let capture = window_capture_capability(window.is_floating, logical_bounds.is_some());
             WindowState {
                 id: WindowId(window.id.to_string()),
                 title: window.title,
                 application_id: window.app_id,
                 pid: window.pid.and_then(|pid| u32::try_from(pid).ok()),
                 logical_bounds,
+                is_floating: window.is_floating,
+                capture,
                 focused: window.is_focused,
                 workspace_id: window.workspace_id.map(WorkspaceId::new),
                 output_id: output_name.cloned().map(OutputId),
             }
         })
         .collect()
+}
+
+fn window_capture_capability(
+    is_floating: bool,
+    has_logical_bounds: bool,
+) -> WindowCaptureCapability {
+    if !is_floating {
+        return WindowCaptureCapability {
+            available: false,
+            limitation: Some(
+                "tiled-window capture is unavailable; observe the containing output instead".into(),
+            ),
+        };
+    }
+    if !has_logical_bounds {
+        return WindowCaptureCapability {
+            available: false,
+            limitation: Some("Niri has not reported screen bounds for this floating window".into()),
+        };
+    }
+    WindowCaptureCapability {
+        available: true,
+        limitation: Some(
+            "capture is an exact output crop and requires the window to be foreground and visible"
+                .into(),
+        ),
+    }
 }
 
 fn window_bounds(window: &Window, output: LogicalRect) -> Option<LogicalRect> {
@@ -224,5 +254,56 @@ mod tests {
         let converted_windows = windows(vec![window(None)], &[workspace()], &converted_outputs);
 
         assert_eq!(converted_windows[0].logical_bounds, None);
+        assert!(!converted_windows[0].capture.available);
+    }
+
+    #[test]
+    fn tiled_windows_disclose_that_direct_capture_is_unsupported() {
+        let converted_outputs = outputs(
+            [("DP-2".to_owned(), output("DP-2", 0))]
+                .into_iter()
+                .collect(),
+            None,
+        );
+
+        let converted_windows = windows(
+            vec![window(Some((20.0, 30.0)))],
+            &[workspace()],
+            &converted_outputs,
+        );
+
+        assert!(!converted_windows[0].is_floating);
+        assert!(!converted_windows[0].capture.available);
+        assert!(
+            converted_windows[0]
+                .capture
+                .limitation
+                .as_deref()
+                .is_some_and(|limitation| limitation.contains("tiled-window"))
+        );
+    }
+
+    #[test]
+    fn bounded_floating_windows_disclose_the_output_crop_route() {
+        let converted_outputs = outputs(
+            [("DP-2".to_owned(), output("DP-2", 0))]
+                .into_iter()
+                .collect(),
+            None,
+        );
+        let mut source = window(Some((20.0, 30.0)));
+        source.is_floating = true;
+
+        let converted_windows = windows(vec![source], &[workspace()], &converted_outputs);
+
+        assert!(converted_windows[0].is_floating);
+        assert!(converted_windows[0].capture.available);
+        assert!(
+            converted_windows[0]
+                .capture
+                .limitation
+                .as_deref()
+                .is_some_and(|limitation| limitation.contains("exact output crop"))
+        );
     }
 }

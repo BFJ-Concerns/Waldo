@@ -182,6 +182,7 @@ pub enum GroundingFailure {
     TargetLost,
     GeometryChanged,
     FocusChanged,
+    CrossOutputDragUnsupported,
     TargetOutsideObservation,
 }
 
@@ -192,6 +193,7 @@ impl GroundingFailure {
             Self::TargetLost => ErrorCode::TargetLost,
             Self::GeometryChanged => ErrorCode::GeometryChanged,
             Self::FocusChanged => ErrorCode::FocusChanged,
+            Self::CrossOutputDragUnsupported => ErrorCode::UnsupportedCapability,
             Self::TargetOutsideObservation => ErrorCode::InvalidRequest,
         }
     }
@@ -202,6 +204,7 @@ impl GroundingFailure {
             Self::TargetLost => StopReason::TargetLost,
             Self::GeometryChanged => StopReason::GeometryChanged,
             Self::FocusChanged => StopReason::FocusChanged,
+            Self::CrossOutputDragUnsupported => StopReason::ExecutionFailed,
             Self::TargetOutsideObservation => StopReason::ExecutionFailed,
         }
     }
@@ -214,6 +217,9 @@ impl GroundingFailure {
                 "the observed output geometry or coordinate transform has changed"
             }
             Self::FocusChanged => "foreground focus changed after the cited observation",
+            Self::CrossOutputDragUnsupported => {
+                "cross-output drag is unsupported and was refused before pointer movement or button press"
+            }
             Self::TargetOutsideObservation => {
                 "an absolute pointer target lies outside the pixels in the cited observation"
             }
@@ -221,7 +227,7 @@ impl GroundingFailure {
         ProtocolError {
             code: self.error_code(),
             message: message.into(),
-            retryable: true,
+            retryable: self != Self::CrossOutputDragUnsupported,
         }
     }
 }
@@ -290,6 +296,9 @@ pub fn validate_grounding(
     if actions_require_stable_focus(actions) && focused_window != recorded.focused_window.as_ref() {
         return Err(GroundingFailure::FocusChanged);
     }
+    if contains_cross_output_drag(actions, outputs) {
+        return Err(GroundingFailure::CrossOutputDragUnsupported);
+    }
     if !pointer_targets_within(
         actions,
         recorded.observed_logical_bounds,
@@ -298,6 +307,21 @@ pub fn validate_grounding(
         return Err(GroundingFailure::TargetOutsideObservation);
     }
     Ok(())
+}
+
+fn contains_cross_output_drag(actions: &[Action], outputs: &[OutputState]) -> bool {
+    actions.iter().any(|action| {
+        let Action::PointerDrag { from, to, .. } = action else {
+            return false;
+        };
+        let from_output = outputs
+            .iter()
+            .find(|output| point_within(*from, output.logical_bounds));
+        let to_output = outputs
+            .iter()
+            .find(|output| point_within(*to, output.logical_bounds));
+        matches!((from_output, to_output), (Some(from), Some(to)) if from.id != to.id)
+    })
 }
 
 fn pointer_targets_within(
@@ -489,6 +513,11 @@ mod tests {
             application_id: None,
             pid: None,
             logical_bounds: None,
+            is_floating: true,
+            capture: waldo_protocol::WindowCaptureCapability {
+                available: true,
+                limitation: None,
+            },
             focused: false,
             workspace_id: None,
             output_id: None,
@@ -533,6 +562,47 @@ mod tests {
         assert_eq!(
             validate_grounding(Some(&recorded), &[rescaled], &[], &[], None, &[]),
             Err(GroundingFailure::GeometryChanged)
+        );
+    }
+
+    #[test]
+    fn cross_output_drag_is_refused_before_backend_dispatch() {
+        let recorded = grounding();
+        let mut second_output = output();
+        second_output.id = OutputId("DP-2".into());
+        second_output.name = "DP-2".into();
+        second_output.logical_bounds.origin.x = 1920.0;
+        let drag = Action::PointerDrag {
+            from: LogicalPoint {
+                x: 1800.0,
+                y: 500.0,
+            },
+            to: LogicalPoint {
+                x: 2100.0,
+                y: 500.0,
+            },
+            button: waldo_protocol::PointerButton::Primary,
+            duration_ms: 250,
+        };
+
+        let failure = validate_grounding(
+            Some(&recorded),
+            &[output(), second_output],
+            &[],
+            &[],
+            recorded.focused_window.as_ref(),
+            &[drag],
+        )
+        .unwrap_err();
+
+        assert_eq!(failure, GroundingFailure::CrossOutputDragUnsupported);
+        let error = failure.protocol_error();
+        assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+        assert!(!error.retryable);
+        assert!(
+            error
+                .message
+                .contains("before pointer movement or button press")
         );
     }
 

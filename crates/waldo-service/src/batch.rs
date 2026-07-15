@@ -417,6 +417,11 @@ mod tests {
             application_id: None,
             pid: None,
             logical_bounds: None,
+            is_floating: true,
+            capture: waldo_protocol::WindowCaptureCapability {
+                available: true,
+                limitation: None,
+            },
             focused: true,
             workspace_id: None,
             output_id: Some(OutputId("DP-1".into())),

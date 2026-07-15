@@ -84,7 +84,7 @@ pub(crate) fn tools() -> Vec<Value> {
         tool::<ObserveRequest>(
             "observe",
             "Observe desktop",
-            "Capture a Niri output, visible foreground window, or region and return its screenshot with grounding metadata.",
+            "Capture a Niri output, supported visible foreground window, or region and return its screenshot with source and delivered-image coordinate mappings. Query window-specific capture availability first; tiled-window capture may be unavailable. continue_from must cite a retained observation of the same source and returns explicit continuity metadata.",
             true,
             false,
         ),

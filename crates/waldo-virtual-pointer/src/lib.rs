@@ -154,6 +154,7 @@ impl PointerState {
         action: &Action,
         cancellation: &ExecutionToken,
     ) -> Result<(), ActionExecutionFailure> {
+        self.refresh_output_inventory()?;
         let prepared =
             PreparedAction::from_action(action).map_err(ActionExecutionFailure::not_executed)?;
         cancelled_before_dispatch(cancellation)?;
@@ -218,6 +219,40 @@ impl PointerState {
                 )
             })?;
         Ok(())
+    }
+
+    fn refresh_output_inventory(&mut self) -> Result<(), ActionExecutionFailure> {
+        if self.held_buttons.is_empty() {
+            // A fresh device binds the compositor's current wl_output objects, including
+            // remove-and-readd mutations which reuse an output name.
+            *self = Self::connect().map_err(ActionExecutionFailure::not_executed)?;
+            return Ok(());
+        }
+
+        let live = DesktopGeometry::inspect().map_err(ActionExecutionFailure::not_executed)?;
+        let known_names = self
+            .outputs
+            .iter()
+            .filter_map(|output| output.name.clone())
+            .collect::<BTreeSet<_>>();
+        let live_names = live
+            .outputs
+            .iter()
+            .map(|output| output.name.clone())
+            .collect::<BTreeSet<_>>();
+        if known_names == live_names {
+            return Ok(());
+        }
+
+        let refreshed = Self::connect().map_err(ActionExecutionFailure::not_executed)?;
+        *self = refreshed;
+        Err(ActionExecutionFailure::indeterminate(
+            ActionRoute::VirtualPointer,
+            backend_failure(
+                "output topology changed while a pointer button was held; Waldo released the virtual device before refusing further dispatch",
+                true,
+            ),
+        ))
     }
 
     fn send_absolute(&mut self, point: &PreparedPoint) -> Result<(), ActionExecutionFailure> {
