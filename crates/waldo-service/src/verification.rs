@@ -43,7 +43,7 @@ impl VerificationPlan {
                             retryable: false,
                         });
                     }
-                    prior_frames.insert(*from, grounding.frame_fingerprint);
+                    prior_frames.insert(*from, grounding.application_frame_fingerprint);
                 }
                 Predicate::ElementExists { .. } | Predicate::ElementState { .. } => {}
                 Predicate::WindowExists { .. }
@@ -72,7 +72,7 @@ impl VerificationPlan {
             .lock()
             .await
             .observation(connection_id, observation.id)
-            .map(|grounding| grounding.frame_fingerprint)
+            .map(|grounding| grounding.application_frame_fingerprint)
             .ok_or_else(|| ProtocolError {
                 code: ErrorCode::Internal,
                 message: "settled observation was not retained for verification".into(),

@@ -327,6 +327,14 @@ async fn stop_overtakes_and_quiesces_an_active_mcp_act() {
         acted["result"]["structuredContent"]["result"]["stop_reason"],
         serde_json::to_value(StopReason::Cancelled).unwrap()
     );
+    assert_eq!(
+        acted["result"]["structuredContent"]["result"]["application_outcome"],
+        "inconclusive"
+    );
+    assert!(
+        acted["result"]["structuredContent"]["result"]["completion_evidence"]["frame_state"]
+            .is_string()
+    );
     assert!(responses.iter().any(|response| response["id"] == 4));
     assert!(finished.load(Ordering::Acquire));
 

@@ -20,6 +20,21 @@ pub trait ScreenCapturer: Send + Sync {
         width: i32,
         height: i32,
     ) -> Result<Capture, CaptureError>;
+
+    fn capture_application_output(&self, output_name: &str) -> Result<Capture, CaptureError> {
+        self.capture_output(output_name)
+    }
+
+    fn capture_application_region(
+        &self,
+        output_name: &str,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture_region(output_name, x, y, width, height)
+    }
 }
 
 impl ScreenCapturer for Screencopy {
@@ -40,6 +55,21 @@ impl ScreenCapturer for Screencopy {
         height: i32,
     ) -> Result<Capture, CaptureError> {
         Self::capture_region(self, output_name, x, y, width, height)
+    }
+
+    fn capture_application_output(&self, output_name: &str) -> Result<Capture, CaptureError> {
+        self.capture_output_without_cursor(output_name)
+    }
+
+    fn capture_application_region(
+        &self,
+        output_name: &str,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture_region_without_cursor(output_name, x, y, width, height)
     }
 }
 

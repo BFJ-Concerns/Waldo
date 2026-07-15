@@ -14,10 +14,10 @@ use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
 use waldo_controller::ExecutionToken;
 use waldo_niri::{NiriSnapshot, SessionInspector, UnavailableInspector};
 use waldo_protocol::{
-    Action, ActionRoute, ClientId, ClientMessage, ErrorCode, LogicalPoint, LogicalRect,
-    ObserveRequest, OutputId, OutputState, OutputTransform, Predicate, ProtocolError, QueryRequest,
-    RequestId, SCHEMA_MAJOR_VERSION, ServerMessage, SourceSelector, StopReason, StopRequest,
-    WindowId,
+    Action, ActionRoute, ApplicationFrameState, ApplicationOutcome, ClientId, ClientMessage,
+    ErrorCode, EvidenceAgreement, LogicalPoint, LogicalRect, ObserveRequest, OutputId, OutputState,
+    OutputTransform, Predicate, ProtocolError, QueryRequest, RequestId, SCHEMA_MAJOR_VERSION,
+    ServerMessage, SourceSelector, StopReason, StopRequest, WindowId,
 };
 use waldo_screencopy::{Capture, CaptureError, ScreenCapturer};
 use waldo_service::ControllerService;
@@ -133,6 +133,18 @@ struct FailingFinalCapturer {
 }
 
 struct SettlingFrameCapturer {
+    calls: AtomicUsize,
+}
+
+struct CursorOnlyCapturer {
+    composite_calls: AtomicUsize,
+}
+
+struct ApplicationChangeCapturer {
+    application_calls: AtomicUsize,
+}
+
+struct ContinuousApplicationCapturer {
     calls: AtomicUsize,
 }
 
@@ -274,13 +286,116 @@ impl ScreenCapturer for SettlingFrameCapturer {
     }
 }
 
+impl ScreenCapturer for CursorOnlyCapturer {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn capture_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        let call = self.composite_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Capture {
+            png: format!("cursor-position-{call}").into_bytes(),
+            width: 1920,
+            height: 1080,
+            captured_at_unix_ms: call as u64,
+        })
+    }
+
+    fn capture_region(
+        &self,
+        output_name: &str,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture_output(output_name)
+    }
+
+    fn capture_application_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        Ok(Capture {
+            png: b"unchanged-application".to_vec(),
+            width: 1920,
+            height: 1080,
+            captured_at_unix_ms: 1,
+        })
+    }
+}
+
+impl ScreenCapturer for ApplicationChangeCapturer {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn capture_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        Ok(Capture {
+            png: b"cursor-inclusive-frame".to_vec(),
+            width: 1920,
+            height: 1080,
+            captured_at_unix_ms: 1,
+        })
+    }
+
+    fn capture_region(
+        &self,
+        output_name: &str,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture_output(output_name)
+    }
+
+    fn capture_application_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        let call = self.application_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Capture {
+            png: if call == 0 {
+                b"application-before".to_vec()
+            } else {
+                b"application-after".to_vec()
+            },
+            width: 1920,
+            height: 1080,
+            captured_at_unix_ms: call as u64 + 1,
+        })
+    }
+}
+
+impl ScreenCapturer for ContinuousApplicationCapturer {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn capture_output(&self, _output_name: &str) -> Result<Capture, CaptureError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Capture {
+            png: format!("application-frame-{call}").into_bytes(),
+            width: 1920,
+            height: 1080,
+            captured_at_unix_ms: call as u64,
+        })
+    }
+
+    fn capture_region(
+        &self,
+        output_name: &str,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture_output(output_name)
+    }
+}
+
 impl ScreenCapturer for FailingFinalCapturer {
     fn available(&self) -> bool {
         true
     }
 
     fn capture_output(&self, output_name: &str) -> Result<Capture, CaptureError> {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 2 {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 4 {
             Err(CaptureError::CompositorFailed)
         } else {
             FixedCapturer.capture_output(output_name)
@@ -748,13 +863,22 @@ async fn floating_window_reports_the_exact_output_crop_consumed_by_screencopy() 
     );
     assert_eq!(
         regions.lock().unwrap().as_slice(),
-        &[RecordedRegion {
-            output: "DP-1".into(),
-            x: 120,
-            y: 80,
-            width: 800,
-            height: 600,
-        }]
+        &[
+            RecordedRegion {
+                output: "DP-1".into(),
+                x: 120,
+                y: 80,
+                width: 800,
+                height: 600,
+            },
+            RecordedRegion {
+                output: "DP-1".into(),
+                x: 120,
+                y: 80,
+                width: 800,
+                height: 600,
+            },
+        ]
     );
 
     drop(client);
@@ -1652,6 +1776,11 @@ async fn act_returns_mechanical_post_action_verification_results() {
     };
     assert_eq!(result.stop_reason, StopReason::Completed);
     assert_eq!(result.verification, vec![true]);
+    assert_eq!(result.application_outcome, ApplicationOutcome::Completed);
+    assert_eq!(
+        result.completion_evidence.verification_agreement,
+        EvidenceAgreement::Agreed
+    );
 
     drop(client);
     shutdown_tx.send(()).unwrap();
@@ -1715,8 +1844,438 @@ async fn act_waits_past_transient_changes_for_a_quiet_post_action_frame() {
         panic!("action did not return a result")
     };
     let settled = result.observation.unwrap();
+    assert_eq!(result.application_outcome, ApplicationOutcome::Inconclusive);
+    assert_eq!(
+        result.completion_evidence.frame_state,
+        ApplicationFrameState::Settled
+    );
+    assert!(!result.completion_evidence.settle_deadline_reached);
     assert_ne!(settled.image.data_base64, before);
     assert!(settled.captured_at_unix_ms >= 4);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn cursor_only_damage_cannot_satisfy_application_frame_change() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(CursorOnlyCapturer {
+            composite_calls: AtomicUsize::new(0),
+        }),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("cursor-only-test").unwrap())
+        .await
+        .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![
+                    Action::PointerClick {
+                        position: LogicalPoint { x: 20.0, y: 20.0 },
+                        button: waldo_protocol::PointerButton::Primary,
+                        count: 1,
+                    },
+                    Action::Wait {
+                        predicate: Predicate::FrameChanged {
+                            from: observation.id,
+                        },
+                        timeout_ms: 50,
+                    },
+                ],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("cursor-only batch did not return an Act result")
+    };
+    assert_eq!(
+        result.receipts[0].status,
+        waldo_protocol::ReceiptStatus::Executed
+    );
+    assert_eq!(
+        result.receipts[1].status,
+        waldo_protocol::ReceiptStatus::Failed
+    );
+    assert_eq!(result.stop_reason, StopReason::WaitFailed);
+    assert_eq!(result.application_outcome, ApplicationOutcome::Inconclusive);
+    assert_eq!(
+        result.completion_evidence.frame_state,
+        ApplicationFrameState::CursorOnly
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn application_frame_change_satisfies_wait_at_the_final_consumer() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(ApplicationChangeCapturer {
+            application_calls: AtomicUsize::new(0),
+        }),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client =
+        ControllerClient::connect(&path, ClientId::new("application-change-test").unwrap())
+            .await
+            .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![
+                    Action::PointerClick {
+                        position: LogicalPoint { x: 20.0, y: 20.0 },
+                        button: waldo_protocol::PointerButton::Primary,
+                        count: 1,
+                    },
+                    Action::Wait {
+                        predicate: Predicate::FrameChanged {
+                            from: observation.id,
+                        },
+                        timeout_ms: 50,
+                    },
+                ],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("application-change batch did not return an Act result")
+    };
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(
+        result.receipts[0].status,
+        waldo_protocol::ReceiptStatus::Executed
+    );
+    assert_eq!(
+        result.receipts[1].status,
+        waldo_protocol::ReceiptStatus::Executed
+    );
+    assert_eq!(result.receipts[1].predicate_result, Some(true));
+    assert_eq!(
+        result.completion_evidence.frame_state,
+        ApplicationFrameState::Settled
+    );
+    assert!(!result.completion_evidence.settle_deadline_reached);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn continuous_repaint_is_changing_at_an_explicit_settle_deadline() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(ContinuousApplicationCapturer {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client =
+        ControllerClient::connect(&path, ClientId::new("continuous-frame-test").unwrap())
+            .await
+            .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![Action::Text {
+                    text: "dispatched".into(),
+                    route: waldo_protocol::TextRoutePreference::VirtualKeyboard,
+                }],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("continuous repaint did not return an Act result")
+    };
+    assert_eq!(
+        result.receipts[0].status,
+        waldo_protocol::ReceiptStatus::Executed
+    );
+    assert_eq!(result.application_outcome, ApplicationOutcome::Inconclusive);
+    assert_eq!(
+        result.completion_evidence.frame_state,
+        ApplicationFrameState::Changing
+    );
+    assert!(result.completion_evidence.settle_deadline_reached);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn contradictory_final_evidence_is_inconclusive_not_completed() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("contradiction-test").unwrap())
+        .await
+        .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: Vec::new(),
+                verification: vec![
+                    Predicate::FocusedWindow {
+                        window_id: WindowId("41".into()),
+                    },
+                    Predicate::FrameChanged {
+                        from: observation.id,
+                    },
+                ],
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("contradictory verification did not return an Act result")
+    };
+    assert_eq!(result.verification, vec![true, false]);
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(result.application_outcome, ApplicationOutcome::Inconclusive);
+    assert_eq!(
+        result.completion_evidence.verification_agreement,
+        EvidenceAgreement::Contradictory
+    );
+
+    let failed = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(4),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: Vec::new(),
+                verification: vec![
+                    Predicate::FocusedWindow {
+                        window_id: WindowId("missing-window".into()),
+                    },
+                    Predicate::FrameChanged {
+                        from: observation.id,
+                    },
+                ],
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = failed else {
+        panic!("failed verification did not return an Act result")
+    };
+    assert_eq!(result.verification, vec![false, false]);
+    assert_eq!(result.stop_reason, StopReason::VerificationFailed);
+    assert_eq!(result.application_outcome, ApplicationOutcome::Failed);
+    assert_eq!(
+        result.completion_evidence.verification_agreement,
+        EvidenceAgreement::Agreed
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn intercepted_rejected_and_blocked_input_remains_only_dispatched() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client =
+        ControllerClient::connect(&path, ClientId::new("rejected-input-test").unwrap())
+            .await
+            .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let destination_before = observation.image.data_base64.clone();
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![
+                    Action::PointerClick {
+                        position: LogicalPoint { x: 20.0, y: 20.0 },
+                        button: waldo_protocol::PointerButton::Primary,
+                        count: 1,
+                    },
+                    Action::Text {
+                        text: "rejected".into(),
+                        route: waldo_protocol::TextRoutePreference::ClipboardPaste,
+                    },
+                    Action::KeyChord {
+                        keys: vec!["Control".into(), "v".into()],
+                    },
+                ],
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("rejected input did not return an Act result")
+    };
+    assert!(
+        result
+            .receipts
+            .iter()
+            .all(|receipt| receipt.status == waldo_protocol::ReceiptStatus::Executed)
+    );
+    assert_eq!(result.stop_reason, StopReason::Completed);
+    assert_eq!(result.application_outcome, ApplicationOutcome::Inconclusive);
+    assert_eq!(
+        result.completion_evidence.frame_state,
+        ApplicationFrameState::Unchanged
+    );
+    assert!(result.completion_evidence.settle_deadline_reached);
+    assert_eq!(
+        result.observation.unwrap().image.data_base64,
+        destination_before
+    );
 
     drop(client);
     shutdown_tx.send(()).unwrap();
