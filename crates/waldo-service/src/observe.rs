@@ -103,6 +103,7 @@ pub(crate) async fn capture_observation(
         logical_bounds,
         provenance,
         capture,
+        application_frame_fingerprint,
     } = match captured {
         Ok(Ok(captured)) => captured,
         Ok(Err(error)) => return Err(error),
@@ -122,6 +123,7 @@ pub(crate) async fn capture_observation(
             include_accessibility,
             cursor_position: None,
             frame_fingerprint,
+            application_frame_fingerprint,
         },
     );
     let pixel_size = waldo_protocol::PixelSize {
@@ -187,6 +189,7 @@ pub(crate) struct CapturedFrame {
     pub(crate) logical_bounds: LogicalRect,
     pub(crate) provenance: CaptureProvenance,
     pub(crate) capture: Capture,
+    pub(crate) application_frame_fingerprint: u64,
 }
 
 pub(crate) fn capture_frame(
@@ -231,6 +234,14 @@ pub(crate) fn capture_frame(
         None => capturer.capture_output(&output.name),
     }
     .map_err(|error| backend_error(error.to_string()))?;
+    let application_capture = match resolved.region {
+        Some(region) => {
+            let (x, y, width, height) = region_coordinates(region, output.logical_bounds)?;
+            capturer.capture_application_region(&output.name, x, y, width, height)
+        }
+        None => capturer.capture_application_output(&output.name),
+    }
+    .map_err(|error| backend_error(error.to_string()))?;
 
     Ok(CapturedFrame {
         focused_window,
@@ -242,6 +253,7 @@ pub(crate) fn capture_frame(
             output_local_bounds,
         },
         capture,
+        application_frame_fingerprint: frame_fingerprint(&application_capture.png),
     })
 }
 

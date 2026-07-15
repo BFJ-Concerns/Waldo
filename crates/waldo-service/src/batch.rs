@@ -18,7 +18,7 @@ use waldo_protocol::{
 };
 use waldo_screencopy::ScreenCapturer;
 
-use crate::observe::{capture_frame, frame_fingerprint};
+use crate::observe::capture_frame;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -102,7 +102,7 @@ impl BatchActionExecutor {
                     self.capturer.as_ref(),
                     false,
                 )?;
-                Ok(frame_fingerprint(&frame.capture.png) != grounding.frame_fingerprint)
+                Ok(frame.application_frame_fingerprint != grounding.application_frame_fingerprint)
             }
             Predicate::WindowExists { window_id } => Ok(self
                 .snapshot_windows()?
@@ -397,6 +397,7 @@ mod tests {
             include_accessibility: false,
             cursor_position: Some(LogicalPoint { x: 10.0, y: 10.0 }),
             frame_fingerprint: 0,
+            application_frame_fingerprint: 0,
         }
     }
 

@@ -141,6 +141,42 @@ pub enum StopReason {
     Cancelled,
 }
 
+/// Whether the intended application state was established independently of dispatch.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationOutcome {
+    Completed,
+    Failed,
+    Inconclusive,
+}
+
+/// State of the application pixels at the end of bounded post-action sampling.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationFrameState {
+    Unchanged,
+    CursorOnly,
+    Settled,
+    Changing,
+}
+
+/// Relationship between the requested verification predicates.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceAgreement {
+    NotEvaluated,
+    Agreed,
+    Contradictory,
+}
+
+/// Bounded evidence returned separately from ordered dispatch receipts.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct CompletionEvidence {
+    pub frame_state: ApplicationFrameState,
+    pub settle_deadline_reached: bool,
+    pub verification_agreement: EvidenceAgreement,
+}
+
 /// Structural evidence for one action, excluding sensitive payloads.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct ActionReceipt {
@@ -171,6 +207,9 @@ pub struct ActResult {
     #[serde(default)]
     pub completion_error: Option<ProtocolError>,
     pub verification: Vec<bool>,
+    /// Application-state conclusion; never inferred from an executed receipt alone.
+    pub application_outcome: ApplicationOutcome,
+    pub completion_evidence: CompletionEvidence,
 }
 
 /// Read-only controller and desktop state.

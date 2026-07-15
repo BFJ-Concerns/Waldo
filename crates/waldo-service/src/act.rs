@@ -7,7 +7,8 @@ use std::{
 use tokio::sync::oneshot;
 use waldo_action::{execute_batch, validate_grounding};
 use waldo_protocol::{
-    ActRequest, ActResult, ConnectionId, ErrorCode, ProtocolError, RequestId, ServerMessage,
+    ActRequest, ActResult, ApplicationFrameState, ApplicationOutcome, CompletionEvidence,
+    ConnectionId, ErrorCode, EvidenceAgreement, ProtocolError, RequestId, ServerMessage,
 };
 
 use crate::{
@@ -171,20 +172,29 @@ pub(crate) async fn act(
             return error_response(request_id, ErrorCode::Internal, &error.to_string(), true);
         }
     };
-    let (observation, mut completion_error, mut stop_reason) =
+    let (observation, frame_state, settle_deadline_reached, mut completion_error, mut stop_reason) =
         match capture_post_action_observation(
             result_source,
             grounding.include_accessibility,
             grounding.frame_fingerprint,
+            grounding.application_frame_fingerprint,
             expect_visual_change,
             state,
             connection_id,
         )
         .await
         {
-            Ok(observation) => (Some(observation), None, execution.stop_reason),
+            Ok(post_action) => (
+                Some(post_action.observation),
+                post_action.frame_state,
+                post_action.settle_deadline_reached,
+                None,
+                execution.stop_reason,
+            ),
             Err(error) => (
                 None,
+                ApplicationFrameState::Unchanged,
+                false,
                 Some(error),
                 if execution.stop_reason == waldo_protocol::StopReason::Completed {
                     waldo_protocol::StopReason::ExecutionFailed
@@ -198,15 +208,7 @@ pub(crate) async fn act(
             .evaluate(observation, state, connection_id)
             .await
         {
-            Ok(results) => {
-                if results.iter().any(|passed| !passed)
-                    && stop_reason == waldo_protocol::StopReason::Completed
-                {
-                    stop_reason = waldo_protocol::StopReason::VerificationFailed;
-                    completion_error = Some(failed_verification());
-                }
-                results
-            }
+            Ok(results) => results,
             Err(error) => {
                 if stop_reason == waldo_protocol::StopReason::Completed {
                     stop_reason = waldo_protocol::StopReason::VerificationFailed;
@@ -218,6 +220,19 @@ pub(crate) async fn act(
     } else {
         Vec::new()
     };
+    let verification_agreement = evidence_agreement(&verification_results);
+    let application_outcome = application_outcome(
+        stop_reason,
+        frame_state,
+        settle_deadline_reached,
+        &verification_results,
+    );
+    if application_outcome == ApplicationOutcome::Failed
+        && stop_reason == waldo_protocol::StopReason::Completed
+    {
+        stop_reason = waldo_protocol::StopReason::VerificationFailed;
+        completion_error = Some(failed_verification());
+    }
     state.finish_execution(connection_id).await;
 
     ServerMessage::Acted {
@@ -230,6 +245,12 @@ pub(crate) async fn act(
             observation,
             completion_error,
             verification: verification_results,
+            application_outcome,
+            completion_evidence: CompletionEvidence {
+                frame_state,
+                settle_deadline_reached,
+                verification_agreement,
+            },
         },
     }
 }
@@ -238,12 +259,14 @@ async fn capture_post_action_observation(
     source: waldo_protocol::SourceSelector,
     include_accessibility: bool,
     previous_frame: u64,
+    previous_application_frame: u64,
     expect_visual_change: bool,
     state: &ServiceState,
     connection_id: ConnectionId,
-) -> Result<waldo_protocol::Observation, ProtocolError> {
+) -> Result<PostActionObservation, ProtocolError> {
     let deadline = Instant::now() + POST_ACTION_FRAME_TIMEOUT;
     let mut latest_frame = previous_frame;
+    let mut latest_application_frame = previous_application_frame;
     let mut last_change = Instant::now();
     let mut changed = false;
     loop {
@@ -251,38 +274,105 @@ async fn capture_post_action_observation(
             capture_observation(source.clone(), include_accessibility, state, connection_id)
                 .await?;
         if !expect_visual_change {
-            return Ok(observation);
+            return Ok(PostActionObservation {
+                observation,
+                frame_state: ApplicationFrameState::Unchanged,
+                settle_deadline_reached: false,
+            });
         }
         let now = Instant::now();
-        let Some(frame) = observation_frame_fingerprint(state, connection_id, observation.id).await
+        let Some((frame, application_frame)) =
+            observation_frame_fingerprints(state, connection_id, observation.id).await
         else {
-            return Ok(observation);
+            return Ok(PostActionObservation {
+                observation,
+                frame_state: ApplicationFrameState::Unchanged,
+                settle_deadline_reached: false,
+            });
         };
-        if frame != latest_frame {
+        let composite_changed = frame != latest_frame;
+        if composite_changed {
             latest_frame = frame;
+        }
+        if application_frame != latest_application_frame {
+            latest_application_frame = application_frame;
             last_change = now;
             changed = true;
         }
-        if (changed && now.duration_since(last_change) >= POST_ACTION_FRAME_QUIET_PERIOD)
-            || now >= deadline
-        {
-            return Ok(observation);
+        if changed && now.duration_since(last_change) >= POST_ACTION_FRAME_QUIET_PERIOD {
+            return Ok(PostActionObservation {
+                observation,
+                frame_state: ApplicationFrameState::Settled,
+                settle_deadline_reached: false,
+            });
+        }
+        if now >= deadline {
+            return Ok(PostActionObservation {
+                observation,
+                frame_state: if changed {
+                    ApplicationFrameState::Changing
+                } else if composite_changed || frame != previous_frame {
+                    ApplicationFrameState::CursorOnly
+                } else {
+                    ApplicationFrameState::Unchanged
+                },
+                settle_deadline_reached: true,
+            });
         }
         tokio::time::sleep(POST_ACTION_FRAME_POLL_INTERVAL).await;
     }
 }
 
-async fn observation_frame_fingerprint(
+async fn observation_frame_fingerprints(
     state: &ServiceState,
     connection_id: ConnectionId,
     observation_id: waldo_protocol::ObservationId,
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     state
         .controller
         .lock()
         .await
         .observation(connection_id, observation_id)
-        .map(|grounding| grounding.frame_fingerprint)
+        .map(|grounding| {
+            (
+                grounding.frame_fingerprint,
+                grounding.application_frame_fingerprint,
+            )
+        })
+}
+
+struct PostActionObservation {
+    observation: waldo_protocol::Observation,
+    frame_state: ApplicationFrameState,
+    settle_deadline_reached: bool,
+}
+
+fn evidence_agreement(results: &[bool]) -> EvidenceAgreement {
+    match results.first() {
+        None => EvidenceAgreement::NotEvaluated,
+        Some(first) if results.iter().all(|result| result == first) => EvidenceAgreement::Agreed,
+        Some(_) => EvidenceAgreement::Contradictory,
+    }
+}
+
+fn application_outcome(
+    stop_reason: waldo_protocol::StopReason,
+    frame_state: ApplicationFrameState,
+    settle_deadline_reached: bool,
+    verification: &[bool],
+) -> ApplicationOutcome {
+    if stop_reason != waldo_protocol::StopReason::Completed {
+        return ApplicationOutcome::Inconclusive;
+    }
+    if settle_deadline_reached && frame_state == ApplicationFrameState::Changing {
+        return ApplicationOutcome::Inconclusive;
+    }
+    match verification.first() {
+        None => ApplicationOutcome::Inconclusive,
+        Some(true) if verification.iter().all(|result| *result) => ApplicationOutcome::Completed,
+        Some(false) if verification.iter().all(|result| !*result) => ApplicationOutcome::Failed,
+        Some(_) => ApplicationOutcome::Inconclusive,
+    }
 }
 
 fn actions_expect_visual_change(actions: &[waldo_protocol::Action]) -> bool {

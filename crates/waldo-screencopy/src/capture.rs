@@ -34,7 +34,14 @@ pub struct Screencopy;
 
 impl Screencopy {
     pub fn capture_output(&self, output_name: &str) -> Result<Capture, CaptureError> {
-        self.capture(output_name, None)
+        self.capture(output_name, None, true)
+    }
+
+    pub fn capture_output_without_cursor(
+        &self,
+        output_name: &str,
+    ) -> Result<Capture, CaptureError> {
+        self.capture(output_name, None, false)
     }
 
     pub fn capture_region(
@@ -45,13 +52,25 @@ impl Screencopy {
         width: i32,
         height: i32,
     ) -> Result<Capture, CaptureError> {
-        self.capture(output_name, Some((x, y, width, height)))
+        self.capture(output_name, Some((x, y, width, height)), true)
+    }
+
+    pub fn capture_region_without_cursor(
+        &self,
+        output_name: &str,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<Capture, CaptureError> {
+        self.capture(output_name, Some((x, y, width, height)), false)
     }
 
     fn capture(
         &self,
         output_name: &str,
         region: Option<(i32, i32, i32, i32)>,
+        overlay_cursor: bool,
     ) -> Result<Capture, CaptureError> {
         let connection = Connection::connect_to_env()
             .map_err(|error| CaptureError::Wayland(error.to_string()))?;
@@ -88,10 +107,17 @@ impl Screencopy {
             .ok_or_else(|| CaptureError::OutputMissing(output_name.to_owned()))?;
 
         let frame = match region {
-            Some((x, y, width, height)) => {
-                manager.capture_output_region(1, &output, x, y, width, height, &handle, ())
-            }
-            None => manager.capture_output(1, &output, &handle, ()),
+            Some((x, y, width, height)) => manager.capture_output_region(
+                overlay_cursor as i32,
+                &output,
+                x,
+                y,
+                width,
+                height,
+                &handle,
+                (),
+            ),
+            None => manager.capture_output(overlay_cursor as i32, &output, &handle, ()),
         };
         state.frame = Some(frame);
         let deadline = Instant::now() + CAPTURE_TIMEOUT;
