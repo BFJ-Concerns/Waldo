@@ -19,7 +19,9 @@ def arguments():
     parser.add_argument("--ready", required=True)
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument(
-        "--scenario", choices=("delayed", "continuous"), default="delayed"
+        "--scenario",
+        choices=("delayed", "continuous", "interception", "contradictory"),
+        default="delayed",
     )
     parser.add_argument("--delay-ms", type=int, default=750)
     parser.add_argument("--continuous-hz", type=int, default=20)
@@ -34,6 +36,7 @@ class CoordinateFixture(Gtk.Application):
         self.options = options
         self.phase = 0
         self.click_count = 0
+        self.interceptor_count = 0
         self.frame_count = 0
         self.written_state = None
         self.continuous_source = None
@@ -46,11 +49,24 @@ class CoordinateFixture(Gtk.Application):
         self.window.set_default_size(1000, 700)
         self.area = Gtk.DrawingArea()
         self.area.set_draw_func(self.draw)
-        click = Gtk.GestureClick()
-        click.connect("pressed", self.pointer_event, "press")
-        click.connect("released", self.pointer_event, "release")
-        self.area.add_controller(click)
-        self.window.set_child(self.area)
+        target_click = Gtk.GestureClick()
+        target_click.connect("pressed", self.pointer_event, "press")
+        target_click.connect("released", self.pointer_event, "release")
+        self.area.add_controller(target_click)
+        if self.options.scenario == "interception":
+            overlay = Gtk.Overlay()
+            overlay.set_child(self.area)
+            interceptor = Gtk.Box()
+            interceptor.set_hexpand(True)
+            interceptor.set_vexpand(True)
+            interceptor_click = Gtk.GestureClick()
+            interceptor_click.connect("pressed", self.interceptor_event, "press")
+            interceptor_click.connect("released", self.interceptor_event, "release")
+            interceptor.add_controller(interceptor_click)
+            overlay.add_overlay(interceptor)
+            self.window.set_child(overlay)
+        else:
+            self.window.set_child(self.area)
         self.window.fullscreen()
         self.window.present()
         signal.signal(signal.SIGUSR1, self.request_change)
@@ -89,7 +105,14 @@ class CoordinateFixture(Gtk.Application):
             context.move_to(0, y)
             context.line_to(width, y)
         context.stroke()
-        state = (self.phase, self.click_count, self.frame_count, width, height)
+        state = (
+            self.phase,
+            self.click_count,
+            self.interceptor_count,
+            self.frame_count,
+            width,
+            height,
+        )
         if self.written_state != state:
             self.written_state = state
             GLib.idle_add(self.write_ready, width, height)
@@ -113,6 +136,7 @@ class CoordinateFixture(Gtk.Application):
                     "scenario": self.options.scenario,
                     "phase": self.phase,
                     "click_count": self.click_count,
+                    "interceptor_count": self.interceptor_count,
                     "frame_count": self.frame_count,
                     "recorded_at_unix_ns": time.time_ns(),
                     "columns": self.options.columns,
@@ -129,7 +153,7 @@ class CoordinateFixture(Gtk.Application):
         open(self.options.events, "a", encoding="utf-8").close()
         return GLib.SOURCE_REMOVE
 
-    def pointer_event(self, gesture, _count, x, y, kind):
+    def record_pointer_event(self, gesture, x, y, kind, receiver):
         button = gesture.get_current_button()
         column = min(int(x * self.options.columns / self.area.get_width()), self.options.columns - 1)
         row = min(int(y * self.options.rows / self.area.get_height()), self.options.rows - 1)
@@ -137,7 +161,7 @@ class CoordinateFixture(Gtk.Application):
             handle.write(
                 json.dumps(
                     {
-                        "kind": kind,
+                        "kind": f"{receiver}_{kind}",
                         "recorded_at_unix_ns": time.time_ns(),
                         "button": button,
                         "x": x,
@@ -151,13 +175,25 @@ class CoordinateFixture(Gtk.Application):
                 + "\n"
             )
             handle.flush()
+
+    def pointer_event(self, gesture, _count, x, y, kind):
+        self.record_pointer_event(gesture, x, y, kind, "target")
         if kind == "release":
             self.click_count += 1
             if self.options.scenario == "delayed":
                 GLib.timeout_add(self.options.delay_ms, self.change_first_cell)
             elif self.continuous_source is None:
-                interval = max(1, round(1000 / self.options.continuous_hz))
-                self.continuous_source = GLib.timeout_add(interval, self.advance_frame)
+                if self.options.scenario == "continuous":
+                    interval = max(1, round(1000 / self.options.continuous_hz))
+                    self.continuous_source = GLib.timeout_add(interval, self.advance_frame)
+                elif self.options.scenario == "contradictory":
+                    self.change_first_cell()
+            self.area.queue_draw()
+
+    def interceptor_event(self, gesture, _count, x, y, kind):
+        self.record_pointer_event(gesture, x, y, kind, "interceptor")
+        if kind == "release":
+            self.interceptor_count += 1
             self.area.queue_draw()
 
     def request_change(self, _signum, _frame):

@@ -33,6 +33,8 @@ pub struct OutsideInSummary {
     coordinate: CoordinateResult,
     delayed_completion: DelayedCompletionResult,
     continuous_completion: ContinuousCompletionResult,
+    transparent_interception: Option<TransparentInterceptionResult>,
+    contradictory_state: Option<ContradictoryStateResult>,
     controller_socket_removed: bool,
     sensitive_payloads_retained: bool,
 }
@@ -40,6 +42,7 @@ pub struct OutsideInSummary {
 #[derive(Debug, Serialize)]
 struct IdentityEvidence {
     waldo_commit: String,
+    verifier_commit: String,
     seed: u64,
     binaries: Vec<FileIdentity>,
     fixture: FileIdentity,
@@ -74,6 +77,9 @@ struct CoordinateResult {
 struct DelayedCompletionResult {
     outcome: &'static str,
     product_stop_reason: Option<String>,
+    application_outcome: Option<String>,
+    frame_state: Option<String>,
+    settle_deadline_reached: Option<bool>,
     click_reached_application: bool,
     returned_before_application_change: bool,
     returned_image_was_pre_change: bool,
@@ -86,11 +92,41 @@ struct DelayedCompletionResult {
 struct ContinuousCompletionResult {
     outcome: &'static str,
     product_stop_reason: Option<String>,
+    application_outcome: Option<String>,
+    frame_state: Option<String>,
+    settle_deadline_reached: Option<bool>,
     external_deadline_reached: bool,
     frames_at_response: u64,
     frames_after_probe: u64,
     independent_oracle_still_changing: bool,
     later_image_digest_changed: Option<bool>,
+    stop_completed_within_limit: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TransparentInterceptionResult {
+    outcome: &'static str,
+    act_external_deadline_reached: bool,
+    receipt_status: Option<String>,
+    application_outcome: Option<String>,
+    frame_state: Option<String>,
+    settle_deadline_reached: Option<bool>,
+    target_clicks: u64,
+    interceptor_clicks: u64,
+    stop_completed_within_limit: bool,
+    service_healthy_after_stop: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ContradictoryStateResult {
+    outcome: &'static str,
+    act_external_deadline_reached: bool,
+    receipt_status: Option<String>,
+    application_outcome: Option<String>,
+    verification_results: Vec<bool>,
+    verification_agreement: Option<String>,
+    fixture_clicks: u64,
+    fixture_phase: u64,
     stop_completed_within_limit: bool,
 }
 
@@ -122,6 +158,8 @@ struct Cell {
 struct FixtureState {
     phase: u64,
     click_count: u64,
+    #[serde(default)]
+    interceptor_count: u64,
     frame_count: u64,
     width: u32,
     height: u32,
@@ -306,7 +344,8 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
     let mut mcp = McpClient::start(&options.mcp, &runtime)?;
     let current_exe = std::env::current_exe()?;
     let identity = IdentityEvidence {
-        waldo_commit: git_head()?,
+        waldo_commit: git_ref("main")?,
+        verifier_commit: git_ref("HEAD")?,
         seed: options.seed,
         binaries: vec![
             file_identity(&options.waldod)?,
@@ -329,6 +368,19 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
     let _ = mcp.call("tools/call", json!({"name": "stop", "arguments": {}}));
     let continuous = run_continuous(&options, &mut mcp)?;
     let _ = mcp.call("tools/call", json!({"name": "stop", "arguments": {}}));
+    let (transparent_interception, contradictory_state) = if continuous.outcome == "passed" {
+        {
+            let interception = run_transparent_interception(&options, &mut mcp)?;
+            let contradiction = if interception.service_healthy_after_stop {
+                Some(run_contradictory_state(&options, &mut mcp)?)
+            } else {
+                None
+            };
+            (Some(interception), contradiction)
+        }
+    } else {
+        (None, None)
+    };
 
     let output_id = delayed.output_id.clone();
     mcp.child.terminate();
@@ -341,6 +393,8 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
         coordinate: delayed.coordinate,
         delayed_completion: delayed.completion,
         continuous_completion: continuous,
+        transparent_interception,
+        contradictory_state,
         controller_socket_removed: !scratch.exists(),
         sensitive_payloads_retained: false,
     };
@@ -442,7 +496,9 @@ fn run_delayed(
         }
     });
     write_json(directory.join("act-request.json"), &act_request)?;
-    let acted_response = mcp.call("tools/call", act_request)?;
+    let acted_response = mcp
+        .call_with_timeout("tools/call", act_request, Duration::from_secs(10))?
+        .ok_or("delayed completion Act exceeded the 10-second verifier limit")?;
     let response_ns = unix_ns()?;
     let acted = parse_observation(&acted_response, &directory, "act")?;
     write_redacted_response(directory.join("act-response.json"), &acted_response, &acted)?;
@@ -494,6 +550,9 @@ fn run_delayed(
     let click_reached_application = release.recorded_at_unix_ns <= response_ns;
     let changed_after_response = changed.phase >= 1 && response_state.phase == 0;
     let stop_reason = stop_reason(&acted_response);
+    let application_outcome = result_text(&acted_response, "application_outcome");
+    let frame_state = completion_text(&acted_response, "frame_state");
+    let settle_deadline_reached = completion_bool(&acted_response, "settle_deadline_reached");
     let false_completion = stop_reason.as_deref() == Some("completed")
         && click_reached_application
         && returned_pre
@@ -546,6 +605,9 @@ fn run_delayed(
                 "inconclusive"
             },
             product_stop_reason: stop_reason,
+            application_outcome,
+            frame_state,
+            settle_deadline_reached,
             click_reached_application,
             returned_before_application_change: response_state.phase == 0,
             returned_image_was_pre_change: returned_pre,
@@ -607,7 +669,7 @@ fn run_continuous(
     });
     write_json(directory.join("act-request.json"), &act_request)?;
     let acted_response =
-        mcp.call_with_timeout("tools/call", act_request, Duration::from_secs(3))?;
+        mcp.call_with_timeout("tools/call", act_request, Duration::from_secs(10))?;
     let Some(acted_response) = acted_response else {
         let at_response = wait_for_state(&state_path, |state| state.click_count >= 1)?;
         thread::sleep(Duration::from_millis(350));
@@ -618,7 +680,7 @@ fn run_continuous(
         write_json(
             directory.join("act-timeout.json"),
             &json!({
-                "verifier_deadline_ms": 3000,
+                "verifier_deadline_ms": 10000,
                 "frames_at_deadline": at_response.frame_count,
                 "frames_after_probe": after_probe.frame_count,
                 "independent_oracle_still_changing": still_changing
@@ -640,6 +702,9 @@ fn run_continuous(
                 "inconclusive"
             },
             product_stop_reason: None,
+            application_outcome: None,
+            frame_state: None,
+            settle_deadline_reached: None,
             external_deadline_reached: true,
             frames_at_response: at_response.frame_count,
             frames_after_probe: after_probe.frame_count,
@@ -653,44 +718,301 @@ fn run_continuous(
     let at_response = wait_for_state(&state_path, |state| state.click_count >= 1)?;
     thread::sleep(Duration::from_millis(350));
     let after_probe = read_state(&state_path)?;
-    let later_request = json!({
-        "name": "observe",
-        "arguments": {
-            "source": observed.source,
-            "continue_from": acted.id,
-            "include_accessibility": false
-        }
-    });
-    let later_response = mcp.call("tools/call", later_request)?;
-    let later = parse_observation(&later_response, &directory, "later-observe")?;
-    write_redacted_response(
-        directory.join("later-observe-response.json"),
-        &later_response,
-        &later,
-    )?;
     let still_changing = initial.frame_count == 0
         && at_response.frame_count > 0
         && after_probe.frame_count > at_response.frame_count;
-    let digest_changed = acted.image_digest != later.image_digest;
     let stop_reason = stop_reason(&acted_response);
-    let false_completion =
-        stop_reason.as_deref() == Some("completed") && still_changing && digest_changed;
+    let application_outcome = result_text(&acted_response, "application_outcome");
+    let frame_state = completion_text(&acted_response, "frame_state");
+    let settle_deadline_reached = completion_bool(&acted_response, "settle_deadline_reached");
+    let decisive_pass = application_outcome.as_deref() == Some("inconclusive")
+        && frame_state.as_deref() == Some("changing")
+        && settle_deadline_reached == Some(true)
+        && still_changing;
+    let stop = mcp.call_with_timeout(
+        "tools/call",
+        json!({"name": "stop", "arguments": {}}),
+        Duration::from_secs(5),
+    )?;
+    if let Some(response) = &stop {
+        write_json(directory.join("stop-response.json"), response)?;
+    }
     fixture.terminate();
 
     Ok(ContinuousCompletionResult {
-        outcome: if false_completion {
-            "failed_as_expected_on_baseline"
-        } else {
-            "did_not_reproduce_baseline_failure"
-        },
+        outcome: if decisive_pass { "passed" } else { "failed" },
         product_stop_reason: stop_reason,
+        application_outcome,
+        frame_state,
+        settle_deadline_reached,
         external_deadline_reached: false,
         frames_at_response: at_response.frame_count,
         frames_after_probe: after_probe.frame_count,
         independent_oracle_still_changing: still_changing,
-        later_image_digest_changed: Some(digest_changed),
-        stop_completed_within_limit: true,
+        later_image_digest_changed: None,
+        stop_completed_within_limit: stop.is_some(),
     })
+}
+
+fn run_transparent_interception(
+    options: &Options,
+    mcp: &mut McpClient,
+) -> Result<TransparentInterceptionResult, Box<dyn std::error::Error>> {
+    let directory = options.evidence_directory.join("transparent-interception");
+    fs::create_dir_all(&directory)?;
+    let state_path = directory.join("fixture-state.json");
+    let events_path = directory.join("fixture-events.jsonl");
+    let mut fixture = start_fixture(options, "interception", &state_path, &events_path)?;
+    wait_for_state(&state_path, |state| {
+        state.click_count == 0 && state.interceptor_count == 0
+    })?;
+    thread::sleep(Duration::from_millis(500));
+    let output_id = focused_output()?;
+    write_json(
+        directory.join("niri-topology.json"),
+        &capture_niri_topology()?,
+    )?;
+    let observe_request = json!({
+        "name": "observe",
+        "arguments": {
+            "source": {"type": "output", "output_id": output_id},
+            "continue_from": null,
+            "include_accessibility": false
+        }
+    });
+    write_json(directory.join("observe-request.json"), &observe_request)?;
+    let observed_response = mcp.call("tools/call", observe_request)?;
+    let observed = parse_observation(&observed_response, &directory, "observe")?;
+    write_redacted_response(
+        directory.join("observe-response.json"),
+        &observed_response,
+        &observed,
+    )?;
+    let target = Point {
+        x: observed.model_pixels.width / 2,
+        y: observed.model_pixels.height / 2,
+    };
+    let logical = model_to_logical(&observed, target.x, target.y);
+    let act_request = json!({
+        "name": "act",
+        "arguments": {
+            "observation_id": observed.id,
+            "actions": [{
+                "type": "pointer_click",
+                "position": {"x": logical.x, "y": logical.y},
+                "button": "primary",
+                "count": 1
+            }],
+            "verification": []
+        }
+    });
+    write_json(directory.join("act-request.json"), &act_request)?;
+    let acted_response =
+        mcp.call_with_timeout("tools/call", act_request, Duration::from_secs(10))?;
+    let Some(acted_response) = acted_response else {
+        let state = wait_for_state(&state_path, |state| state.interceptor_count >= 1)?;
+        write_json(
+            directory.join("act-timeout.json"),
+            &json!({
+                "verifier_deadline_ms": 10000,
+                "target_clicks": state.click_count,
+                "interceptor_clicks": state.interceptor_count,
+                "classification": "blocked_inconclusive"
+            }),
+        )?;
+        let stop = stop_and_record(mcp, &directory)?;
+        let healthy = service_health_check(mcp, &directory)?;
+        fixture.terminate();
+        return Ok(TransparentInterceptionResult {
+            outcome: "blocked_inconclusive",
+            act_external_deadline_reached: true,
+            receipt_status: None,
+            application_outcome: None,
+            frame_state: None,
+            settle_deadline_reached: None,
+            target_clicks: state.click_count,
+            interceptor_clicks: state.interceptor_count,
+            stop_completed_within_limit: stop,
+            service_healthy_after_stop: healthy,
+        });
+    };
+    let acted = parse_observation(&acted_response, &directory, "act")?;
+    write_redacted_response(directory.join("act-response.json"), &acted_response, &acted)?;
+    let state = wait_for_state(&state_path, |state| state.interceptor_count >= 1)?;
+    let receipt_status = first_receipt_status(&acted_response);
+    let application_outcome = result_text(&acted_response, "application_outcome");
+    let frame_state = completion_text(&acted_response, "frame_state");
+    let settle_deadline_reached = completion_bool(&acted_response, "settle_deadline_reached");
+    let passed = receipt_status.as_deref() == Some("executed")
+        && application_outcome.as_deref() == Some("inconclusive")
+        && state.click_count == 0
+        && state.interceptor_count == 1;
+    let stop = stop_and_record(mcp, &directory)?;
+    let healthy = service_health_check(mcp, &directory)?;
+    fixture.terminate();
+
+    Ok(TransparentInterceptionResult {
+        outcome: if passed { "passed" } else { "failed" },
+        act_external_deadline_reached: false,
+        receipt_status,
+        application_outcome,
+        frame_state,
+        settle_deadline_reached,
+        target_clicks: state.click_count,
+        interceptor_clicks: state.interceptor_count,
+        stop_completed_within_limit: stop,
+        service_healthy_after_stop: healthy,
+    })
+}
+
+fn run_contradictory_state(
+    options: &Options,
+    mcp: &mut McpClient,
+) -> Result<ContradictoryStateResult, Box<dyn std::error::Error>> {
+    let directory = options.evidence_directory.join("contradictory-state");
+    fs::create_dir_all(&directory)?;
+    let state_path = directory.join("fixture-state.json");
+    let events_path = directory.join("fixture-events.jsonl");
+    let mut fixture = start_fixture(options, "contradictory", &state_path, &events_path)?;
+    let fixture_pid = fixture.0.id();
+    wait_for_state(&state_path, |state| state.click_count == 0)?;
+    thread::sleep(Duration::from_millis(500));
+    let output_id = focused_output()?;
+    let window_id = focused_window_id()?;
+    write_json(
+        directory.join("niri-topology.json"),
+        &capture_niri_topology()?,
+    )?;
+    let observe_request = json!({
+        "name": "observe",
+        "arguments": {
+            "source": {"type": "output", "output_id": output_id},
+            "continue_from": null,
+            "include_accessibility": false
+        }
+    });
+    write_json(directory.join("observe-request.json"), &observe_request)?;
+    let observed_response = mcp.call("tools/call", observe_request)?;
+    let observed = parse_observation(&observed_response, &directory, "observe")?;
+    write_redacted_response(
+        directory.join("observe-response.json"),
+        &observed_response,
+        &observed,
+    )?;
+    let target = Point {
+        x: observed.model_pixels.width / 2,
+        y: observed.model_pixels.height / 2,
+    };
+    let logical = model_to_logical(&observed, target.x, target.y);
+    let act_request = json!({
+        "name": "act",
+        "arguments": {
+            "observation_id": observed.id,
+            "actions": [{
+                "type": "pointer_click",
+                "position": {"x": logical.x, "y": logical.y},
+                "button": "primary",
+                "count": 1
+            }],
+            "verification": [
+                {"type": "focused_window", "window_id": window_id},
+                {"type": "process_exited", "pid": fixture_pid}
+            ]
+        }
+    });
+    write_json(directory.join("act-request.json"), &act_request)?;
+    let acted_response =
+        mcp.call_with_timeout("tools/call", act_request, Duration::from_secs(10))?;
+    let Some(acted_response) = acted_response else {
+        let state = read_state(&state_path)?;
+        write_json(
+            directory.join("act-timeout.json"),
+            &json!({
+                "verifier_deadline_ms": 10000,
+                "fixture_clicks": state.click_count,
+                "fixture_phase": state.phase,
+                "classification": "blocked_inconclusive"
+            }),
+        )?;
+        let stop = stop_and_record(mcp, &directory)?;
+        fixture.terminate();
+        return Ok(ContradictoryStateResult {
+            outcome: "blocked_inconclusive",
+            act_external_deadline_reached: true,
+            receipt_status: None,
+            application_outcome: None,
+            verification_results: Vec::new(),
+            verification_agreement: None,
+            fixture_clicks: state.click_count,
+            fixture_phase: state.phase,
+            stop_completed_within_limit: stop,
+        });
+    };
+    let acted = parse_observation(&acted_response, &directory, "act")?;
+    write_redacted_response(directory.join("act-response.json"), &acted_response, &acted)?;
+    let state = wait_for_state(&state_path, |state| {
+        state.click_count >= 1 && state.phase >= 1
+    })?;
+    let receipt_status = first_receipt_status(&acted_response);
+    let application_outcome = result_text(&acted_response, "application_outcome");
+    let verification_results =
+        acted_response["result"]["structuredContent"]["result"]["verification"]
+            .as_array()
+            .map(|results| results.iter().filter_map(Value::as_bool).collect())
+            .unwrap_or_default();
+    let verification_agreement = completion_text(&acted_response, "verification_agreement");
+    let passed = receipt_status.as_deref() == Some("executed")
+        && application_outcome.as_deref() == Some("inconclusive")
+        && verification_results == [true, false]
+        && verification_agreement.as_deref() == Some("contradictory")
+        && state.click_count == 1
+        && state.phase >= 1;
+    let stop = stop_and_record(mcp, &directory)?;
+    fixture.terminate();
+
+    Ok(ContradictoryStateResult {
+        outcome: if passed { "passed" } else { "failed" },
+        act_external_deadline_reached: false,
+        receipt_status,
+        application_outcome,
+        verification_results,
+        verification_agreement,
+        fixture_clicks: state.click_count,
+        fixture_phase: state.phase,
+        stop_completed_within_limit: stop,
+    })
+}
+
+fn stop_and_record(
+    mcp: &mut McpClient,
+    directory: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let stop = mcp.call_with_timeout(
+        "tools/call",
+        json!({"name": "stop", "arguments": {}}),
+        Duration::from_secs(5),
+    )?;
+    if let Some(response) = &stop {
+        write_json(directory.join("stop-response.json"), response)?;
+    }
+    Ok(stop.is_some())
+}
+
+fn service_health_check(
+    mcp: &mut McpClient,
+    directory: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let response = mcp.call_with_timeout(
+        "tools/call",
+        json!({"name": "query", "arguments": {"include_windows": false}}),
+        Duration::from_secs(5),
+    )?;
+    if let Some(response) = &response {
+        write_json(directory.join("post-stop-health.json"), response)?;
+    }
+    Ok(response
+        .as_ref()
+        .is_some_and(|response| response["result"]["isError"].as_bool() != Some(true)))
 }
 
 fn start_fixture(
@@ -857,9 +1179,29 @@ fn rgb_near(actual: [u8; 4], expected: [u8; 3], tolerance: u8) -> bool {
 }
 
 fn stop_reason(response: &Value) -> Option<String> {
-    response["result"]["structuredContent"]["result"]["stop_reason"]
+    result_text(response, "stop_reason")
+}
+
+fn result_text(response: &Value, field: &str) -> Option<String> {
+    response["result"]["structuredContent"]["result"][field]
         .as_str()
         .map(str::to_owned)
+}
+
+fn first_receipt_status(response: &Value) -> Option<String> {
+    response["result"]["structuredContent"]["result"]["receipts"][0]["status"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn completion_text(response: &Value, field: &str) -> Option<String> {
+    response["result"]["structuredContent"]["result"]["completion_evidence"][field]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn completion_bool(response: &Value, field: &str) -> Option<bool> {
+    response["result"]["structuredContent"]["result"]["completion_evidence"][field].as_bool()
 }
 
 fn focused_output() -> Result<String, Box<dyn std::error::Error>> {
@@ -870,6 +1212,20 @@ fn focused_output() -> Result<String, Box<dyn std::error::Error>> {
         return Err("Niri has no focused output".into());
     };
     Ok(output.name)
+}
+
+fn focused_window_id() -> Result<String, Box<dyn std::error::Error>> {
+    let response = Socket::connect()?
+        .send(Request::Windows)?
+        .map_err(std::io::Error::other)?;
+    let Response::Windows(windows) = response else {
+        return Err("Niri returned an unexpected response to Windows".into());
+    };
+    windows
+        .into_iter()
+        .find(|window| window.is_focused)
+        .map(|window| window.id.to_string())
+        .ok_or_else(|| "Niri has no focused window".into())
 }
 
 fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
@@ -909,7 +1265,7 @@ fn wait_for_release(path: &Path) -> Result<FixtureEvent, Box<dyn std::error::Err
         if let Ok(contents) = fs::read_to_string(path) {
             for line in contents.lines() {
                 let event: FixtureEvent = serde_json::from_str(line)?;
-                if event.kind == "release" {
+                if event.kind == "target_release" {
                     return Ok(event);
                 }
             }
@@ -957,10 +1313,12 @@ fn file_identity(path: &Path) -> Result<FileIdentity, Box<dyn std::error::Error>
     })
 }
 
-fn git_head() -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
+fn git_ref(reference: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .args(["rev-parse", reference])
+        .output()?;
     if !output.status.success() {
-        return Err("git rev-parse HEAD failed".into());
+        return Err(format!("git rev-parse {reference} failed").into());
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
