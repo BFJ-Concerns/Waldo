@@ -1282,9 +1282,13 @@ name = "waldo-clipboard"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "nix",
  "waldo-action",
  "waldo-controller",
  "waldo-protocol",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
  "wl-clipboard-rs",
 ]
 
@@ -1390,6 +1394,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "waldo-clipboard",
  "waldo-protocol",
 ]
 

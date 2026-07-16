@@ -36,6 +36,11 @@ pub trait ActionExecutor: Send + Sync {
         false
     }
 
+    /// Payload-free reason a discovered route is temporarily blocked.
+    fn limitation(&self, _route: ActionRoute) -> Option<String> {
+        None
+    }
+
     /// Releases any explicitly held input and tears down its virtual devices.
     fn release_all(&self) {}
 }
@@ -411,6 +416,10 @@ fn actions_require_stable_focus(actions: &[Action]) -> bool {
                 | Action::Accessibility { .. }
                 | Action::ClipboardRead { .. }
                 | Action::ClipboardWrite { .. }
+                | Action::ClipboardWriteOffer { .. }
+                | Action::ClipboardPreserve
+                | Action::ClipboardRestore { .. }
+                | Action::ClipboardKeep { .. }
         )
     })
 }

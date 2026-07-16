@@ -111,6 +111,20 @@ impl ServiceState {
             notified.await;
         }
     }
+
+    /// Restores backend state before an expired driving lease releases authority.
+    pub async fn cleanup_expired_lease(&self) {
+        let owner = self
+            .controller
+            .lock()
+            .await
+            .begin_idle_cleanup(self.elapsed());
+        let Some(owner) = owner else {
+            return;
+        };
+        self.executor.release_all();
+        let _ = self.controller.lock().await.stop(owner);
+    }
 }
 
 /// A bound controller service ready to accept authenticated local clients.
@@ -257,22 +271,21 @@ impl ControllerService {
                     }
                 }
                 _ = lease_reaper.tick() => {
-                    let expired = self.state
-                        .controller
-                        .lock()
-                        .await
-                        .expire_idle_lease(self.state.elapsed());
-                    if expired {
-                        self.state.executor.release_all();
-                    }
+                    self.state.cleanup_expired_lease().await;
                 }
             }
         };
 
-        self.state.controller.lock().await.terminate();
+        {
+            let mut controller = self.state.controller.lock().await;
+            if let Some(owner) = controller.driving_session().map(|session| session.owner()) {
+                let _ = controller.begin_session_cleanup(owner);
+            }
+        }
         self.state.shutdown.send_replace(true);
         while connections.join_next().await.is_some() {}
         self.state.executor.release_all();
+        self.state.controller.lock().await.terminate();
         result
     }
 }
@@ -309,8 +322,13 @@ pub(crate) fn enable_action_capabilities(
     if executor.supports(waldo_protocol::ActionRoute::Clipboard)
         && capabilities.clipboard.version.is_some()
     {
-        capabilities.clipboard.available = true;
-        capabilities.clipboard.limitation = None;
+        if let Some(limitation) = executor.limitation(waldo_protocol::ActionRoute::Clipboard) {
+            capabilities.clipboard.available = false;
+            capabilities.clipboard.limitation = Some(limitation);
+        } else {
+            capabilities.clipboard.available = true;
+            capabilities.clipboard.limitation = None;
+        }
     }
 }
 
@@ -461,9 +479,9 @@ async fn connection_loop(
             }
             message = read_message(&mut reader) => {
                 match message {
-                    Ok(message @ ClientMessage::Stop { .. }) => {
-                        // Stop is the sole operation allowed to overtake an Act,
-                        // and it does not respond until that Act has quiesced.
+                    Ok(message @ (ClientMessage::Stop { .. } | ClientMessage::Handover { .. })) => {
+                        // Authority-ending operations may overtake an Act to
+                        // cancel it, but cannot respond until it has quiesced.
                         let response = dispatch(message, &state, connection_id, None).await;
                         if let Err(error) = write_message(&mut *writer.lock().await, &response).await {
                             quiesce_connection(&state, connection_id, &mut active_act).await;
@@ -495,7 +513,11 @@ async fn quiesce_connection(
         let owned = controller
             .driving_session()
             .is_some_and(|session| session.owner() == connection_id);
-        let _ = controller.disconnect(connection_id);
+        if owned {
+            let _ = controller.begin_session_cleanup(connection_id);
+        } else {
+            let _ = controller.disconnect(connection_id);
+        }
         owned
     };
     if let Some(active) = active_act.take() {
@@ -505,6 +527,7 @@ async fn quiesce_connection(
     state.finish_execution(connection_id).await;
     if owned_driving_session {
         state.executor.release_all();
+        let _ = state.controller.lock().await.disconnect(connection_id);
     }
 }
 
@@ -519,4 +542,48 @@ fn authenticate_peer(stream: &UnixStream) -> Result<(), ServiceError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
+    use waldo_controller::ExecutionToken;
+    use waldo_protocol::{Action, ActionRoute, Capabilities};
+
+    use super::enable_action_capabilities;
+
+    struct BlockedClipboard;
+
+    impl ActionExecutor for BlockedClipboard {
+        fn execute(
+            &self,
+            _action: &Action,
+            _cancellation: &ExecutionToken,
+        ) -> Result<ActionExecution, ActionExecutionFailure> {
+            unreachable!("capability test does not execute actions")
+        }
+
+        fn supports(&self, route: ActionRoute) -> bool {
+            route == ActionRoute::Clipboard
+        }
+
+        fn limitation(&self, route: ActionRoute) -> Option<String> {
+            (route == ActionRoute::Clipboard)
+                .then(|| "clipboard mutation blocked by unresolved restoration".into())
+        }
+    }
+
+    #[test]
+    fn query_clipboard_capability_surfaces_payload_free_restoration_failure() {
+        let mut capabilities = Capabilities::unavailable();
+        capabilities.clipboard.version = Some("runtime-discovered".into());
+
+        enable_action_capabilities(&mut capabilities, &BlockedClipboard);
+
+        assert!(!capabilities.clipboard.available);
+        assert_eq!(
+            capabilities.clipboard.limitation.as_deref(),
+            Some("clipboard mutation blocked by unresolved restoration")
+        );
+    }
 }

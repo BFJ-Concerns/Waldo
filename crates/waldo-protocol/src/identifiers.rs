@@ -95,6 +95,10 @@ numeric_identifier!(
     ObservationId
 );
 numeric_identifier!(
+    /// Opaque identity for one driving-session clipboard preservation guard.
+    ClipboardPreservationId
+);
+numeric_identifier!(
     /// Stable Niri identity for one workspace during the compositor session.
     WorkspaceId
 );

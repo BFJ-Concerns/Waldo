@@ -87,9 +87,9 @@ pub(crate) async fn act(
             };
         }
     };
+    state.cleanup_expired_lease().await;
     let authority = {
         let mut controller = state.controller.lock().await;
-        controller.expire_idle_lease(state.elapsed());
         match controller.begin_execution(connection_id, state.elapsed()) {
             Ok(authority) => authority,
             Err(error) => return lease_error(request_id, error),
@@ -464,9 +464,43 @@ fn validate_action_order(actions: &[waldo_protocol::Action]) -> Result<(), Proto
 
 #[cfg(test)]
 mod tests {
-    use waldo_protocol::{Action, LogicalPoint, Predicate, WindowId};
+    use waldo_protocol::{
+        Action, ApplicationFrameState, ApplicationOutcome, LogicalPoint, Predicate, StopReason,
+        WindowId,
+    };
 
-    use super::{actions_expect_visual_change, validate_action_order};
+    use super::{actions_expect_visual_change, application_outcome, validate_action_order};
+
+    #[test]
+    fn a_changing_application_at_the_settle_deadline_is_inconclusive() {
+        assert_eq!(
+            application_outcome(
+                StopReason::Completed,
+                ApplicationFrameState::Changing,
+                true,
+                &[true, true]
+            ),
+            ApplicationOutcome::Inconclusive
+        );
+        assert_eq!(
+            application_outcome(
+                StopReason::Completed,
+                ApplicationFrameState::Changing,
+                true,
+                &[false, false]
+            ),
+            ApplicationOutcome::Inconclusive
+        );
+        assert_eq!(
+            application_outcome(
+                StopReason::Completed,
+                ApplicationFrameState::Changing,
+                true,
+                &[]
+            ),
+            ApplicationOutcome::Inconclusive
+        );
+    }
 
     #[test]
     fn pointer_motion_waits_for_its_cursor_frame() {
