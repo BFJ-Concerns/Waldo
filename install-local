@@ -34,13 +34,15 @@ systemctl --user restart waldod.service
 install -d -m 0755 "$plugin_home"
 rsync -a --delete "$repo_root/plugins/waldo/" "$plugin_home/"
 cachebuster="$(date -u +%Y%m%d%H%M%S)"
-plugin_manifest="$plugin_home/.codex-plugin/plugin.json"
-plugin_manifest_tmp="$(mktemp)"
-jq --arg cachebuster "$cachebuster" \
-    '.version = ((.version | split("+")[0]) + "+codex." + $cachebuster)' \
-    "$plugin_manifest" >"$plugin_manifest_tmp"
-install -m 0644 "$plugin_manifest_tmp" "$plugin_manifest"
-rm -f "$plugin_manifest_tmp"
+for client in codex claude; do
+    plugin_manifest="$plugin_home/.$client-plugin/plugin.json"
+    plugin_manifest_tmp="$(mktemp)"
+    jq --arg cachebuster "$cachebuster" --arg client "$client" \
+        '.version = ((.version | split("+")[0]) + "+" + $client + "." + $cachebuster)' \
+        "$plugin_manifest" >"$plugin_manifest_tmp"
+    install -m 0644 "$plugin_manifest_tmp" "$plugin_manifest"
+    rm -f "$plugin_manifest_tmp"
+done
 
 install -d -m 0755 "$(dirname -- "$marketplace")"
 marketplace_tmp="$(mktemp)"
@@ -68,6 +70,23 @@ fi
 install -m 0644 "$marketplace_tmp" "$marketplace"
 rm -f "$marketplace_tmp"
 codex plugin add waldo@personal
+
+if command -v claude >/dev/null; then
+    claude_marketplace_root="$(dirname -- "$plugin_home")"
+    claude_marketplace_manifest="$claude_marketplace_root/.claude-plugin/marketplace.json"
+    install -d -m 0755 "$(dirname -- "$claude_marketplace_manifest")"
+    claude_marketplace_tmp="$(mktemp)"
+    jq -n --arg path "./$(basename -- "$plugin_home")" '{
+        "name":"personal",
+        "owner":{"name":"BFJ Concerns"},
+        "plugins":[{"name":"waldo","source":$path}]
+    }' >"$claude_marketplace_tmp"
+    install -m 0644 "$claude_marketplace_tmp" "$claude_marketplace_manifest"
+    rm -f "$claude_marketplace_tmp"
+    claude plugin marketplace update personal 2>/dev/null \
+        || claude plugin marketplace add "$claude_marketplace_root"
+    claude plugin install waldo@personal
+fi
 
 for _ in {1..50}; do
     [[ -S "$XDG_RUNTIME_DIR/waldo/controller.sock" ]] && break
