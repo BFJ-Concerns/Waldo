@@ -1,0 +1,14 @@
+{
+  "observation_id": 0,
+  "actions": [
+    {"type": "pointer_move_absolute", "position": {"x": 100.0, "y": 100.0}},
+    {"type": "pointer_move_relative", "delta": {"x": 5.0, "y": 3.0}},
+    {"type": "pointer_button", "button": "primary", "state": "pressed"},
+    {"type": "pointer_button", "button": "primary", "state": "released"},
+    {"type": "pointer_click", "position": {"x": 120.0, "y": 110.0}, "button": "primary", "count": 1},
+    {"type": "pointer_drag", "from": {"x": 120.0, "y": 110.0}, "to": {"x": 140.0, "y": 130.0}, "button": "primary", "duration_ms": 20},
+    {"type": "pointer_path", "points": [{"x": 140.0, "y": 130.0}, {"x": 150.0, "y": 135.0}], "duration_ms": 20},
+    {"type": "scroll", "delta": {"x": 0.0, "y": 4.0}}
+  ],
+  "verification": []
+}

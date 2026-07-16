@@ -1,0 +1,7 @@
+{
+  "observation_id": 0,
+  "actions": [
+    {"type": "workspace", "workspace_id": 1, "operation": {"type": "focus"}}
+  ],
+  "verification": []
+}

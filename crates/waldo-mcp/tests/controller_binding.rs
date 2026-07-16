@@ -221,6 +221,108 @@ async fn receive(reader: &mut tokio::io::Lines<BufReader<DuplexStream>>) -> Valu
 }
 
 #[tokio::test]
+async fn invalid_tool_arguments_are_structured_and_do_not_touch_controller_state() {
+    let path = test_socket();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(RecordingExecutor {
+            actions: Arc::clone(&recorded),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let service_task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+
+    let (mut client_writer, server_reader) = tokio::io::duplex(64 * 1024);
+    let (server_writer, client_reader) = tokio::io::duplex(128 * 1024);
+    let server = McpServer::new(path.clone()).unwrap();
+    let mcp_task = tokio::spawn(async move { server.run(server_reader, server_writer).await });
+    let mut client_reader = BufReader::new(client_reader).lines();
+
+    send(
+        &mut client_writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"}
+        }),
+    )
+    .await;
+    let _ = receive(&mut client_reader).await;
+
+    for (id, name, arguments) in [
+        (
+            2,
+            "query",
+            json!({"include_windows": false, "future_field": true}),
+        ),
+        (
+            3,
+            "act",
+            json!({
+                "observation_id": 1,
+                "actions": [{"type": "future_action"}],
+                "verification": []
+            }),
+        ),
+        (4, "stop", json!({"unexpected": true})),
+    ] {
+        send(
+            &mut client_writer,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }),
+        )
+        .await;
+        let response = receive(&mut client_reader).await;
+        assert_eq!(response["id"], id);
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            "invalid_request"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["retryable"],
+            false
+        );
+    }
+
+    send(
+        &mut client_writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "query", "arguments": {"include_windows": false}}
+        }),
+    )
+    .await;
+    let queried = receive(&mut client_reader).await;
+    assert_eq!(queried["id"], 5);
+    assert_eq!(
+        queried["result"]["structuredContent"]["result"]["driving_session"],
+        Value::Null
+    );
+    assert!(recorded.lock().unwrap().is_empty());
+
+    drop(client_writer);
+    mcp_task.await.unwrap().unwrap();
+    shutdown_tx.send(()).unwrap();
+    service_task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
 async fn stop_overtakes_and_quiesces_an_active_mcp_act() {
     let path = test_socket();
     let (started_tx, started_rx) = mpsc::channel();

@@ -18,6 +18,15 @@ waldo-protocol = { path = "../waldo-protocol" }
 [lib]
 path = "src/lib.rs"
 
+[dev-dependencies]
+waldo-action = { path = "../waldo-action" }
+waldo-cli = { path = "../waldo-cli" }
+waldo-controller = { path = "../waldo-controller" }
+waldo-mcp = { path = "../waldo-mcp" }
+waldo-niri = { path = "../waldo-niri" }
+waldo-screencopy = { path = "../waldo-screencopy" }
+waldo-service = { path = "../waldo-service" }
+
 [[bin]]
 name = "waldo-verification"
 path = "src/main.rs"

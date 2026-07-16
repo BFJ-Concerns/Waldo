@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eEuo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-plugin_home="${WALDO_PLUGIN_HOME:-$HOME/plugins/waldo}"
-marketplace="${WALDO_MARKETPLACE:-$HOME/.agents/plugins/marketplace.json}"
-service_file="$HOME/.config/systemd/user/waldod.service"
-profile_file="${XDG_STATE_HOME:-$HOME/.local/state}/waldo/environment.json"
+operator_home="$HOME"
+operator_codex_home="${CODEX_HOME:-$operator_home/.codex}"
+install_root="${WALDO_INSTALL_ROOT:-}"
+install_mode="canonical"
 
-for command in cargo codex jq rsync systemctl; do
+for command in cargo codex git jq realpath rsync sha256sum systemctl; do
     command -v "$command" >/dev/null || {
         printf 'Waldo installation requires %s on PATH.\n' "$command" >&2
         exit 1
@@ -19,18 +19,138 @@ if [[ -z "${XDG_RUNTIME_DIR:-}" || -z "${WAYLAND_DISPLAY:-}" || -z "${NIRI_SOCKE
     exit 1
 fi
 
-cargo install --locked --force --path "$repo_root/crates/waldo-service"
-cargo install --locked --force --path "$repo_root/crates/waldo-cli"
-cargo install --locked --force --path "$repo_root/crates/waldo-mcp"
+if [[ -n "$install_root" ]]; then
+    install_mode="redirected"
+    install_root="$(realpath -m -- "$install_root")"
+    case "$install_root" in
+        /|"$operator_home"|"$repo_root")
+            printf 'WALDO_INSTALL_ROOT must name a dedicated disposable directory.\n' >&2
+            exit 1
+            ;;
+    esac
+    install_home="$install_root/home"
+    cargo_root="$install_root/cargo"
+    bin_dir="$cargo_root/bin"
+    plugin_home="${WALDO_PLUGIN_HOME:-$install_home/plugins/waldo}"
+    marketplace="${WALDO_MARKETPLACE:-$install_home/.agents/plugins/marketplace.json}"
+    service_file="${WALDO_SERVICE_FILE:-$install_home/.config/systemd/user/waldod.service}"
+    profile_file="${WALDO_PROFILE_FILE:-$install_root/state/waldo/environment.json}"
+    codex_home="${WALDO_CODEX_HOME:-$install_root/codex}"
+    runtime_tag="$(printf '%s' "$install_root" | sha256sum | cut -c1-12)"
+    redirected_runtime="${WALDO_RUNTIME_DIR:-$XDG_RUNTIME_DIR/waldo-install-$runtime_tag}"
+    controller_socket="$redirected_runtime/waldo/controller.sock"
+else
+    install_home="$operator_home"
+    cargo_root=""
+    bin_dir=""
+    plugin_home="${WALDO_PLUGIN_HOME:-$operator_home/plugins/waldo}"
+    marketplace="${WALDO_MARKETPLACE:-$operator_home/.agents/plugins/marketplace.json}"
+    service_file="${WALDO_SERVICE_FILE:-$operator_home/.config/systemd/user/waldod.service}"
+    profile_file="${WALDO_PROFILE_FILE:-${XDG_STATE_HOME:-$operator_home/.local/state}/waldo/environment.json}"
+    codex_home="$operator_codex_home"
+    redirected_runtime=""
+    controller_socket="$XDG_RUNTIME_DIR/waldo/controller.sock"
+fi
 
+controller_pid=""
+auth_link=""
+proof_transcript=""
+query_output=""
+failure_stage="initialisation"
+installation_succeeded=false
+
+record_unavailable() {
+    local diagnostic="$1"
+    local profile_tmp
+    install -d -m 0700 "$(dirname -- "$profile_file")"
+    profile_tmp="$(mktemp)"
+    jq -n \
+        --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg mode "$install_mode" \
+        --arg diagnostic "$diagnostic" \
+        '{
+            recorded_at: $recorded_at,
+            installation: {
+                available: false,
+                mode: $mode,
+                diagnostic: $diagnostic
+            }
+        }' >"$profile_tmp"
+    install -m 0600 "$profile_tmp" "$profile_file"
+    rm -f -- "$profile_tmp"
+}
+
+cleanup() {
+    if [[ -n "$controller_pid" ]]; then
+        kill "$controller_pid" 2>/dev/null || true
+        wait "$controller_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$auth_link" && -L "$auth_link" ]]; then
+        rm -f -- "$auth_link"
+    fi
+    if [[ -n "$proof_transcript" ]]; then
+        rm -f -- "$proof_transcript"
+    fi
+    if [[ -n "$query_output" ]]; then
+        rm -f -- "$query_output"
+    fi
+    if [[ "$install_mode" == redirected && -n "$redirected_runtime" ]]; then
+        rmdir -- "$redirected_runtime/waldo" "$redirected_runtime" 2>/dev/null || true
+    fi
+}
+
+finish() {
+    local status=$?
+    trap - EXIT
+    if [[ "$installation_succeeded" != true ]]; then
+        record_unavailable "install-local failed during $failure_stage; inspect the preceding diagnostic and rerun after correcting it" || true
+    fi
+    cleanup
+    exit "$status"
+}
+trap finish EXIT
+
+record_unavailable "installation and installed-binding verification have not completed"
+
+failure_stage="binary installation"
+cargo_install=(install --locked --force)
+if [[ "$install_mode" == redirected ]]; then
+    install -d -m 0700 "$install_root" "$install_home" "$cargo_root" "$codex_home" "$redirected_runtime"
+    cargo_install+=(--root "$cargo_root")
+fi
+for package in waldo-service waldo-cli waldo-mcp; do
+    cargo "${cargo_install[@]}" --path "$repo_root/crates/$package"
+done
+
+if [[ "$install_mode" == redirected ]]; then
+    waldod_bin="$bin_dir/waldod"
+    waldo_bin="$bin_dir/waldo"
+    mcp_bin="$bin_dir/waldo-mcp"
+else
+    waldod_bin="$(command -v waldod)"
+    waldo_bin="$(command -v waldo)"
+    mcp_bin="$(command -v waldo-mcp)"
+fi
+
+failure_stage="controller service installation"
 install -d -m 0755 "$(dirname -- "$service_file")"
 install -m 0644 "$repo_root/packaging/waldod.service" "$service_file"
-systemctl --user import-environment \
-    XDG_RUNTIME_DIR WAYLAND_DISPLAY NIRI_SOCKET DBUS_SESSION_BUS_ADDRESS
-systemctl --user daemon-reload
-systemctl --user enable waldod.service
-systemctl --user restart waldod.service
+if [[ "$install_mode" == redirected ]]; then
+    install -d -m 0700 "$redirected_runtime" "$(dirname -- "$controller_socket")"
+    service_log="$install_root/waldod.log"
+    : >"$service_log"
+    chmod 0600 "$service_log"
+    "$waldod_bin" --socket "$controller_socket" >"$service_log" 2>&1 &
+    controller_pid=$!
+else
+    systemctl --user import-environment \
+        XDG_RUNTIME_DIR WAYLAND_DISPLAY NIRI_SOCKET DBUS_SESSION_BUS_ADDRESS
+    systemctl --user daemon-reload
+    systemctl --user enable waldod.service
+    systemctl --user restart waldod.service
+fi
 
+failure_stage="plugin installation"
 install -d -m 0755 "$plugin_home"
 rsync -a --delete "$repo_root/plugins/waldo/" "$plugin_home/"
 cachebuster="$(date -u +%Y%m%d%H%M%S)"
@@ -41,37 +161,70 @@ for client in codex claude; do
         '.version = ((.version | split("+")[0]) + "+" + $client + "." + $cachebuster)' \
         "$plugin_manifest" >"$plugin_manifest_tmp"
     install -m 0644 "$plugin_manifest_tmp" "$plugin_manifest"
-    rm -f "$plugin_manifest_tmp"
+    rm -f -- "$plugin_manifest_tmp"
 done
 
+if [[ "$plugin_home" == "$install_home"/* ]]; then
+    marketplace_source="./${plugin_home#"$install_home"/}"
+else
+    marketplace_source="$plugin_home"
+fi
 install -d -m 0755 "$(dirname -- "$marketplace")"
 marketplace_tmp="$(mktemp)"
 if [[ -f "$marketplace" ]]; then
-    jq '.name = "personal"
+    jq --arg source "$marketplace_source" \
+        '.name = "personal"
         | .interface = (.interface // {"displayName":"Personal"})
         | .plugins = ((.plugins // []) | map(select(.name != "waldo")) + [{
             "name":"waldo",
-            "source":{"source":"local","path":"./plugins/waldo"},
+            "source":{"source":"local","path":$source},
             "policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},
             "category":"Productivity"
         }])' "$marketplace" >"$marketplace_tmp"
 else
-    jq -n '{
+    jq -n --arg source "$marketplace_source" '{
         "name":"personal",
         "interface":{"displayName":"Personal"},
         "plugins":[{
             "name":"waldo",
-            "source":{"source":"local","path":"./plugins/waldo"},
+            "source":{"source":"local","path":$source},
             "policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},
             "category":"Productivity"
         }]
     }' >"$marketplace_tmp"
 fi
 install -m 0644 "$marketplace_tmp" "$marketplace"
-rm -f "$marketplace_tmp"
-codex plugin add waldo@personal
+rm -f -- "$marketplace_tmp"
 
-if command -v claude >/dev/null; then
+run_codex() {
+    if [[ "$install_mode" == redirected ]]; then
+        env \
+            HOME="$install_home" \
+            CODEX_HOME="$codex_home" \
+            PATH="$bin_dir:$PATH" \
+            WALDO_SOCKET_PATH="$controller_socket" \
+            "$@"
+    else
+        "$@"
+    fi
+}
+
+if [[ "$install_mode" == redirected ]]; then
+    auth_source="${WALDO_CODEX_AUTH_SOURCE:-$operator_codex_home/auth.json}"
+    if [[ ! -f "$auth_source" ]]; then
+        printf 'Redirected verification requires an existing Codex login at %s.\n' "$auth_source" >&2
+        exit 1
+    fi
+    auth_link="$codex_home/auth.json"
+    if [[ -e "$auth_link" || -L "$auth_link" ]]; then
+        printf 'Refusing to replace existing redirected Codex authentication at %s.\n' "$auth_link" >&2
+        exit 1
+    fi
+    ln -s -- "$auth_source" "$auth_link"
+fi
+run_codex codex plugin add waldo@personal
+
+if [[ "$install_mode" == canonical ]] && command -v claude >/dev/null; then
     claude_marketplace_root="$(dirname -- "$plugin_home")"
     claude_marketplace_manifest="$claude_marketplace_root/.claude-plugin/marketplace.json"
     install -d -m 0755 "$(dirname -- "$claude_marketplace_manifest")"
@@ -82,34 +235,183 @@ if command -v claude >/dev/null; then
         "plugins":[{"name":"waldo","source":$path}]
     }' >"$claude_marketplace_tmp"
     install -m 0644 "$claude_marketplace_tmp" "$claude_marketplace_manifest"
-    rm -f "$claude_marketplace_tmp"
+    rm -f -- "$claude_marketplace_tmp"
     claude plugin marketplace update personal 2>/dev/null \
         || claude plugin marketplace add "$claude_marketplace_root"
     claude plugin install waldo@personal
 fi
 
+failure_stage="controller readiness"
 for _ in {1..50}; do
-    [[ -S "$XDG_RUNTIME_DIR/waldo/controller.sock" ]] && break
+    [[ -S "$controller_socket" ]] && break
     sleep 0.1
 done
-if [[ ! -S "$XDG_RUNTIME_DIR/waldo/controller.sock" ]]; then
-    printf 'Waldo controller did not create its private socket.\n' >&2
-    systemctl --user status waldod.service --no-pager >&2 || true
+if [[ ! -S "$controller_socket" ]]; then
+    printf 'Waldo controller did not create its private socket at %s.\n' "$controller_socket" >&2
+    if [[ "$install_mode" == canonical ]]; then
+        systemctl --user status waldod.service --no-pager >&2 || true
+    else
+        printf 'Redirected controller log: %s\n' "$service_log" >&2
+    fi
     exit 1
 fi
 
-install -d -m 0700 "$(dirname -- "$profile_file")"
-profile_tmp="$(mktemp)"
-recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-waldo query | jq --arg recorded_at "$recorded_at" '{
-    recorded_at: $recorded_at,
-    profile: .result.profile,
-    capabilities: .result.capabilities,
-    outputs: .result.outputs,
-    keyboard_layouts: .result.keyboard_layouts,
-    active_keyboard_layout: .result.active_keyboard_layout
-}' >"$profile_tmp"
-install -m 0600 "$profile_tmp" "$profile_file"
-rm -f "$profile_tmp"
+failure_stage="installed CLI query"
+query_output="$(mktemp)"
+if [[ "$install_mode" == redirected ]]; then
+    "$waldo_bin" --socket "$controller_socket" query >"$query_output"
+else
+    "$waldo_bin" query >"$query_output"
+fi
+jq -e '.type == "queried" and (.result.outputs | length) > 0' "$query_output" >/dev/null
 
-printf 'Installed Waldo, enabled waldod.service, and recorded %s\n' "$profile_file"
+failure_stage="installed stock-Codex plugin and first-image proof"
+mapfile -t installed_skills < <(
+    rg --files "$codex_home/plugins/cache/personal/waldo" \
+        | rg '/skills/desktop-control/SKILL\.md$' \
+        | sort
+)
+if [[ ${#installed_skills[@]} -eq 0 ]]; then
+    printf 'Codex installed no desktop-control skill beneath %s.\n' "$codex_home/plugins/cache/personal/waldo" >&2
+    exit 1
+fi
+installed_skill="${installed_skills[${#installed_skills[@]}-1]}"
+installed_plugin_root="$(dirname -- "$(dirname -- "$(dirname -- "$installed_skill")")")"
+installed_plugin_manifest="$installed_plugin_root/.codex-plugin/plugin.json"
+installed_mcp_manifest="$installed_plugin_root/.mcp.json"
+for installed_file in "$installed_skill" "$installed_plugin_manifest" "$installed_mcp_manifest"; do
+    if [[ ! -f "$installed_file" ]]; then
+        printf 'Installed plugin proof is missing %s.\n' "$installed_file" >&2
+        exit 1
+    fi
+done
+cmp -s "$plugin_home/skills/desktop-control/SKILL.md" "$installed_skill" || {
+    printf 'Installed Codex skill bytes do not match the candidate plugin.\n' >&2
+    exit 1
+}
+cmp -s "$plugin_home/.mcp.json" "$installed_mcp_manifest" || {
+    printf 'Installed Codex MCP manifest bytes do not match the candidate plugin.\n' >&2
+    exit 1
+}
+
+proof_transcript="$(mktemp)"
+chmod 0600 "$proof_transcript"
+proof_prompt='Use the installed Waldo desktop-control skill. Query Waldo to choose one available output, call Waldo Observe exactly once on that output, then reply with MCP_IMAGE_PROOF_OK. Do not call Act or any mutating tool.'
+proof_workdir="$repo_root"
+if [[ "$install_mode" == redirected ]]; then
+    proof_workdir="$install_root"
+fi
+run_codex codex exec \
+    --json \
+    --ephemeral \
+    --sandbox read-only \
+    --cd "$proof_workdir" \
+    --skip-git-repo-check \
+    "$proof_prompt" </dev/null >"$proof_transcript"
+
+proof_summary="$(jq -s --arg skill "$installed_skill" '
+    . as $events
+    | [$events[]
+        | select(
+            .type == "item.completed"
+            and .item.type == "mcp_tool_call"
+            and .item.server == "waldo"
+            and .item.tool == "observe"
+        )] as $observe_calls
+    | [$observe_calls[]
+        | .item.result
+        | (., (.. | strings | select(startswith("{")) | fromjson?))
+        | objects
+        | select(
+            any(.content[]?;
+                .type == "image"
+                and .mimeType == "image/png"
+                and (.data | type == "string")
+                and (.data | length > 0)
+            )
+            and ((.structuredContent // .structured_content).observation.image.delivered_as_content == true)
+        )] as $image_results
+    | {
+        observe_calls: ($observe_calls | length),
+        image_results: ($image_results | length),
+        skill_reads: ([$events[]
+            | select(
+                .type == "item.completed"
+                and .item.type == "command_execution"
+                and (.item.command | contains($skill))
+            )] | length),
+        mutating_calls: ([$events[]
+            | select(
+                .type == "item.completed"
+                and .item.type == "mcp_tool_call"
+                and .item.server == "waldo"
+                and (.item.tool == "act" or .item.tool == "stop" or .item.tool == "handover")
+            )] | length),
+        completion_markers: ([$events[]
+            | select(
+                .type == "item.completed"
+                and .item.type == "agent_message"
+                and (.item.text | contains("MCP_IMAGE_PROOF_OK"))
+            )] | length)
+    }
+' "$proof_transcript")"
+if ! jq -e '
+    .observe_calls == 1
+    and .image_results == 1
+    and .skill_reads >= 1
+    and .mutating_calls == 0
+    and .completion_markers >= 1
+' <<<"$proof_summary" >/dev/null; then
+    printf 'Stock Codex did not prove installed skill loading and one structured MCP image: %s\n' \
+        "$proof_summary" >&2
+    exit 1
+fi
+
+failure_stage="verified environment recording"
+recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+source_commit="$(git -C "$repo_root" rev-parse HEAD)"
+source_tree_clean=false
+if [[ -z "$(git -C "$repo_root" status --porcelain)" ]]; then
+    source_tree_clean=true
+fi
+profile_tmp="$(mktemp)"
+jq \
+    --arg recorded_at "$recorded_at" \
+    --arg mode "$install_mode" \
+    --arg source_commit "$source_commit" \
+    --argjson source_tree_clean "$source_tree_clean" \
+    --arg codex_version "$(codex --version)" \
+    --arg plugin_manifest "$installed_plugin_manifest" \
+    --arg plugin_manifest_sha256 "$(sha256sum "$installed_plugin_manifest" | cut -d' ' -f1)" \
+    --arg skill "$installed_skill" \
+    --arg skill_sha256 "$(sha256sum "$installed_skill" | cut -d' ' -f1)" \
+    --arg mcp_binary "$mcp_bin" \
+    --arg mcp_binary_sha256 "$(sha256sum "$mcp_bin" | cut -d' ' -f1)" \
+    --argjson proof "$proof_summary" \
+    '{
+        recorded_at: $recorded_at,
+        installation: {
+            available: true,
+            mode: $mode,
+            source_commit: $source_commit,
+            source_tree_clean: $source_tree_clean,
+            plugin_loaded: true,
+            mcp_image_delivery: true,
+            codex_version: $codex_version,
+            plugin_manifest: {path: $plugin_manifest, sha256: $plugin_manifest_sha256},
+            skill: {path: $skill, sha256: $skill_sha256},
+            mcp_binary: {path: $mcp_binary, sha256: $mcp_binary_sha256},
+            proof: $proof
+        },
+        profile: .result.profile,
+        capabilities: .result.capabilities,
+        outputs: .result.outputs,
+        keyboard_layouts: .result.keyboard_layouts,
+        active_keyboard_layout: .result.active_keyboard_layout
+    }' "$query_output" >"$profile_tmp"
+install -m 0600 "$profile_tmp" "$profile_file"
+rm -f -- "$profile_tmp"
+
+installation_succeeded=true
+printf 'Installed Waldo, proved stock-Codex plugin loading and first MCP image delivery, and recorded %s\n' \
+    "$profile_file"

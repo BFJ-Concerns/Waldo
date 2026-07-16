@@ -1,0 +1,12 @@
+{
+  "observation_id": 0,
+  "actions": [
+    {"type": "clipboard_read", "mime_type": "text/plain"},
+    {"type": "clipboard_write", "mime_type": "text/plain", "data_base64": "cGFyaXR5"},
+    {"type": "clipboard_write_offer", "representations": [{"mime_type": "text/plain", "data_base64": "cGFyaXR5"}]},
+    {"type": "clipboard_preserve"},
+    {"type": "clipboard_restore", "preservation_id": 1},
+    {"type": "clipboard_keep", "preservation_id": 1}
+  ],
+  "verification": []
+}

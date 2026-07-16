@@ -19,10 +19,10 @@ use waldo_action::{ActionExecutor, UnavailableActionExecutor};
 use waldo_controller::Controller;
 use waldo_niri::{NiriInspector, SessionInspector};
 use waldo_protocol::{
-    Capabilities, ClientMessage, ProtocolError, SCHEMA_MAJOR_VERSION, ServerMessage,
+    Capabilities, ClientMessage, ProtocolError, RequestId, SCHEMA_MAJOR_VERSION, ServerMessage,
 };
 use waldo_screencopy::{ScreenCapturer, Screencopy, UnavailableCapturer};
-use waldo_socket::{TransportError, read_message, write_message};
+use waldo_socket::{TransportError, read_frame, write_message};
 
 use crate::{ServiceError, dispatch::dispatch, executor::DesktopActionExecutor, socket_path};
 
@@ -342,41 +342,48 @@ async fn handle_connection(
     if *shutdown.borrow() {
         return Ok(());
     }
-    let first: ClientMessage = tokio::select! {
-        _ = shutdown.changed() => return Ok(()),
-        message = read_message(&mut stream) => message?,
-    };
-    let (request_id, client_id) = match first {
-        ClientMessage::Hello {
-            request_id,
-            schema_major,
-            client_id,
-        } if schema_major == SCHEMA_MAJOR_VERSION => (request_id, client_id),
-        ClientMessage::Hello {
-            request_id,
-            schema_major,
-            ..
-        } => {
-            write_message(
-                &mut stream,
-                &ServerMessage::Error {
-                    request_id: Some(request_id),
-                    error: ProtocolError::incompatible_schema(SCHEMA_MAJOR_VERSION, schema_major),
-                },
-            )
-            .await?;
-            return Ok(());
-        }
-        other => {
-            write_message(
-                &mut stream,
-                &ServerMessage::Error {
-                    request_id: Some(other.request_id()),
-                    error: crate::dispatch::invalid_request("the first message must be hello"),
-                },
-            )
-            .await?;
-            return Ok(());
+    let (request_id, client_id) = loop {
+        let first = tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            message = read_client_message(&mut stream) => message?,
+        };
+        match first {
+            IncomingMessage::Valid(ClientMessage::Hello {
+                request_id,
+                schema_major,
+                client_id,
+            }) if schema_major == SCHEMA_MAJOR_VERSION => break (request_id, client_id),
+            IncomingMessage::Valid(ClientMessage::Hello {
+                request_id,
+                schema_major,
+                ..
+            }) => {
+                write_message(
+                    &mut stream,
+                    &ServerMessage::Error {
+                        request_id: Some(request_id),
+                        error: ProtocolError::incompatible_schema(
+                            SCHEMA_MAJOR_VERSION,
+                            schema_major,
+                        ),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            IncomingMessage::Valid(other) => {
+                write_message(
+                    &mut stream,
+                    &invalid_request_response(
+                        Some(other.request_id()),
+                        "the first message must be hello",
+                    ),
+                )
+                .await?;
+            }
+            IncomingMessage::Invalid(response) => {
+                write_message(&mut stream, &response).await?;
+            }
         }
     };
 
@@ -421,8 +428,15 @@ async fn connection_loop(
                         quiesce_connection(&state, connection_id, &mut active_act).await;
                         return Ok(());
                     }
-                    message = read_message(&mut reader) => match message {
-                        Ok(message) => message,
+                    message = read_client_message(&mut reader) => match message {
+                        Ok(IncomingMessage::Valid(message)) => message,
+                        Ok(IncomingMessage::Invalid(response)) => {
+                            if let Err(error) = write_message(&mut *writer.lock().await, &response).await {
+                                quiesce_connection(&state, connection_id, &mut active_act).await;
+                                return Err(error.into());
+                            }
+                            continue;
+                        }
                         Err(TransportError::ConnectionClosed) => {
                             quiesce_connection(&state, connection_id, &mut active_act).await;
                             return Ok(());
@@ -477,9 +491,9 @@ async fn connection_loop(
                     }
                 }
             }
-            message = read_message(&mut reader) => {
+            message = read_client_message(&mut reader) => {
                 match message {
-                    Ok(message @ (ClientMessage::Stop { .. } | ClientMessage::Handover { .. })) => {
+                    Ok(IncomingMessage::Valid(message @ (ClientMessage::Stop { .. } | ClientMessage::Handover { .. }))) => {
                         // Authority-ending operations may overtake an Act to
                         // cancel it, but cannot respond until it has quiesced.
                         let response = dispatch(message, &state, connection_id, None).await;
@@ -488,7 +502,13 @@ async fn connection_loop(
                             return Err(error.into());
                         }
                     }
-                    Ok(message) => queued.push_back(message),
+                    Ok(IncomingMessage::Valid(message)) => queued.push_back(message),
+                    Ok(IncomingMessage::Invalid(response)) => {
+                        if let Err(error) = write_message(&mut *writer.lock().await, &response).await {
+                            quiesce_connection(&state, connection_id, &mut active_act).await;
+                            return Err(error.into());
+                        }
+                    }
                     Err(TransportError::ConnectionClosed) => {
                         quiesce_connection(&state, connection_id, &mut active_act).await;
                         return Ok(());
@@ -500,6 +520,43 @@ async fn connection_loop(
                 }
             }
         }
+    }
+}
+
+enum IncomingMessage {
+    Valid(ClientMessage),
+    Invalid(Box<ServerMessage>),
+}
+
+async fn read_client_message<R>(reader: &mut R) -> Result<IncomingMessage, TransportError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let payload = read_frame(reader).await?;
+    let value: serde_json::Value = match serde_json::from_slice(&payload) {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(IncomingMessage::Invalid(Box::new(
+                invalid_request_response(None, "request frame is not valid JSON"),
+            )));
+        }
+    };
+    let request_id = value
+        .get("request_id")
+        .and_then(serde_json::Value::as_u64)
+        .map(RequestId::new);
+    match serde_json::from_value(value) {
+        Ok(message) => Ok(IncomingMessage::Valid(message)),
+        Err(_) => Ok(IncomingMessage::Invalid(Box::new(
+            invalid_request_response(request_id, "request does not match the protocol schema"),
+        ))),
+    }
+}
+
+fn invalid_request_response(request_id: Option<RequestId>, message: &str) -> ServerMessage {
+    ServerMessage::Error {
+        request_id,
+        error: crate::dispatch::invalid_request(message),
     }
 }
 

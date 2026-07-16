@@ -1,0 +1,7 @@
+{
+  "observation_id": 0,
+  "actions": [
+    {"type": "accessibility", "element": "parity-element", "operation": {"type": "invoke", "action": "Click"}}
+  ],
+  "verification": []
+}

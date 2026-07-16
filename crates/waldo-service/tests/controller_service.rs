@@ -9,6 +9,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde_json::json;
 use tokio::{io::AsyncWriteExt, sync::oneshot};
 use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
 use waldo_controller::ExecutionToken;
@@ -421,6 +422,11 @@ struct ReleaseTrackingExecutor {
     releases: Arc<AtomicUsize>,
 }
 
+struct SideEffectTrackingExecutor {
+    dispatches: Arc<AtomicUsize>,
+    releases: Arc<AtomicUsize>,
+}
+
 struct RecordingPointerExecutor {
     actions: Arc<Mutex<Vec<Action>>>,
 }
@@ -442,6 +448,21 @@ impl ActionExecutor for ReleaseTrackingExecutor {
         _cancellation: &ExecutionToken,
     ) -> Result<ActionExecution, ActionExecutionFailure> {
         Ok(ActionRoute::Screencopy.into())
+    }
+
+    fn release_all(&self) {
+        self.releases.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl ActionExecutor for SideEffectTrackingExecutor {
+    fn execute(
+        &self,
+        _action: &Action,
+        _cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        Ok(ActionRoute::NiriIpc.into())
     }
 
     fn release_all(&self) {
@@ -581,6 +602,268 @@ async fn private_socket_accepts_a_query_from_the_current_user() {
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
     assert!(!path.exists());
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn recoverably_framed_invalid_requests_keep_the_connection_and_lease_unchanged() {
+    let path = test_socket();
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let releases = Arc::new(AtomicUsize::new(0));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(SideEffectTrackingExecutor {
+            dispatches: Arc::clone(&dispatches),
+            releases: Arc::clone(&releases),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    write_message(
+        &mut stream,
+        &ClientMessage::Hello {
+            request_id: RequestId::new(1),
+            schema_major: SCHEMA_MAJOR_VERSION,
+            client_id: ClientId::new("invalid-request-test").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let connected: ServerMessage = read_message(&mut stream).await.unwrap();
+    let ServerMessage::Connected { connection_id, .. } = connected else {
+        panic!("test connection failed")
+    };
+
+    let invalid_documents = [
+        json!({
+            "type": "query",
+            "request_id": 10,
+            "request": {"include_windows": false, "unknown": true}
+        }),
+        json!({
+            "type": "act",
+            "request_id": 11,
+            "request": {
+                "observation_id": 1,
+                "actions": [{"type": "future_action"}],
+                "verification": []
+            }
+        }),
+        json!({
+            "type": "query",
+            "request_id": 12,
+            "request": {"include_windows": "not-a-boolean"}
+        }),
+    ];
+    for (expected_id, document) in (10..=12).zip(invalid_documents) {
+        write_message(&mut stream, &document).await.unwrap();
+        assert!(matches!(
+            read_message(&mut stream).await.unwrap(),
+            ServerMessage::Error {
+                request_id: Some(request_id),
+                error: ProtocolError {
+                    code: ErrorCode::InvalidRequest,
+                    retryable: false,
+                    ..
+                }
+            } if request_id == RequestId::new(expected_id)
+        ));
+    }
+
+    write_message(
+        &mut stream,
+        &ClientMessage::Query {
+            request_id: RequestId::new(13),
+            request: QueryRequest::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let query: ServerMessage = read_message(&mut stream).await.unwrap();
+    let ServerMessage::Queried { result, .. } = query else {
+        panic!("connection was not usable after invalid requests")
+    };
+    assert_eq!(result.driving_session, None);
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(releases.load(Ordering::SeqCst), 0);
+
+    write_message(
+        &mut stream,
+        &ClientMessage::Observe {
+            request_id: RequestId::new(14),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let observed: ServerMessage = read_message(&mut stream).await.unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("follow-up observation failed")
+    };
+    write_message(
+        &mut stream,
+        &ClientMessage::Act {
+            request_id: RequestId::new(15),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![Action::Capture {
+                    source: observation.source,
+                }],
+                verification: Vec::new(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let acted: ServerMessage = read_message(&mut stream).await.unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("valid Act failed")
+    };
+    let driving_session = result.driving_session;
+
+    write_message(
+        &mut stream,
+        &json!({
+            "type": "stop",
+            "request_id": 16,
+            "request": {"unexpected": "must not release"}
+        }),
+    )
+    .await
+    .unwrap();
+    let invalid_stop: ServerMessage = read_message(&mut stream).await.unwrap();
+    assert!(matches!(
+        invalid_stop,
+        ServerMessage::Error {
+            error: ProtocolError {
+                code: ErrorCode::InvalidRequest,
+                ..
+            },
+            ..
+        }
+    ));
+    write_message(
+        &mut stream,
+        &ClientMessage::Query {
+            request_id: RequestId::new(17),
+            request: QueryRequest::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let query: ServerMessage = read_message(&mut stream).await.unwrap();
+    let ServerMessage::Queried { result, .. } = query else {
+        panic!("post-error Query failed")
+    };
+    assert_eq!(result.driving_session, Some(driving_session));
+    assert_eq!(result.driving_connection, Some(connection_id));
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(releases.load(Ordering::SeqCst), 0);
+
+    write_message(
+        &mut stream,
+        &ClientMessage::Stop {
+            request_id: RequestId::new(18),
+            request: StopRequest::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_message(&mut stream).await.unwrap(),
+        ServerMessage::Stopped { .. }
+    ));
+    assert_eq!(releases.load(Ordering::SeqCst), 1);
+
+    drop(stream);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn invalid_request_does_not_cancel_an_active_batch() {
+    let path = test_socket();
+    let (started_tx, started_rx) = mpsc::channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(BlockingExecutor {
+            started: started_tx,
+            finished: Arc::clone(&finished),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut stream = connect_and_start_capture(&path, "invalid-during-act-test").await;
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .unwrap();
+
+    write_message(
+        &mut stream,
+        &json!({
+            "type": "handover",
+            "request_id": 4,
+            "request": {"target": "not-a-connection"}
+        }),
+    )
+    .await
+    .unwrap();
+    let invalid: ServerMessage = read_message(&mut stream).await.unwrap();
+    assert!(matches!(
+        invalid,
+        ServerMessage::Error {
+            error: ProtocolError {
+                code: ErrorCode::InvalidRequest,
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(!finished.load(Ordering::Acquire));
+
+    write_message(
+        &mut stream,
+        &ClientMessage::Stop {
+            request_id: RequestId::new(5),
+            request: StopRequest::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let first: ServerMessage = read_message(&mut stream).await.unwrap();
+    let second: ServerMessage = read_message(&mut stream).await.unwrap();
+    assert!(
+        [first, second]
+            .iter()
+            .any(|response| matches!(response, ServerMessage::Stopped { .. }))
+    );
+    assert!(finished.load(Ordering::Acquire));
+
+    drop(stream);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
     let _ = fs::remove_dir_all(path.parent().unwrap());
 }
 
