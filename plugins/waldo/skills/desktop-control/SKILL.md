@@ -38,7 +38,8 @@ not already authorised.
    focus action is `{"type":"window","window_id":"8","operation":{"type":"focus"}}`;
    resizing keeps `width` and `height` inside the operation:
    `{"type":"window","window_id":"20","operation":{"type":"set_size","width":420,"height":380}}`;
-   there is no `focus_window` action variant. Absolute pointer movement is
+   there is no `focus_window` action variant. A workspace action has the same
+   shape: `{"type":"workspace","workspace_id":1,"operation":{"type":"focus"}}`. Absolute pointer movement is
    `{"type":"pointer_move_absolute","position":{"x":3600,"y":250}}`, and a
    primary click adds `"type":"pointer_click"`, `"button":"primary"`, and
    `"count":1` alongside the position. There is no generic `pointer` action

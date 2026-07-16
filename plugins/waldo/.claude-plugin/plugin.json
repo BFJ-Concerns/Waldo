@@ -1,0 +1,9 @@
+{
+  "name": "waldo",
+  "version": "0.1.0",
+  "description": "Observe and control the operator's live Niri desktop from Claude Code.",
+  "author": {
+    "name": "BFJ Concerns"
+  },
+  "mcpServers": "./.mcp.claude.json"
+}
