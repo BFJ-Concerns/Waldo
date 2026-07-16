@@ -173,45 +173,35 @@ pub(crate) async fn act(
         }
     };
     let (observation, frame_state, settle_deadline_reached, mut completion_error, mut stop_reason) =
-        if execution.stop_reason == waldo_protocol::StopReason::Cancelled {
-            (
+        match capture_post_action_observation(
+            result_source,
+            grounding.include_accessibility,
+            grounding.frame_fingerprint,
+            grounding.application_frame_fingerprint,
+            expect_visual_change,
+            state,
+            connection_id,
+        )
+        .await
+        {
+            Ok(post_action) => (
+                Some(post_action.observation),
+                post_action.frame_state,
+                post_action.settle_deadline_reached,
+                None,
+                execution.stop_reason,
+            ),
+            Err(error) => (
                 None,
                 ApplicationFrameState::Unchanged,
                 false,
-                None,
-                execution.stop_reason,
-            )
-        } else {
-            match capture_post_action_observation(
-                result_source,
-                grounding.include_accessibility,
-                grounding.frame_fingerprint,
-                grounding.application_frame_fingerprint,
-                expect_visual_change,
-                state,
-                connection_id,
-            )
-            .await
-            {
-                Ok(post_action) => (
-                    Some(post_action.observation),
-                    post_action.frame_state,
-                    post_action.settle_deadline_reached,
-                    None,
-                    execution.stop_reason,
-                ),
-                Err(error) => (
-                    None,
-                    ApplicationFrameState::Unchanged,
-                    false,
-                    Some(error),
-                    if execution.stop_reason == waldo_protocol::StopReason::Completed {
-                        waldo_protocol::StopReason::ExecutionFailed
-                    } else {
-                        execution.stop_reason
-                    },
-                ),
-            }
+                Some(error),
+                if execution.stop_reason == waldo_protocol::StopReason::Completed {
+                    waldo_protocol::StopReason::ExecutionFailed
+                } else {
+                    execution.stop_reason
+                },
+            ),
         };
     let verification_results = if let Some(observation) = &observation {
         match verification
@@ -367,11 +357,14 @@ fn evidence_agreement(results: &[bool]) -> EvidenceAgreement {
 
 fn application_outcome(
     stop_reason: waldo_protocol::StopReason,
-    _frame_state: ApplicationFrameState,
-    _settle_deadline_reached: bool,
+    frame_state: ApplicationFrameState,
+    settle_deadline_reached: bool,
     verification: &[bool],
 ) -> ApplicationOutcome {
     if stop_reason != waldo_protocol::StopReason::Completed {
+        return ApplicationOutcome::Inconclusive;
+    }
+    if settle_deadline_reached && frame_state == ApplicationFrameState::Changing {
         return ApplicationOutcome::Inconclusive;
     }
     match verification.first() {
@@ -479,7 +472,7 @@ mod tests {
     use super::{actions_expect_visual_change, application_outcome, validate_action_order};
 
     #[test]
-    fn agreed_application_evidence_decides_outcome_despite_incidental_frame_motion() {
+    fn a_changing_application_at_the_settle_deadline_is_inconclusive() {
         assert_eq!(
             application_outcome(
                 StopReason::Completed,
@@ -487,7 +480,7 @@ mod tests {
                 true,
                 &[true, true]
             ),
-            ApplicationOutcome::Completed
+            ApplicationOutcome::Inconclusive
         );
         assert_eq!(
             application_outcome(
@@ -496,7 +489,7 @@ mod tests {
                 true,
                 &[false, false]
             ),
-            ApplicationOutcome::Failed
+            ApplicationOutcome::Inconclusive
         );
         assert_eq!(
             application_outcome(

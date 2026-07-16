@@ -466,6 +466,15 @@ impl RuntimeHarness {
         self.scratch.remove()?;
         Ok((self.identity, !self.scratch_path.exists()))
     }
+
+    pub(crate) fn restart_mcp(
+        &mut self,
+        executable: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.mcp.child.terminate();
+        self.mcp = McpClient::start(executable, self.scratch.path().join("runtime").as_path())?;
+        Ok(())
+    }
 }
 
 pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Error>> {

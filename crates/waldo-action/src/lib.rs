@@ -419,6 +419,7 @@ fn actions_require_stable_focus(actions: &[Action]) -> bool {
                 | Action::ClipboardWriteOffer { .. }
                 | Action::ClipboardPreserve
                 | Action::ClipboardRestore { .. }
+                | Action::ClipboardKeep { .. }
         )
     })
 }

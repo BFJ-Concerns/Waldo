@@ -213,7 +213,8 @@ impl ActionExecutor for DesktopActionExecutor {
             | Action::ClipboardWrite { .. }
             | Action::ClipboardWriteOffer { .. }
             | Action::ClipboardPreserve
-            | Action::ClipboardRestore { .. } => self
+            | Action::ClipboardRestore { .. }
+            | Action::ClipboardKeep { .. } => self
                 .clipboard
                 .as_ref()
                 .ok_or_else(|| {

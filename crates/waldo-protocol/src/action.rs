@@ -159,6 +159,9 @@ pub enum Action {
     ClipboardRestore {
         preservation_id: crate::ClipboardPreservationId,
     },
+    ClipboardKeep {
+        preservation_id: crate::ClipboardPreservationId,
+    },
     Window {
         window_id: WindowId,
         operation: WindowOperation,

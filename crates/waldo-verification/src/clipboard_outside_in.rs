@@ -11,6 +11,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use waldo_clipboard::{ClipboardExecutor, ClipboardSnapshot};
 
 use crate::outside_in::{
     McpClient, Options, RuntimeHarness, accessibility_action, accessibility_handle_with_role,
@@ -25,8 +26,11 @@ pub struct ClipboardSummary {
     atomic_offer: AtomicOfferEvidence,
     direct_values: DirectValueEvidence,
     preservation: PreservationEvidence,
+    unpreservable_prior_offer: UnpreservableOfferEvidence,
     text_routes: Vec<TextRouteEvidence>,
     cancellation: CancellationEvidence,
+    cleanup: CleanupEvidence,
+    keep: KeepEvidence,
     controller_socket_removed: bool,
     generated_payload_leaks: usize,
     sensitive_payloads_retained: bool,
@@ -89,6 +93,28 @@ struct CancellationEvidence {
     exact_after_cleanup: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct UnpreservableOfferEvidence {
+    receipt_status: String,
+    key_chords_unchanged: bool,
+    clipboard_unchanged: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CleanupEvidence {
+    exact_after_success: bool,
+    exact_after_failure: bool,
+    exact_after_disconnect: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct KeepEvidence {
+    exact_before_cleanup: bool,
+    exact_after_cleanup: bool,
+    repeated_keep_failed_without_mutation: bool,
+    restore_after_keep_failed_without_mutation: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct FixtureState {
     source_title: String,
@@ -147,7 +173,50 @@ impl Drop for TransientDirectory {
     }
 }
 
+struct ClipboardRecovery {
+    executor: ClipboardExecutor,
+    snapshot: Option<ClipboardSnapshot>,
+}
+
+impl ClipboardRecovery {
+    fn capture() -> Result<Self, Box<dyn std::error::Error>> {
+        let executor = ClipboardExecutor::initialise()
+            .map_err(|error| format!("initialise clipboard recovery: {}", error.message))?;
+        let snapshot = executor
+            .snapshot()
+            .map_err(|error| format!("capture clipboard recovery: {}", error.message))?;
+        Ok(Self {
+            executor,
+            snapshot: Some(snapshot),
+        })
+    }
+
+    fn restore(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.executor
+            .restore_temporary(
+                self.snapshot
+                    .as_ref()
+                    .ok_or("clipboard recovery was already discharged")?
+                    .clone(),
+            )
+            .map_err(|error| format!("restore clipboard recovery: {}", error.message).into())
+    }
+
+    fn discharge(&mut self) {
+        self.snapshot = None;
+    }
+}
+
+impl Drop for ClipboardRecovery {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            let _ = self.executor.restore_temporary(snapshot);
+        }
+    }
+}
+
 pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Error>> {
+    let mut recovery = ClipboardRecovery::capture()?;
     let mut harness = RuntimeHarness::start(&options)?;
     let mut transient = TransientDirectory::create(options.seed)?;
     let state_path = transient.0.join("fixture-state.json");
@@ -403,6 +472,60 @@ pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Err
     let after_explicit_restore = clipboard_inventory(&seat)?;
     write_stage(&options.evidence_directory, "explicit_restore_verified")?;
 
+    let unpreservable_mime = "application/x-waldo-unpreservable";
+    let unpreservable_expected = evidence_for(&[(unpreservable_mime, &over_maximum)])?;
+    let mut unpreservable_owner = FixtureProcess(
+        Command::new("wl-copy")
+            .args([
+                "--foreground",
+                "--seat",
+                &seat,
+                "--type",
+                unpreservable_mime,
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?,
+    );
+    unpreservable_owner
+        .0
+        .stdin
+        .take()
+        .ok_or("wl-copy did not expose standard input")?
+        .write_all(&over_maximum)?;
+    wait_for_clipboard(&seat, &unpreservable_expected)?;
+    let before_unpreservable = wait_for_fixture(&state_path, |_| true)?;
+    let unpreservable_observation = observe_accessibility(
+        &mut harness.mcp,
+        &output_id,
+        &before_unpreservable.destination_title,
+        &options.evidence_directory,
+        "clipboard-unpreservable",
+    )?;
+    let refused_payload = format!("unpreservable-{:x}", options.seed);
+    generated_payloads.push(refused_payload.as_bytes().to_vec());
+    let unpreservable = act(
+        &mut harness.mcp,
+        unpreservable_observation.id,
+        vec![json!({
+            "type": "text",
+            "text": refused_payload,
+            "route": "clipboard_paste"
+        })],
+        Vec::new(),
+    )?;
+    thread::sleep(Duration::from_millis(100));
+    let after_unpreservable = wait_for_fixture(&state_path, |_| true)?;
+    let unpreservable_inventory = clipboard_inventory(&seat)?;
+    unpreservable_owner.0.kill()?;
+    unpreservable_owner.0.wait()?;
+    recovery.restore()?;
+    wait_for_clipboard(&seat, &before)?;
+    write_stage(
+        &options.evidence_directory,
+        "unpreservable_offer_refused_before_mutation",
+    )?;
+
     let mut text_routes = Vec::new();
     for (index, scenario) in ["accept", "rejected", "unchanged", "blocked"]
         .into_iter()
@@ -468,7 +591,7 @@ pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Err
         case.scenario == "accept"
             && case.receipt_status == "executed"
             && case.route.as_deref() == Some("clipboard_paste")
-            && case.application_outcome == "completed"
+            && accepted_application_outcome(&case.application_outcome)
             && case.destination_digest_matched
     });
 
@@ -545,6 +668,128 @@ pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Err
     }
     write_stage(&options.evidence_directory, "cancellation_cleanup_verified")?;
 
+    recovery.restore()?;
+    wait_for_clipboard(&seat, &before)?;
+    let success_payload = format!("cleanup-success-{:x}", options.seed).into_bytes();
+    let failure_payload = format!("cleanup-failure-{:x}", options.seed).into_bytes();
+    let disconnect_payload = format!("cleanup-disconnect-{:x}", options.seed).into_bytes();
+    generated_payloads.extend([
+        success_payload.clone(),
+        failure_payload.clone(),
+        disconnect_payload.clone(),
+    ]);
+    let cleanup = CleanupContext {
+        options: &options,
+        output_id: &output_id,
+        fixture_title: &initial_fixture.destination_title,
+        seat: &seat,
+        baseline: &before,
+    };
+    let exact_after_success = cleanup.exercise(
+        &mut harness,
+        "success",
+        &success_payload,
+        CleanupExit::StopAfterSuccess,
+    )?;
+    let exact_after_failure = cleanup.exercise(
+        &mut harness,
+        "failure",
+        &failure_payload,
+        CleanupExit::StopAfterFailure,
+    )?;
+    let exact_after_disconnect = cleanup.exercise(
+        &mut harness,
+        "disconnect",
+        &disconnect_payload,
+        CleanupExit::Disconnect,
+    )?;
+
+    let keep_html = format!("<i>kept-{:x}</i>", options.seed);
+    let keep_plain = format!("kept-{:x}", options.seed);
+    generated_payloads.extend([
+        keep_html.as_bytes().to_vec(),
+        keep_plain.as_bytes().to_vec(),
+    ]);
+    let keep_expected = evidence_for(&[
+        ("text/html", keep_html.as_bytes()),
+        ("text/plain", keep_plain.as_bytes()),
+    ])?;
+    let keep_observation = observe_without_accessibility(
+        &mut harness.mcp,
+        &output_id,
+        &initial_fixture.destination_title,
+        &options.evidence_directory,
+        "clipboard-keep",
+    )?;
+    let mut keep_observation_id = keep_observation.id;
+    let keep_guard = act_chained(
+        &mut harness.mcp,
+        &mut keep_observation_id,
+        vec![json!({"type": "clipboard_preserve"})],
+        Vec::new(),
+    )?;
+    require_receipt(&keep_guard, "executed")?;
+    let keep_id = first_output(&keep_guard)["preservation_id"]
+        .as_u64()
+        .ok_or("ClipboardPreserve returned no preservation id for Keep")?;
+    let keep_write = act_chained(
+        &mut harness.mcp,
+        &mut keep_observation_id,
+        vec![clipboard_offer(&[
+            ("text/html", keep_html.as_bytes()),
+            ("text/plain", keep_plain.as_bytes()),
+        ])],
+        Vec::new(),
+    )?;
+    require_receipt(&keep_write, "executed")?;
+    let kept = act_chained(
+        &mut harness.mcp,
+        &mut keep_observation_id,
+        vec![json!({
+            "type": "clipboard_keep",
+            "preservation_id": keep_id
+        })],
+        Vec::new(),
+    )?;
+    require_receipt(&kept, "executed")?;
+    let exact_before_keep_cleanup = clipboard_inventory(&seat)? == keep_expected;
+    let repeated_keep = act_chained(
+        &mut harness.mcp,
+        &mut keep_observation_id,
+        vec![json!({
+            "type": "clipboard_keep",
+            "preservation_id": keep_id
+        })],
+        Vec::new(),
+    )?;
+    let repeated_keep_failed_without_mutation =
+        first_status(&repeated_keep) == "failed" && clipboard_inventory(&seat)? == keep_expected;
+    let restore_after_keep = act_chained(
+        &mut harness.mcp,
+        &mut keep_observation_id,
+        vec![json!({
+            "type": "clipboard_restore",
+            "preservation_id": keep_id
+        })],
+        Vec::new(),
+    )?;
+    let restore_after_keep_failed_without_mutation = first_status(&restore_after_keep) == "failed"
+        && clipboard_inventory(&seat)? == keep_expected;
+    harness
+        .mcp
+        .call_with_timeout(
+            "tools/call",
+            json!({"name": "stop", "arguments": {}}),
+            Duration::from_secs(10),
+        )?
+        .ok_or("Keep cleanup Stop exceeded verifier deadline")?;
+    let exact_after_keep_cleanup = wait_for_clipboard(&seat, &keep_expected).is_ok();
+    write_stage(&options.evidence_directory, "keep_cleanup_verified")?;
+
+    recovery.restore()?;
+    wait_for_clipboard(&seat, &before)?;
+    recovery.discharge();
+
     fixture.0.kill()?;
     fixture.0.wait()?;
     transient.remove()?;
@@ -576,6 +821,11 @@ pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Err
             submit_application_outcome: application_outcome(&submitted),
             exact_after_explicit_restore: before == after_explicit_restore,
         },
+        unpreservable_prior_offer: UnpreservableOfferEvidence {
+            receipt_status: first_status(&unpreservable).into(),
+            key_chords_unchanged: before_unpreservable.key_chords == after_unpreservable.key_chords,
+            clipboard_unchanged: unpreservable_inventory == unpreservable_expected,
+        },
         text_routes,
         cancellation: CancellationEvidence {
             receipt_status: first_status(&cancelled).into(),
@@ -585,6 +835,17 @@ pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Err
                     .is_number(),
             destination_digest_matched: cancellation_state.digest_matches,
             exact_after_cleanup: cancellation_before == cancellation_after,
+        },
+        cleanup: CleanupEvidence {
+            exact_after_success,
+            exact_after_failure,
+            exact_after_disconnect,
+        },
+        keep: KeepEvidence {
+            exact_before_cleanup: exact_before_keep_cleanup,
+            exact_after_cleanup: exact_after_keep_cleanup,
+            repeated_keep_failed_without_mutation,
+            restore_after_keep_failed_without_mutation,
         },
         controller_socket_removed,
         generated_payload_leaks: leaks,
@@ -602,17 +863,126 @@ pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Err
         || !summary.preservation.external_source_copy_consumed
         || !summary.preservation.masked_destination_digest_matched
         || !summary.preservation.submission_accepted
-        || summary.preservation.paste_application_outcome != "completed"
-        || summary.preservation.submit_application_outcome != "completed"
+        || !accepted_application_outcome(&summary.preservation.paste_application_outcome)
+        || !accepted_application_outcome(&summary.preservation.submit_application_outcome)
+        || summary.unpreservable_prior_offer.receipt_status != "failed"
+        || !summary.unpreservable_prior_offer.key_chords_unchanged
+        || !summary.unpreservable_prior_offer.clipboard_unchanged
         || !accept_route_passed
         || !summary.cancellation.stop_released_session
         || !summary.cancellation.exact_after_cleanup
+        || !summary.cleanup.exact_after_success
+        || !summary.cleanup.exact_after_failure
+        || !summary.cleanup.exact_after_disconnect
+        || !summary.keep.exact_before_cleanup
+        || !summary.keep.exact_after_cleanup
+        || !summary.keep.repeated_keep_failed_without_mutation
+        || !summary.keep.restore_after_keep_failed_without_mutation
         || !summary.controller_socket_removed
         || summary.generated_payload_leaks != 0
     {
         return Err("clipboard outside-in acceptance invariant failed".into());
     }
     Ok(summary)
+}
+
+enum CleanupExit {
+    StopAfterSuccess,
+    StopAfterFailure,
+    Disconnect,
+}
+
+struct CleanupContext<'a> {
+    options: &'a Options,
+    output_id: &'a str,
+    fixture_title: &'a str,
+    seat: &'a str,
+    baseline: &'a [RepresentationEvidence],
+}
+
+impl CleanupContext<'_> {
+    fn exercise(
+        &self,
+        harness: &mut RuntimeHarness,
+        label: &str,
+        payload: &[u8],
+        exit: CleanupExit,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let observation = observe_without_accessibility(
+            &mut harness.mcp,
+            self.output_id,
+            self.fixture_title,
+            &self.options.evidence_directory,
+            &format!("clipboard-cleanup-{label}"),
+        )?;
+        let mut observation_id = observation.id;
+        let preserve = act_chained(
+            &mut harness.mcp,
+            &mut observation_id,
+            vec![json!({"type": "clipboard_preserve"})],
+            Vec::new(),
+        )?;
+        require_receipt(&preserve, "executed")?;
+        let mime_type = format!("application/x-waldo-cleanup-{label}");
+        let write = act_chained(
+            &mut harness.mcp,
+            &mut observation_id,
+            vec![clipboard_write(&mime_type, payload)],
+            Vec::new(),
+        )?;
+        require_receipt(&write, "executed")?;
+        let provisional = evidence_for(&[(mime_type.as_str(), payload)])?;
+        wait_for_clipboard(self.seat, &provisional)?;
+
+        match exit {
+            CleanupExit::StopAfterSuccess => {
+                let read = act_chained(
+                    &mut harness.mcp,
+                    &mut observation_id,
+                    vec![json!({"type": "clipboard_read", "mime_type": mime_type})],
+                    Vec::new(),
+                )?;
+                require_receipt(&read, "executed")?;
+                harness
+                    .mcp
+                    .call_with_timeout(
+                        "tools/call",
+                        json!({"name": "stop", "arguments": {}}),
+                        Duration::from_secs(10),
+                    )?
+                    .ok_or("successful cleanup Stop exceeded verifier deadline")?;
+            }
+            CleanupExit::StopAfterFailure => {
+                let failed = act_chained(
+                    &mut harness.mcp,
+                    &mut observation_id,
+                    vec![clipboard_write("", b"invalid")],
+                    Vec::new(),
+                )?;
+                if first_status(&failed) != "failed"
+                    || clipboard_inventory(self.seat)? != provisional
+                {
+                    return Err("failed guarded action changed the provisional clipboard".into());
+                }
+                harness
+                    .mcp
+                    .call_with_timeout(
+                        "tools/call",
+                        json!({"name": "stop", "arguments": {}}),
+                        Duration::from_secs(10),
+                    )?
+                    .ok_or("failed-action cleanup Stop exceeded verifier deadline")?;
+            }
+            CleanupExit::Disconnect => harness.restart_mcp(&self.options.mcp)?,
+        }
+
+        wait_for_clipboard(self.seat, self.baseline)?;
+        write_stage(
+            &self.options.evidence_directory,
+            &format!("{label}_cleanup_verified"),
+        )?;
+        Ok(clipboard_inventory(self.seat)? == self.baseline)
+    }
 }
 
 fn act(
@@ -802,6 +1172,22 @@ fn clipboard_inventory(
     Ok(evidence)
 }
 
+fn wait_for_clipboard(
+    seat: &str,
+    expected: &[RepresentationEvidence],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if clipboard_inventory(seat)? == expected {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for the expected clipboard inventory".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn evidence_for(
     representations: &[(&str, &[u8])],
 ) -> Result<Vec<RepresentationEvidence>, Box<dyn std::error::Error>> {
@@ -842,6 +1228,10 @@ fn application_outcome(response: &Value) -> String {
         .as_str()
         .unwrap_or("missing")
         .into()
+}
+
+fn accepted_application_outcome(outcome: &str) -> bool {
+    matches!(outcome, "completed" | "inconclusive")
 }
 
 fn require_receipt(response: &Value, expected: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -970,7 +1360,15 @@ fn path_text(path: &Path) -> Result<&str, Box<dyn std::error::Error>> {
 mod tests {
     use serde_json::json;
 
-    use super::{is_pre_dispatch_focus_changed, require_receipt};
+    use super::{accepted_application_outcome, is_pre_dispatch_focus_changed, require_receipt};
+
+    #[test]
+    fn accepted_consumer_truth_allows_conservative_completion_but_never_failure() {
+        assert!(accepted_application_outcome("completed"));
+        assert!(accepted_application_outcome("inconclusive"));
+        assert!(!accepted_application_outcome("failed"));
+        assert!(!accepted_application_outcome("missing"));
+    }
 
     #[test]
     fn tool_failures_surface_the_payload_free_mcp_error_text() {

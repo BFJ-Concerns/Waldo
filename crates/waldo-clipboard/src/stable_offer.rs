@@ -202,32 +202,87 @@ pub(crate) fn publish(
     representations: Vec<(String, Vec<u8>)>,
 ) -> Result<Publication, ProtocolError> {
     let seat_name = seat_name.to_owned();
-    let (ready_tx, ready_rx) = sync_channel(1);
     let publication = Publication {
         failure: Arc::new(Mutex::new(None)),
     };
     let background_publication = publication.clone();
-    thread::spawn(move || {
-        let prepared = prepare_publication(&seat_name, representations);
-        match prepared {
-            Ok((mut queue, mut state)) => {
-                let _ = ready_tx.send(Ok(()));
-                if let Err(error) = serve_owned_publication(&mut queue, &mut state) {
-                    background_publication.record_failure(error);
-                }
+    coordinate_publication(
+        SNAPSHOT_TIMEOUT,
+        move |deadline| prepare_publication(&seat_name, representations, deadline),
+        move |(mut queue, mut state)| {
+            if let Err(error) = serve_owned_publication(&mut queue, &mut state) {
+                background_publication.record_failure(error);
             }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error));
+        },
+    )?;
+    Ok(publication)
+}
+
+fn coordinate_publication<T, Prepare, Serve>(
+    timeout: Duration,
+    prepare: Prepare,
+    serve: Serve,
+) -> Result<(), ProtocolError>
+where
+    T: Send + 'static,
+    Prepare: FnOnce(Instant) -> Result<T, ProtocolError> + Send + 'static,
+    Serve: FnOnce(T) + Send + 'static,
+{
+    let deadline = Instant::now() + timeout;
+    let (ready_tx, ready_rx) = sync_channel(1);
+    let (accept_tx, accept_rx) = sync_channel(0);
+    let worker = thread::spawn(move || match prepare(deadline) {
+        Ok(prepared) => {
+            if ready_tx.send(Ok(())).is_ok() && accept_rx.recv().is_ok() {
+                serve(prepared);
             }
         }
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+        }
     });
-    ready_rx.recv_timeout(SNAPSHOT_TIMEOUT).map_err(|error| {
-        backend_failure(
-            format!("acknowledge ordered clipboard publication: {error}"),
-            true,
-        )
-    })??;
-    Ok(publication)
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match ready_rx.recv_timeout(remaining) {
+        Ok(Ok(())) => {
+            if accept_tx.send(()).is_err() {
+                worker.join().map_err(|_| {
+                    backend_failure(
+                        "prepare ordered clipboard publication: worker panicked",
+                        true,
+                    )
+                })?;
+                return Err(backend_failure(
+                    "prepare ordered clipboard publication: worker exited before acceptance",
+                    true,
+                ));
+            }
+            drop(worker);
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            drop(accept_tx);
+            worker.join().map_err(|_| {
+                backend_failure(
+                    "prepare ordered clipboard publication: worker panicked",
+                    true,
+                )
+            })?;
+            Err(error)
+        }
+        Err(error) => {
+            drop(accept_tx);
+            worker.join().map_err(|_| {
+                backend_failure(
+                    "prepare ordered clipboard publication: worker panicked",
+                    true,
+                )
+            })?;
+            Err(backend_failure(
+                format!("acknowledge ordered clipboard publication: {error}"),
+                true,
+            ))
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -336,10 +391,10 @@ fn wait_for_publication_readable(
 fn prepare_publication(
     seat_name: &str,
     representations: Vec<(String, Vec<u8>)>,
+    deadline: Instant,
 ) -> Result<(EventQueue<OfferState>, OfferState), ProtocolError> {
     let connection = Connection::connect_to_env()
         .map_err(|error| backend_failure(format!("connect to Wayland: {error}"), true))?;
-    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
     let mut queue = connection.new_event_queue::<OfferState>();
     let qh = queue.handle();
     let registry = connection.display().get_registry(&qh, ());
@@ -387,6 +442,7 @@ fn prepare_publication(
                 source.offer(mime_type.clone());
             }
             let device = manager.get_data_device(&seat, &qh, ());
+            require_deadline(deadline, "claim ordered clipboard publication")?;
             device.set_selection(Some(&source));
             state.owned_source = Some(ClipboardSource::Ext { _proxy: source });
         }
@@ -398,6 +454,7 @@ fn prepare_publication(
                 source.offer(mime_type.clone());
             }
             let device = manager.get_data_device(&seat, &qh, ());
+            require_deadline(deadline, "claim ordered clipboard publication")?;
             device.set_selection(Some(&source));
             state.owned_source = Some(ClipboardSource::Wlr { _proxy: source });
         }
@@ -415,6 +472,17 @@ fn prepare_publication(
         "acknowledge ordered clipboard publication",
     )?;
     Ok((queue, state))
+}
+
+fn require_deadline(deadline: Instant, operation: &str) -> Result<(), ProtocolError> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(backend_failure(
+            format!("{operation} exceeded the {SNAPSHOT_TIMEOUT:?} clipboard snapshot limit"),
+            true,
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -913,12 +981,62 @@ fn backend_failure(message: impl Into<String>, retryable: bool) -> ProtocolError
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write as _, os::fd::AsFd as _, thread, time::Instant};
+    use std::{
+        io::Write as _,
+        os::fd::AsFd as _,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::{
-        SNAPSHOT_TIMEOUT, read_representation, serve_publication, wait_for_publication_readable,
-        wait_for_readable,
+        SNAPSHOT_TIMEOUT, coordinate_publication, read_representation, serve_publication,
+        wait_for_publication_readable, wait_for_readable,
     };
+
+    struct FakeOwnership(Arc<AtomicBool>);
+
+    impl Drop for FakeOwnership {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn timeout_waits_until_a_late_worker_can_no_longer_retain_ownership() {
+        let claimed = Arc::new(AtomicBool::new(false));
+        let owned = Arc::new(AtomicBool::new(false));
+        let served = Arc::new(AtomicBool::new(false));
+        let prepare_claimed = Arc::clone(&claimed);
+        let prepare_owned = Arc::clone(&owned);
+        let serve_called = Arc::clone(&served);
+
+        let error = coordinate_publication(
+            Duration::from_millis(20),
+            move |deadline| {
+                thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(20),
+                );
+                prepare_claimed.store(true, Ordering::Release);
+                prepare_owned.store(true, Ordering::Release);
+                Ok(FakeOwnership(prepare_owned))
+            },
+            move |_ownership| serve_called.store(true, Ordering::Release),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .message
+                .contains("acknowledge ordered clipboard publication")
+        );
+        assert!(claimed.load(Ordering::Acquire));
+        assert!(!owned.load(Ordering::Acquire));
+        assert!(!served.load(Ordering::Acquire));
+    }
 
     #[test]
     fn consumer_disconnect_does_not_invalidate_the_published_offer() {

@@ -326,6 +326,17 @@ impl ClipboardExecutor {
         preservation_id: ClipboardPreservationId,
         cancellation: &ExecutionToken,
     ) -> Result<ActionExecution, ActionExecutionFailure> {
+        self.restore_guard_with(preservation_id, cancellation, Self::restore_snapshot)
+    }
+
+    fn restore_guard_with(
+        &self,
+        preservation_id: ClipboardPreservationId,
+        cancellation: &ExecutionToken,
+        restore: impl FnOnce(
+            &ClipboardSnapshot,
+        ) -> Result<Option<stable_offer::Publication>, ProtocolError>,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
         let mut state = self.preservation.lock().map_err(|_| {
             ActionExecutionFailure::not_executed(internal(
                 "clipboard preservation state lock is poisoned",
@@ -350,7 +361,7 @@ impl ClipboardExecutor {
             return Err(ActionExecutionFailure::not_executed(cancelled()));
         }
         let snapshot = guard.snapshot.clone();
-        let result = Self::restore_snapshot(&snapshot);
+        let result = restore(&snapshot);
         match result {
             Ok(publication) => {
                 state.guard = None;
@@ -368,6 +379,44 @@ impl ClipboardExecutor {
                 ))
             }
         }
+    }
+
+    fn keep_guard(
+        &self,
+        preservation_id: ClipboardPreservationId,
+        cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        let mut state = self.preservation.lock().map_err(|_| {
+            ActionExecutionFailure::not_executed(internal(
+                "clipboard preservation state lock is poisoned",
+            ))
+        })?;
+        Self::promote_publication_failure(&mut state);
+        let guard = state.guard.as_ref().ok_or_else(|| {
+            ActionExecutionFailure::not_executed(invalid_request(
+                "no clipboard preservation guard is active",
+            ))
+        })?;
+        if guard.id != preservation_id
+            || guard.owner != cancellation.owner()
+            || guard.session != cancellation.driving_session()
+        {
+            return Err(ActionExecutionFailure::not_executed(ProtocolError {
+                code: ErrorCode::NotLeaseOwner,
+                message: "clipboard preservation guard belongs to another driving session".into(),
+                retryable: false,
+            }));
+        }
+        if cancellation.is_cancelled() {
+            return Err(ActionExecutionFailure::not_executed(cancelled()));
+        }
+        if let Some(error) = &state.failure {
+            return Err(ActionExecutionFailure::not_executed(blocked_by_restore(
+                error,
+            )));
+        }
+        state.guard = None;
+        Ok(ActionRoute::Clipboard.into())
     }
 
     /// Restores a temporary-paste snapshot and retains it after uncertain failure.
@@ -506,6 +555,9 @@ impl ActionExecutor for ClipboardExecutor {
             Action::ClipboardPreserve => self.preserve(cancellation),
             Action::ClipboardRestore { preservation_id } => {
                 self.restore_guard(*preservation_id, cancellation)
+            }
+            Action::ClipboardKeep { preservation_id } => {
+                self.keep_guard(*preservation_id, cancellation)
             }
             _ => Err(ActionExecutionFailure::not_executed(ProtocolError {
                 code: ErrorCode::UnsupportedCapability,
@@ -907,6 +959,93 @@ mod tests {
             result,
             Err(ActionExecutionFailure::NotExecuted { error })
                 if error.code == ErrorCode::NotLeaseOwner
+        ));
+    }
+
+    #[test]
+    fn keeping_is_scoped_to_the_guard_owner_and_driving_session() {
+        let executor = guarded_executor(ConnectionId::new(9), DrivingSessionId::new(9));
+        let mut controller = Controller::new(Duration::from_secs(30));
+        let owner = controller.connect(ClientId::new("other").unwrap());
+        let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
+
+        let result = executor.execute(
+            &Action::ClipboardKeep {
+                preservation_id: ClipboardPreservationId::new(1),
+            },
+            authority.cancellation(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ActionExecutionFailure::NotExecuted { error })
+                if error.code == ErrorCode::NotLeaseOwner
+        ));
+        assert!(executor.preservation.lock().unwrap().guard.is_some());
+    }
+
+    #[test]
+    fn keep_consumes_the_guard_without_restoring_and_consumed_actions_fail_closed() {
+        let executor = guarded_executor(ConnectionId::new(1), DrivingSessionId::new(1));
+        let mut controller = Controller::new(Duration::from_secs(30));
+        let owner = controller.connect(ClientId::new("owner").unwrap());
+        let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
+        let keep = Action::ClipboardKeep {
+            preservation_id: ClipboardPreservationId::new(1),
+        };
+
+        executor.execute(&keep, authority.cancellation()).unwrap();
+        executor.cleanup_with(|_| panic!("a kept clipboard must not be restored at cleanup"));
+
+        assert!(matches!(
+            executor.execute(&keep, authority.cancellation()),
+            Err(ActionExecutionFailure::NotExecuted { error })
+                if error.code == ErrorCode::InvalidRequest
+        ));
+        assert!(matches!(
+            executor.restore_guard_with(
+                ClipboardPreservationId::new(1),
+                authority.cancellation(),
+                |_| panic!("a consumed guard must fail before restoration"),
+            ),
+            Err(ActionExecutionFailure::NotExecuted { error })
+                if error.code == ErrorCode::InvalidRequest
+        ));
+    }
+
+    #[test]
+    fn restore_consumes_the_guard_and_consumed_actions_fail_closed() {
+        let executor = guarded_executor(ConnectionId::new(1), DrivingSessionId::new(1));
+        let mut controller = Controller::new(Duration::from_secs(30));
+        let owner = controller.connect(ClientId::new("owner").unwrap());
+        let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
+
+        executor
+            .restore_guard_with(
+                ClipboardPreservationId::new(1),
+                authority.cancellation(),
+                |_| Ok(None),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            executor.execute(
+                &Action::ClipboardKeep {
+                    preservation_id: ClipboardPreservationId::new(1),
+                },
+                authority.cancellation(),
+            ),
+            Err(ActionExecutionFailure::NotExecuted { error })
+                if error.code == ErrorCode::InvalidRequest
+        ));
+        assert!(matches!(
+            executor.restore_guard_with(
+                ClipboardPreservationId::new(1),
+                authority.cancellation(),
+                |_| panic!("a consumed guard must fail before restoration"),
+            ),
+            Err(ActionExecutionFailure::NotExecuted { error })
+                if error.code == ErrorCode::InvalidRequest
         ));
     }
 

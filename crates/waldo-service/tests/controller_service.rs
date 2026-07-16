@@ -1268,7 +1268,10 @@ async fn pipelined_act_then_stop_never_executes_after_stop_completion() {
         .expect("Act must return its cancellation receipts");
     assert_eq!(acted.stop_reason, StopReason::Cancelled);
     assert_eq!(acted.application_outcome, ApplicationOutcome::Inconclusive);
-    assert!(acted.observation.is_none());
+    assert_eq!(
+        acted.observation.as_ref().unwrap().stable_output_id.0,
+        "DP-1"
+    );
     let backend_started = started_rx.try_recv().is_ok();
     assert!(!backend_started || finished.load(Ordering::Acquire));
 
@@ -2130,7 +2133,9 @@ async fn continuous_repaint_is_changing_at_an_explicit_settle_deadline() {
                     text: "dispatched".into(),
                     route: waldo_protocol::TextRoutePreference::VirtualKeyboard,
                 }],
-                verification: Vec::new(),
+                verification: vec![Predicate::FocusedWindow {
+                    window_id: WindowId("41".into()),
+                }],
             },
         })
         .await
@@ -2148,6 +2153,10 @@ async fn continuous_repaint_is_changing_at_an_explicit_settle_deadline() {
         ApplicationFrameState::Changing
     );
     assert!(result.completion_evidence.settle_deadline_reached);
+    assert_eq!(
+        result.completion_evidence.verification_agreement,
+        EvidenceAgreement::Agreed
+    );
 
     drop(client);
     shutdown_tx.send(()).unwrap();

@@ -1,6 +1,7 @@
 use waldo_protocol::{
-    ActRequest, Action, ClientMessage, ClipboardRepresentation, LogicalPoint, ObservationId,
-    PointerButton, RequestId, ServerMessage, StopResult, published_schema,
+    ActRequest, Action, ClientMessage, ClipboardPreservationId, ClipboardRepresentation,
+    LogicalPoint, ObservationId, PointerButton, RequestId, ServerMessage, StopResult,
+    published_schema,
 };
 
 #[test]
@@ -46,6 +47,24 @@ fn atomic_clipboard_offer_is_additive_to_the_single_representation_action() {
     };
 
     for action in [old, offer] {
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), action);
+    }
+}
+
+#[test]
+fn clipboard_keep_is_additive_to_the_preservation_actions() {
+    let actions = [
+        Action::ClipboardPreserve,
+        Action::ClipboardRestore {
+            preservation_id: ClipboardPreservationId::new(7),
+        },
+        Action::ClipboardKeep {
+            preservation_id: ClipboardPreservationId::new(7),
+        },
+    ];
+
+    for action in actions {
         let json = serde_json::to_string(&action).unwrap();
         assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), action);
     }
