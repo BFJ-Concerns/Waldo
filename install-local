@@ -81,31 +81,83 @@ record_unavailable() {
 }
 
 cleanup() {
+    local failed=false
     if [[ -n "$controller_pid" ]]; then
-        kill "$controller_pid" 2>/dev/null || true
-        wait "$controller_pid" 2>/dev/null || true
+        if kill -0 "$controller_pid" 2>/dev/null; then
+            if ! kill "$controller_pid" 2>/dev/null; then
+                printf 'Failed to signal redirected Waldo controller PID %s.\n' "$controller_pid" >&2
+                failed=true
+            fi
+        fi
+        for _ in {1..50}; do
+            if ! kill -0 "$controller_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+        if kill -0 "$controller_pid" 2>/dev/null; then
+            printf 'Redirected Waldo controller PID %s exceeded its shutdown deadline.\n' \
+                "$controller_pid" >&2
+            failed=true
+            kill -KILL "$controller_pid" 2>/dev/null || true
+        fi
+        if ! wait "$controller_pid" && [[ "$failed" == false ]]; then
+            printf 'Redirected Waldo controller PID %s did not shut down cleanly.\n' \
+                "$controller_pid" >&2
+            failed=true
+        fi
+        controller_pid=""
     fi
     if [[ -n "$auth_link" && -L "$auth_link" ]]; then
-        rm -f -- "$auth_link"
+        if ! rm -f -- "$auth_link"; then
+            printf 'Failed to remove temporary Codex authentication link %s.\n' "$auth_link" >&2
+            failed=true
+        fi
     fi
     if [[ -n "$proof_transcript" ]]; then
-        rm -f -- "$proof_transcript"
+        if ! rm -f -- "$proof_transcript"; then
+            printf 'Failed to remove temporary Codex proof transcript %s.\n' \
+                "$proof_transcript" >&2
+            failed=true
+        fi
     fi
     if [[ -n "$query_output" ]]; then
-        rm -f -- "$query_output"
+        if ! rm -f -- "$query_output"; then
+            printf 'Failed to remove temporary Waldo query result %s.\n' "$query_output" >&2
+            failed=true
+        fi
     fi
     if [[ "$install_mode" == redirected && -n "$redirected_runtime" ]]; then
-        rmdir -- "$redirected_runtime/waldo" "$redirected_runtime" 2>/dev/null || true
+        if [[ -e "$controller_socket" || -L "$controller_socket" ]]; then
+            printf 'Redirected Waldo controller left unexpected socket residue at %s.\n' \
+                "$controller_socket" >&2
+            failed=true
+        fi
+        for runtime_directory in "$redirected_runtime/waldo" "$redirected_runtime"; do
+            if [[ -e "$runtime_directory" || -L "$runtime_directory" ]]; then
+                if ! rmdir -- "$runtime_directory"; then
+                    printf 'Redirected Waldo runtime residue remains at %s.\n' \
+                        "$runtime_directory" >&2
+                    failed=true
+                fi
+            fi
+        done
     fi
+    [[ "$failed" == false ]]
 }
 
 finish() {
     local status=$?
+    local failed_stage="$failure_stage"
     trap - EXIT
+    if ! cleanup; then
+        status=1
+        installation_succeeded=false
+        failure_stage="redirected runtime cleanup after $failed_stage"
+    fi
     if [[ "$installation_succeeded" != true ]]; then
         record_unavailable "install-local failed during $failure_stage; inspect the preceding diagnostic and rerun after correcting it" || true
     fi
-    cleanup
     exit "$status"
 }
 trap finish EXIT

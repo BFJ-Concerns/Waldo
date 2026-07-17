@@ -1,6 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
+use tokio::signal::unix::{SignalKind, signal};
 use waldo_service::{ControllerService, default_socket_path};
 
 #[derive(Debug, Parser)]
@@ -26,9 +27,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ControllerService::bind(&socket, Duration::from_secs(arguments.idle_timeout_seconds))?;
 
     eprintln!("Waldo controller listening on {}", socket.display());
+    let mut terminate = signal(SignalKind::terminate())?;
     service
         .run_until(async {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
         })
         .await?;
     Ok(())
