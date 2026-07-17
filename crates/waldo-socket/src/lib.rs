@@ -69,7 +69,20 @@ impl fmt::Display for TransportError {
 
 /// Returns the controller socket beneath the user's private runtime directory.
 pub fn default_socket_path() -> Result<PathBuf, TransportError> {
-    let runtime = env::var_os("XDG_RUNTIME_DIR").ok_or(TransportError::RuntimeDirectoryMissing)?;
+    socket_path(
+        env::var_os("WALDO_SOCKET_PATH"),
+        env::var_os("XDG_RUNTIME_DIR"),
+    )
+}
+
+fn socket_path(
+    explicit: Option<std::ffi::OsString>,
+    runtime: Option<std::ffi::OsString>,
+) -> Result<PathBuf, TransportError> {
+    if let Some(path) = explicit {
+        return Ok(PathBuf::from(path));
+    }
+    let runtime = runtime.ok_or(TransportError::RuntimeDirectoryMissing)?;
     Ok(PathBuf::from(runtime).join("waldo/controller.sock"))
 }
 
@@ -121,6 +134,19 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    let payload = read_frame(reader).await?;
+    Ok(serde_json::from_slice(&payload)?)
+}
+
+/// Reads one bounded frame without interpreting its JSON payload.
+///
+/// The controller service uses this lower-level boundary so a recoverably
+/// framed request which does not match the current schema can receive a
+/// structured protocol error without closing the healthy connection.
+pub async fn read_frame<R>(reader: &mut R) -> Result<Vec<u8>, TransportError>
+where
+    R: AsyncRead + Unpin,
+{
     let size = match reader.read_u32().await {
         Ok(size) => size as usize,
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
@@ -137,7 +163,7 @@ where
 
     let mut payload = vec![0; size];
     reader.read_exact(&mut payload).await?;
-    Ok(serde_json::from_slice(&payload)?)
+    Ok(payload)
 }
 
 /// A connected and schema-checked controller client.
@@ -316,7 +342,7 @@ impl ControllerClient {
 mod tests {
     use tokio::io::{AsyncWriteExt, duplex};
 
-    use super::{MAX_FRAME_BYTES, TransportError, read_message, write_message};
+    use super::{MAX_FRAME_BYTES, TransportError, read_frame, read_message, write_message};
 
     #[tokio::test]
     async fn messages_round_trip_over_an_async_stream() {
@@ -328,6 +354,15 @@ mod tests {
         let decoded: Vec<String> = read_message(&mut reader).await.unwrap();
 
         assert_eq!(decoded, ["observe", "act"]);
+    }
+
+    #[tokio::test]
+    async fn raw_frame_reading_preserves_recoverable_invalid_json() {
+        let (mut writer, mut reader) = duplex(128);
+        writer.write_u32(9).await.unwrap();
+        writer.write_all(b"{not-json").await.unwrap();
+
+        assert_eq!(read_frame(&mut reader).await.unwrap(), b"{not-json");
     }
 
     #[tokio::test]
@@ -363,5 +398,16 @@ mod tests {
         let base64_ceiling = rgba_bytes.div_ceil(3) * 4;
 
         assert!(MAX_FRAME_BYTES > base64_ceiling);
+    }
+
+    #[test]
+    fn explicit_socket_override_supports_disposable_installed_proofs() {
+        let path = super::socket_path(
+            Some("/tmp/waldo-disposable.sock".into()),
+            Some("/run/user/1000".into()),
+        )
+        .unwrap();
+
+        assert_eq!(path, std::path::Path::new("/tmp/waldo-disposable.sock"));
     }
 }

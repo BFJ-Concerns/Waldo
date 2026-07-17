@@ -1,0 +1,8 @@
+{
+  "observation_id": 0,
+  "actions": [
+    {"type": "wait", "predicate": {"type": "process_exited", "pid": 4294967295}, "timeout_ms": 50},
+    {"type": "capture", "source": {"type": "output", "output_id": "PARITY-1"}}
+  ],
+  "verification": []
+}

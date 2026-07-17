@@ -3,7 +3,7 @@ use std::io::Cursor;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::{GenericImageView, ImageFormat, imageops::FilterType};
 use serde_json::{Value, json};
-use waldo_protocol::{Observation, PixelSize, ServerMessage};
+use waldo_protocol::{ErrorCode, Observation, PixelSize, ProtocolError, ServerMessage};
 
 use crate::tools::ToolResult;
 
@@ -11,16 +11,15 @@ const MAX_MODEL_IMAGE_EDGE: u32 = 2048;
 
 pub(crate) fn tool_response(mut response: ServerMessage) -> Value {
     if let ServerMessage::Error { error, .. } = &response {
-        let code = serde_json::to_value(error.code)
-            .expect("error codes serialise")
-            .as_str()
-            .expect("error codes serialise as strings")
-            .to_owned();
-        return tool_failure(format!("{code}: {}", error.message));
+        return tool_failure(error.clone());
     }
 
     if let Err(error) = present_response_images(&mut response, MAX_MODEL_IMAGE_EDGE) {
-        return tool_failure(format!("image presentation failed: {error}"));
+        return tool_failure(ProtocolError {
+            code: ErrorCode::Internal,
+            message: format!("image presentation failed: {error}"),
+            retryable: true,
+        });
     }
 
     let response = serde_json::to_value(response).expect("controller responses serialise");
@@ -122,13 +121,32 @@ fn separate_image(mut response: Value) -> (Value, Option<(String, String)>) {
     (response, image)
 }
 
-pub(crate) fn tool_failure(message: String) -> Value {
+pub(crate) fn tool_failure(error: ProtocolError) -> Value {
+    let code = serde_json::to_value(error.code)
+        .expect("error codes serialise")
+        .as_str()
+        .expect("error codes serialise as strings")
+        .to_owned();
+    let message = format!("{code}: {}", error.message);
+    let structured = json!({
+        "type": "error",
+        "request_id": null,
+        "error": error,
+    });
     serde_json::to_value(ToolResult {
         content: vec![json!({ "type": "text", "text": message })],
-        structured_content: None,
+        structured_content: Some(structured),
         is_error: true,
     })
     .expect("tool failure serialises")
+}
+
+pub(crate) fn transport_failure(message: String) -> Value {
+    tool_failure(ProtocolError {
+        code: ErrorCode::BackendFailure,
+        message,
+        retryable: true,
+    })
 }
 
 #[cfg(test)]
@@ -144,7 +162,9 @@ mod tests {
         SourceSelector,
     };
 
-    use super::{present_observation_image, separate_image};
+    use waldo_protocol::{ErrorCode, ProtocolError};
+
+    use super::{present_observation_image, separate_image, tool_failure};
 
     #[test]
     fn images_are_emitted_once_as_mcp_image_content() {
@@ -164,6 +184,22 @@ mod tests {
             true
         );
         assert!(structured.to_string().find("cG5n").is_none());
+    }
+
+    #[test]
+    fn tool_errors_retain_the_protocol_error_as_structured_content() {
+        let result = tool_failure(ProtocolError {
+            code: ErrorCode::InvalidRequest,
+            message: "request does not match the protocol schema".into(),
+            retryable: false,
+        });
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            "invalid_request"
+        );
+        assert_eq!(result["structuredContent"]["error"]["retryable"], false);
     }
 
     #[test]

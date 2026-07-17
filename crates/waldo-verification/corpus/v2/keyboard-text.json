@@ -1,0 +1,13 @@
+{
+  "observation_id": 0,
+  "actions": [
+    {"type": "key", "key": "a", "state": "pressed"},
+    {"type": "key", "key": "a", "state": "released"},
+    {"type": "key_chord", "keys": ["ctrl", "a"]},
+    {"type": "text", "text": "accessibility", "route": "accessibility"},
+    {"type": "text", "text": "clipboard", "route": "clipboard_paste"},
+    {"type": "text", "text": "keyboard", "route": "virtual_keyboard"},
+    {"type": "text", "text": "automatic", "route": "automatic"}
+  ],
+  "verification": []
+}

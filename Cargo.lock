@@ -1271,8 +1271,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "waldo-action",
  "waldo-niri",
  "waldo-protocol",
+ "waldo-screencopy",
  "waldo-service",
  "waldo-socket",
 ]
@@ -1360,6 +1362,7 @@ dependencies = [
  "clap",
  "niri-ipc",
  "nix",
+ "serde_json",
  "tokio",
  "waldo-accessibility",
  "waldo-action",
@@ -1394,8 +1397,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "waldo-action",
+ "waldo-cli",
  "waldo-clipboard",
+ "waldo-controller",
+ "waldo-mcp",
+ "waldo-niri",
  "waldo-protocol",
+ "waldo-screencopy",
+ "waldo-service",
 ]
 
 [[package]]

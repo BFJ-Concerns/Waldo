@@ -11,10 +11,10 @@ use clap::{Parser, Subcommand};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use waldo_protocol::{
-    ActRequest, ClientId, ClientMessage, ConnectionId, HandoverRequest, ObserveRequest,
-    QueryRequest, RequestId, ServerMessage, StopRequest, published_schema,
+    ActRequest, ClientId, ClientMessage, ConnectionId, ErrorCode, HandoverRequest, ObserveRequest,
+    ProtocolError, QueryRequest, RequestId, ServerMessage, StopRequest, published_schema,
 };
-use waldo_socket::{ControllerClient, TransportError, default_socket_path};
+use waldo_socket::{PipelinedControllerClient, TransportError, default_socket_path};
 
 #[derive(Debug, Parser)]
 #[command(name = "waldo", about = "Observe and control the active Niri desktop")]
@@ -52,6 +52,12 @@ pub enum Command {
         /// ObserveRequest document used to ground this action on the same connection.
         #[arg(long)]
         observe: Option<PathBuf>,
+        /// Cancel this batch through Stop after the given delay.
+        #[arg(long, conflicts_with = "handover_to")]
+        stop_after_ms: Option<u64>,
+        /// Transfer the acquired driving lease after this batch completes.
+        #[arg(long, conflicts_with = "stop_after_ms")]
+        handover_to: Option<u64>,
     },
     /// Cancel and release this connection's driving session.
     Stop,
@@ -135,17 +141,30 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
         None => default_socket_path()?,
     };
     let client_id = ClientId::new(arguments.client_id).map_err(CliError::InvalidClientId)?;
-    let mut client = ControllerClient::connect(&socket, client_id).await?;
+    let client = PipelinedControllerClient::connect(&socket, client_id).await?;
     let request_id = RequestId::new(2);
-    if let Command::Act { document, observe } = arguments.command {
-        let mut request: ActRequest = read_document(&document)?;
+    if let Command::Act {
+        document,
+        observe,
+        stop_after_ms,
+        handover_to,
+    } = arguments.command
+    {
+        let mut request: ActRequest = match request_document(&document, RequestId::new(3))? {
+            Ok(request) => request,
+            Err(response) => return Ok(response),
+        };
         if let Some(observe_document) = observe {
             if document == Path::new("-") && observe_document == Path::new("-") {
                 return Err(CliError::SharedStdin);
             }
-            let observation_request: ObserveRequest = read_document(&observe_document)?;
+            let observation_request: ObserveRequest =
+                match request_document(&observe_document, request_id)? {
+                    Ok(request) => request,
+                    Err(response) => return Ok(response),
+                };
             let observed = client
-                .request(&ClientMessage::Observe {
+                .request(ClientMessage::Observe {
                     request_id,
                     request: observation_request,
                 })
@@ -155,14 +174,40 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
             };
             request.observation_id = observation.id;
         }
-        return Ok(serde_json::to_value(
-            client
-                .request(&ClientMessage::Act {
-                    request_id: RequestId::new(3),
-                    request,
+        let act_message = ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request,
+        };
+        if let Some(delay_ms) = stop_after_ms {
+            let act_client = client.clone();
+            let stop_client = client.clone();
+            let act = async move { act_client.request(act_message).await };
+            let stop = async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                stop_client
+                    .request(ClientMessage::Stop {
+                        request_id: RequestId::new(4),
+                        request: StopRequest::default(),
+                    })
+                    .await
+            };
+            let (acted, stopped) = tokio::join!(act, stop);
+            return json_envelope("act_cancelled", acted?, "stop", stopped?);
+        }
+
+        let acted = client.request(act_message).await?;
+        if let Some(connection) = handover_to {
+            let handed_over = client
+                .request(ClientMessage::Handover {
+                    request_id: RequestId::new(4),
+                    request: HandoverRequest {
+                        target: ConnectionId::new(connection),
+                    },
                 })
-                .await?,
-        )?);
+                .await?;
+            return json_envelope("act_handover", acted, "handover", handed_over);
+        }
+        return Ok(serde_json::to_value(acted)?);
     }
     let message = match arguments.command {
         Command::Schema => unreachable!("schema returned before opening the controller socket"),
@@ -172,7 +217,10 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
         },
         Command::Observe { document } => ClientMessage::Observe {
             request_id,
-            request: read_document(&document)?,
+            request: match request_document(&document, request_id)? {
+                Ok(request) => request,
+                Err(response) => return Ok(response),
+            },
         },
         Command::Act { .. } => unreachable!("Act returned through its composed CLI path"),
         Command::Stop => ClientMessage::Stop {
@@ -186,7 +234,10 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
             },
         },
         Command::Send { document } => {
-            let message: ClientMessage = read_document(&document)?;
+            let message: ClientMessage = match request_document(&document, request_id)? {
+                Ok(request) => request,
+                Err(response) => return Ok(response),
+            };
             if matches!(message, ClientMessage::Hello { .. }) {
                 return Err(CliError::HelloDocument);
             }
@@ -194,7 +245,7 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
         }
     };
 
-    Ok(serde_json::to_value(client.request(&message).await?)?)
+    Ok(serde_json::to_value(client.request(message).await?)?)
 }
 
 fn read_document<T: DeserializeOwned>(path: &Path) -> Result<T, CliError> {
@@ -205,6 +256,37 @@ fn read_document<T: DeserializeOwned>(path: &Path) -> Result<T, CliError> {
         document = fs::read_to_string(path)?;
     }
     Ok(serde_json::from_str(&document)?)
+}
+
+fn request_document<T: DeserializeOwned>(
+    path: &Path,
+    request_id: RequestId,
+) -> Result<Result<T, Value>, CliError> {
+    match read_document(path) {
+        Ok(request) => Ok(Ok(request)),
+        Err(CliError::Json(_)) => Ok(Err(serde_json::to_value(ServerMessage::Error {
+            request_id: Some(request_id),
+            error: ProtocolError {
+                code: ErrorCode::InvalidRequest,
+                message: "request document does not match the protocol schema".into(),
+                retryable: false,
+            },
+        })?)),
+        Err(error) => Err(error),
+    }
+}
+
+fn json_envelope(
+    kind: &str,
+    acted: ServerMessage,
+    following_name: &str,
+    following: ServerMessage,
+) -> Result<Value, CliError> {
+    Ok(serde_json::json!({
+        "type": kind,
+        "act": acted,
+        (following_name): following,
+    }))
 }
 
 #[cfg(test)]
@@ -235,6 +317,33 @@ mod tests {
                 observe: Some(path),
                 ..
             } if path == std::path::Path::new("source.json")
+        ));
+    }
+
+    #[test]
+    fn act_can_compose_stop_or_handover_without_changing_the_saved_document() {
+        let cancelled =
+            Arguments::try_parse_from(["waldo", "act", "batch.json", "--stop-after-ms", "25"])
+                .unwrap();
+        let handed_over =
+            Arguments::try_parse_from(["waldo", "act", "batch.json", "--handover-to", "7"])
+                .unwrap();
+
+        assert!(matches!(
+            cancelled.command,
+            Command::Act {
+                stop_after_ms: Some(25),
+                handover_to: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            handed_over.command,
+            Command::Act {
+                stop_after_ms: None,
+                handover_to: Some(7),
+                ..
+            }
         ));
     }
 

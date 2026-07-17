@@ -1,0 +1,8 @@
+{
+  "observation_id": 0,
+  "actions": [
+    {"type": "wait", "predicate": {"type": "process_exited", "pid": 4294967295}, "timeout_ms": 50},
+    {"type": "pointer_move_absolute", "position": {"x": 100.0, "y": 100.0}}
+  ],
+  "verification": []
+}

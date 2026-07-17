@@ -104,32 +104,44 @@ impl McpServer {
         let message = match call.name.as_str() {
             "observe" => ClientMessage::Observe {
                 request_id,
-                request: decode(call.arguments)?,
+                request: match decode_tool_arguments(call.arguments, "ObserveRequest") {
+                    Ok(request) => request,
+                    Err(error) => return Ok(tool_failure(error)),
+                },
             },
             "act" => ClientMessage::Act {
                 request_id,
-                request: decode(call.arguments)?,
+                request: match decode_tool_arguments(call.arguments, "ActRequest") {
+                    Ok(request) => request,
+                    Err(error) => return Ok(tool_failure(error)),
+                },
             },
             "query" => ClientMessage::Query {
                 request_id,
-                request: decode(call.arguments)?,
+                request: match decode_tool_arguments(call.arguments, "QueryRequest") {
+                    Ok(request) => request,
+                    Err(error) => return Ok(tool_failure(error)),
+                },
             },
             "stop" => ClientMessage::Stop {
                 request_id,
-                request: decode(call.arguments)?,
+                request: match decode_tool_arguments(call.arguments, "StopRequest") {
+                    Ok(request) => request,
+                    Err(error) => return Ok(tool_failure(error)),
+                },
             },
             _ => return Err(format!("unknown Waldo tool: {}", call.name)),
         };
 
         let response = match self.controller().await {
             Ok(controller) => controller.request(message).await,
-            Err(error) => return Ok(tool_failure(error.to_string())),
+            Err(error) => return Ok(crate::result::transport_failure(error.to_string())),
         };
         match response {
             Ok(response) => Ok(tool_response(response)),
             Err(error) => {
                 *self.controller.lock().await = None;
-                Ok(tool_failure(error.to_string()))
+                Ok(crate::result::transport_failure(error.to_string()))
             }
         }
     }
@@ -154,6 +166,17 @@ impl McpServer {
     fn next_controller_request_id(&self) -> RequestId {
         RequestId::new(self.next_request_id.fetch_add(1, Ordering::Relaxed))
     }
+}
+
+fn decode_tool_arguments<T: serde::de::DeserializeOwned>(
+    value: Value,
+    schema: &str,
+) -> Result<T, waldo_protocol::ProtocolError> {
+    decode(value).map_err(|_| waldo_protocol::ProtocolError {
+        code: waldo_protocol::ErrorCode::InvalidRequest,
+        message: format!("tool arguments do not match the {schema} schema"),
+        retryable: false,
+    })
 }
 
 async fn write_response<W>(writer: &mut BufWriter<W>, response: &Value) -> Result<(), McpError>

@@ -13,8 +13,11 @@ waldo-protocol = { path = "../waldo-protocol" }
 waldo-socket = { path = "../waldo-socket" }
 
 [dev-dependencies]
+waldo-action = { path = "../waldo-action" }
 waldo-niri = { path = "../waldo-niri" }
+waldo-screencopy = { path = "../waldo-screencopy" }
 waldo-service = { path = "../waldo-service" }
+waldo-socket = { path = "../waldo-socket" }
 
 [lib]
 path = "src/lib.rs"

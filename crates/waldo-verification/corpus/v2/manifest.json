@@ -1,0 +1,15 @@
+{
+  "schema_major": 2,
+  "documents": [
+    {"name": "pointer", "file": "pointer.json", "families": ["pointer"]},
+    {"name": "keyboard-text", "file": "keyboard-text.json", "families": ["keyboard", "text"]},
+    {"name": "clipboard", "file": "clipboard.json", "families": ["clipboard"]},
+    {"name": "accessibility", "file": "accessibility.json", "families": ["accessibility"]},
+    {"name": "window", "file": "window.json", "families": ["window"]},
+    {"name": "workspace", "file": "workspace.json", "families": ["workspace"]},
+    {"name": "wait-capture", "file": "wait-capture.json", "families": ["wait", "capture"]},
+    {"name": "invalid-order", "file": "invalid-order.json", "families": ["structured-error"]},
+    {"name": "stopped-batch", "file": "stopped-batch.json", "families": ["stop"], "stop_after_ms": 25}
+  ],
+  "deferred": ["mcp-handover"]
+}

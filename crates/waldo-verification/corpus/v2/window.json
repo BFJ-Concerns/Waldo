@@ -1,0 +1,7 @@
+{
+  "observation_id": 0,
+  "actions": [
+    {"type": "window", "window_id": "42", "operation": {"type": "set_size", "width": 640, "height": 480}}
+  ],
+  "verification": []
+}
