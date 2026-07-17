@@ -85,3 +85,14 @@ not already authorised.
 Waldo is currently a supervised development tool for the operator's own
 unshared machine. Do not represent it as suitable for unattended operation, a
 shared workstation, or general distribution.
+
+## In-development status and defect reporting
+
+**Temporary — remove when Waldo matures out of supervised development.**
+
+Waldo is an in-development tool. When a problem during a task is attributable
+to Waldo itself — wrong or misleading behaviour, a defective result, a missing
+capability that its contract implies, or guidance this skill lacks — report
+it to the user: what was attempted, what Waldo returned, and why the fault
+appears to be Waldo's rather than the task's. Do not silently work around a
+Waldo defect without reporting it.
