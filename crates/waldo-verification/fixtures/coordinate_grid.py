@@ -149,8 +149,11 @@ class CoordinateFixture(Gtk.Application):
                 indent=2,
             )
             handle.write("\n")
+        os.chmod(temporary, 0o600)
         os.replace(temporary, self.options.ready)
+        os.chmod(self.options.ready, 0o600)
         open(self.options.events, "a", encoding="utf-8").close()
+        os.chmod(self.options.events, 0o600)
         return GLib.SOURCE_REMOVE
 
     def record_pointer_event(self, gesture, x, y, kind, receiver):
@@ -175,6 +178,7 @@ class CoordinateFixture(Gtk.Application):
                 + "\n"
             )
             handle.flush()
+        os.chmod(self.options.events, 0o600)
 
     def pointer_event(self, gesture, _count, x, y, kind):
         self.record_pointer_event(gesture, x, y, kind, "target")

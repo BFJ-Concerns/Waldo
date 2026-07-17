@@ -6,7 +6,9 @@ use waldo_verification::{
 };
 
 mod clipboard_outside_in;
+mod final_campaign;
 mod outside_in;
+mod toolkit_preflight;
 
 #[derive(Debug, Parser)]
 #[command(about = "Prepare and validate deterministic Waldo verification evidence")]
@@ -97,6 +99,45 @@ enum Command {
         python: PathBuf,
         #[arg(long, default_value_t = 0xc8e5)]
         seed: u64,
+    },
+    /// Preflight equivalent toolkit fixtures and emit provisional matrix admission evidence.
+    ToolkitPreflight {
+        evidence_directory: PathBuf,
+        #[arg(long)]
+        fixture_directory: PathBuf,
+        #[arg(long, default_value = "python3")]
+        python: PathBuf,
+        #[arg(long, default_value = "/usr/bin/electron39")]
+        electron: PathBuf,
+        #[arg(long, default_value_t = 0xd35c)]
+        seed: u64,
+        #[arg(long)]
+        probe_only: bool,
+    },
+    /// Run the complete exact-binary, final-consumer desktop conformance campaign.
+    FinalCampaign {
+        evidence_directory: PathBuf,
+        #[arg(long)]
+        waldod: PathBuf,
+        #[arg(long)]
+        mcp: PathBuf,
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        fixture_directory: PathBuf,
+        #[arg(long)]
+        corpus_directory: PathBuf,
+        #[arg(long)]
+        plugin_manifest: PathBuf,
+        #[arg(long, default_value = "python3")]
+        python: PathBuf,
+        #[arg(long, default_value = "/usr/bin/electron39")]
+        electron: PathBuf,
+        #[arg(long, default_value_t = 0xf17a)]
+        seed: u64,
+        /// Skip migrated legacy circuits for a non-acceptance diagnostic run.
+        #[arg(long)]
+        skip_legacy: bool,
     },
 }
 
@@ -200,6 +241,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fixture,
                 python,
                 seed,
+            })?;
+            emit_json(&summary, None)?;
+        }
+        Command::ToolkitPreflight {
+            evidence_directory,
+            fixture_directory,
+            python,
+            electron,
+            seed,
+            probe_only,
+        } => {
+            let summary = toolkit_preflight::run(toolkit_preflight::Options {
+                evidence_directory,
+                fixture_directory,
+                python,
+                electron,
+                seed,
+                probe_only,
+            })?;
+            emit_json(&summary, None)?;
+        }
+        Command::FinalCampaign {
+            evidence_directory,
+            waldod,
+            mcp,
+            cli,
+            fixture_directory,
+            corpus_directory,
+            plugin_manifest,
+            python,
+            electron,
+            seed,
+            skip_legacy,
+        } => {
+            let summary = final_campaign::run(final_campaign::Options {
+                evidence_directory,
+                waldod,
+                mcp,
+                cli,
+                fixture_directory,
+                corpus_directory,
+                plugin_manifest,
+                python,
+                electron,
+                seed,
+                skip_legacy,
             })?;
             emit_json(&summary, None)?;
         }

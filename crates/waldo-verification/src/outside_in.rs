@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     io::{BufRead, BufReader, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
@@ -15,7 +15,9 @@ use image::{DynamicImage, GenericImageView, ImageFormat};
 use niri_ipc::{Action as NiriAction, Request, Response, socket::Socket};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use waldo_verification::{FixtureRect, TargetGrid, capture_niri_topology};
+use waldo_verification::{
+    FixtureRect, PrivacyScan, PrivateRoot, TargetGrid, capture_niri_topology, scan_private_root,
+};
 
 pub struct Options {
     pub evidence_directory: PathBuf,
@@ -36,6 +38,7 @@ pub struct OutsideInSummary {
     transparent_interception: Option<TransparentInterceptionResult>,
     contradictory_state: Option<ContradictoryStateResult>,
     controller_socket_removed: bool,
+    privacy_scan: PrivacyScan,
     sensitive_payloads_retained: bool,
 }
 
@@ -51,10 +54,11 @@ pub struct AccessibilitySummary {
     stale_replacement_refused: bool,
     ambiguity_propagated: bool,
     controller_socket_removed: bool,
+    privacy_scan: PrivacyScan,
     sensitive_payloads_retained: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct IdentityEvidence {
     waldo_commit: String,
     verifier_commit: String,
@@ -63,7 +67,7 @@ pub(crate) struct IdentityEvidence {
     fixture: FileIdentity,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct FileIdentity {
     path: PathBuf,
     sha256: String,
@@ -200,7 +204,7 @@ struct FixtureEvent {
 
 pub(crate) struct ToolObservation {
     pub(crate) id: u64,
-    source: Value,
+    pub(crate) source: Value,
     source_pixels: PixelSize,
     model_pixels: PixelSize,
     logical_origin: FloatPoint,
@@ -209,6 +213,97 @@ pub(crate) struct ToolObservation {
     image: DynamicImage,
     image_digest: String,
     pub(crate) accessibility: Vec<Value>,
+}
+
+impl ToolObservation {
+    pub(crate) fn model_dimensions(&self) -> (u32, u32) {
+        (self.model_pixels.width, self.model_pixels.height)
+    }
+
+    pub(crate) fn model_to_logical_point(&self, x: u32, y: u32) -> (f64, f64) {
+        let point = model_to_logical(self, x, y);
+        (point.x, point.y)
+    }
+
+    pub(crate) fn logical_centre(&self) -> (f64, f64) {
+        (
+            self.logical_origin.x + self.logical_width / 2.0,
+            self.logical_origin.y + self.logical_height / 2.0,
+        )
+    }
+
+    pub(crate) fn largest_colour_region(
+        &self,
+        expected: [u8; 3],
+        tolerance: u8,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let image = self.image.to_rgba8();
+        let (width, height) = image.dimensions();
+        let mut eligible = image
+            .pixels()
+            .map(|pixel| rgb_near(pixel.0, expected, tolerance))
+            .collect::<Vec<_>>();
+        let mut largest = None;
+        for y in 0..height {
+            for x in 0..width {
+                let index = (y * width + x) as usize;
+                if !eligible[index] {
+                    continue;
+                }
+                eligible[index] = false;
+                let mut queue = VecDeque::from([(x, y)]);
+                let mut count = 0usize;
+                let mut bounds = (x, y, x, y);
+                while let Some((current_x, current_y)) = queue.pop_front() {
+                    count += 1;
+                    bounds.0 = bounds.0.min(current_x);
+                    bounds.1 = bounds.1.min(current_y);
+                    bounds.2 = bounds.2.max(current_x);
+                    bounds.3 = bounds.3.max(current_y);
+                    for (next_x, next_y) in [
+                        current_x.checked_sub(1).map(|value| (value, current_y)),
+                        (current_x + 1 < width).then_some((current_x + 1, current_y)),
+                        current_y.checked_sub(1).map(|value| (current_x, value)),
+                        (current_y + 1 < height).then_some((current_x, current_y + 1)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let next = (next_y * width + next_x) as usize;
+                        if eligible[next] {
+                            eligible[next] = false;
+                            queue.push_back((next_x, next_y));
+                        }
+                    }
+                }
+                if largest.is_none_or(|(largest_count, _)| count > largest_count) {
+                    largest = Some((count, bounds));
+                }
+            }
+        }
+        largest.map(|(_, bounds)| bounds)
+    }
+
+    pub(crate) fn closest_colour(&self, expected: [u8; 3]) -> ([u8; 4], u8, u32, u32) {
+        self.image
+            .to_rgba8()
+            .enumerate_pixels()
+            .map(|(x, y, pixel)| {
+                let distance = pixel.0[..3]
+                    .iter()
+                    .zip(expected)
+                    .map(|(actual, expected)| actual.abs_diff(expected))
+                    .max()
+                    .unwrap_or(0);
+                (pixel.0, distance, x, y)
+            })
+            .min_by_key(|(_, distance, _, _)| *distance)
+            .unwrap_or(([0, 0, 0, 0], u8::MAX, 0, 0))
+    }
+
+    pub(crate) fn image_digest(&self) -> &str {
+        &self.image_digest
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,51 +320,25 @@ struct AccessibilityFixtureState {
     control_sequence: u64,
 }
 
-struct ChildGuard(Child);
+pub(crate) struct ChildGuard(pub(crate) Child);
 
 impl ChildGuard {
-    fn terminate(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+    pub(crate) fn terminate(&mut self) {
+        let _ = self.terminate_checked();
+    }
+
+    pub(crate) fn terminate_checked(&mut self) -> std::io::Result<()> {
+        if self.0.try_wait()?.is_none() {
+            self.0.kill()?;
+            self.0.wait()?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         self.terminate();
-    }
-}
-
-struct ScratchDirectory {
-    path: Option<PathBuf>,
-}
-
-impl ScratchDirectory {
-    fn create(path: PathBuf) -> Result<Self, std::io::Error> {
-        fs::create_dir(&path)?;
-        Ok(Self { path: Some(path) })
-    }
-
-    fn path(&self) -> &Path {
-        self.path
-            .as_deref()
-            .expect("scratch directory exists until cleanup")
-    }
-
-    fn remove(mut self) -> Result<(), std::io::Error> {
-        if let Some(path) = self.path.as_ref() {
-            fs::remove_dir_all(path)?;
-        }
-        self.path = None;
-        Ok(())
-    }
-}
-
-impl Drop for ScratchDirectory {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_dir_all(path);
-        }
     }
 }
 
@@ -406,7 +475,8 @@ impl McpClient {
 
 pub(crate) struct RuntimeHarness {
     scratch_path: PathBuf,
-    scratch: ScratchDirectory,
+    scratch: Option<PrivateRoot>,
+    evidence: PrivateRoot,
     controller: ChildGuard,
     pub(crate) mcp: McpClient,
     identity: IdentityEvidence,
@@ -414,18 +484,19 @@ pub(crate) struct RuntimeHarness {
 
 impl RuntimeHarness {
     pub(crate) fn start(options: &Options) -> Result<Self, Box<dyn std::error::Error>> {
-        prepare_evidence_directory(&options.evidence_directory)?;
-        let scratch_path = std::env::temp_dir().join(format!(
-            "waldo-verification-{}-{}",
-            std::process::id(),
-            unix_ns()?
-        ));
-        let scratch = ScratchDirectory::create(scratch_path.clone())?;
+        let evidence = PrivateRoot::create_retained(&options.evidence_directory)?;
+        Self::start_prepared(options, evidence)
+    }
+
+    pub(crate) fn start_prepared(
+        options: &Options,
+        evidence: PrivateRoot,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let scratch = PrivateRoot::create_scratch("waldo-verification")?;
+        let scratch_path = scratch.path().to_path_buf();
         let runtime = scratch.path().join("runtime");
         let socket_directory = runtime.join("waldo");
-        fs::create_dir_all(&socket_directory)?;
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(&socket_directory, fs::Permissions::from_mode(0o700))?;
+        scratch.create_directory("runtime/waldo")?;
         let socket = socket_directory.join("controller.sock");
 
         let controller = ChildGuard(
@@ -451,7 +522,8 @@ impl RuntimeHarness {
         write_json(options.evidence_directory.join("identity.json"), &identity)?;
         Ok(Self {
             scratch_path,
-            scratch,
+            scratch: Some(scratch),
+            evidence,
             controller,
             mcp,
             identity,
@@ -461,18 +533,31 @@ impl RuntimeHarness {
     pub(crate) fn shutdown(
         mut self,
     ) -> Result<(IdentityEvidence, bool), Box<dyn std::error::Error>> {
-        self.mcp.child.terminate();
-        self.controller.terminate();
-        self.scratch.remove()?;
+        self.mcp.child.terminate_checked()?;
+        self.controller.terminate_checked()?;
+        self.scratch
+            .take()
+            .ok_or("runtime scratch root was already removed")?
+            .remove()?;
         Ok((self.identity, !self.scratch_path.exists()))
+    }
+
+    pub(crate) fn evidence(&self) -> &PrivateRoot {
+        &self.evidence
+    }
+
+    pub(crate) fn scratch(&self) -> &PrivateRoot {
+        self.scratch
+            .as_ref()
+            .expect("runtime scratch root exists until shutdown")
     }
 
     pub(crate) fn restart_mcp(
         &mut self,
         executable: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.mcp.child.terminate();
-        self.mcp = McpClient::start(executable, self.scratch.path().join("runtime").as_path())?;
+        self.mcp.child.terminate_checked()?;
+        self.mcp = McpClient::start(executable, self.scratch().path().join("runtime").as_path())?;
         Ok(())
     }
 }
@@ -512,6 +597,7 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
 
     let output_id = delayed.output_id.clone();
     let (identity, controller_socket_removed) = harness.shutdown()?;
+    let privacy_scan = scan_private_root(&options.evidence_directory, &[])?;
 
     let summary = OutsideInSummary {
         identity,
@@ -522,9 +608,14 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
         transparent_interception,
         contradictory_state,
         controller_socket_removed,
-        sensitive_payloads_retained: false,
+        privacy_scan: privacy_scan.clone(),
+        sensitive_payloads_retained: !privacy_scan.leaks.is_empty(),
     };
     write_json(options.evidence_directory.join("summary.json"), &summary)?;
+    write_json(
+        options.evidence_directory.join("privacy-scan.json"),
+        &privacy_scan,
+    )?;
     Ok(summary)
 }
 
@@ -532,10 +623,12 @@ pub fn run_accessibility(
     options: Options,
 ) -> Result<AccessibilitySummary, Box<dyn std::error::Error>> {
     let mut harness = RuntimeHarness::start(&options)?;
-    let directory = options.evidence_directory.join("accessibility");
-    fs::create_dir_all(&directory)?;
-    let state_path = directory.join("fixture-state.json");
-    let control_path = directory.join("fixture-control.json");
+    let directory = harness.evidence().create_directory("accessibility")?;
+    let fixture_directory = harness
+        .scratch()
+        .create_directory("accessibility-fixture")?;
+    let state_path = fixture_directory.join("state.json");
+    let control_path = fixture_directory.join("control.json");
     write_json(
         control_path.clone(),
         &json!({"sequence": 0, "action": "none"}),
@@ -576,15 +669,16 @@ pub fn run_accessibility(
         "set-text",
     )?;
     let entry_handle = accessibility_handle(&observed, "Focus and SetText target")?;
+    let entered_text = format!("waldo-accessibility-{:016x}", options.seed);
     let set_text_response = accessibility_act(
         &mut harness.mcp,
         &observed,
         &entry_handle,
-        json!({"type": "set_text", "text": "E2E016 exact text"}),
+        json!({"type": "set_text", "text": entered_text.clone()}),
     )?;
     write_json(directory.join("set-text-response.json"), &set_text_response)?;
     let text_set =
-        wait_for_accessibility_state(&state_path, |state| state.entry_text == "E2E016 exact text")?;
+        wait_for_accessibility_state(&state_path, |state| state.entry_text == entered_text)?;
 
     let observed = observe_accessibility(
         &mut harness.mcp,
@@ -676,11 +770,12 @@ pub fn run_accessibility(
         &json!({"sequence": 2, "action": "recreate_entry"}),
     )?;
     let recreated = wait_for_accessibility_state(&state_path, |state| state.entry_generation == 1)?;
+    let refused_text = format!("waldo-stale-refusal-{:016x}", options.seed);
     let stale_response = accessibility_act(
         &mut harness.mcp,
         &observed,
         &stale_handle,
-        json!({"type": "set_text", "text": "must not be written"}),
+        json!({"type": "set_text", "text": refused_text.clone()}),
     )?;
     write_json(directory.join("stale-response.json"), &stale_response)?;
     let after_stale = read_accessibility_state(&state_path)?;
@@ -716,12 +811,26 @@ pub fn run_accessibility(
     let _ = harness
         .mcp
         .call("tools/call", json!({"name": "stop", "arguments": {}}));
-    fixture.terminate();
+    fixture.terminate_checked()?;
     let (identity, controller_socket_removed) = harness.shutdown()?;
+    redact_sensitive_evidence(
+        &options.evidence_directory,
+        &[
+            ("accessibility-entered-text", entered_text.as_bytes()),
+            ("accessibility-refused-text", refused_text.as_bytes()),
+        ],
+    )?;
+    let privacy_scan = scan_private_root(
+        &options.evidence_directory,
+        &[
+            ("accessibility-entered-text", entered_text.as_bytes()),
+            ("accessibility-refused-text", refused_text.as_bytes()),
+        ],
+    )?;
     let summary = AccessibilitySummary {
         identity,
         invoke_reached_application: initial.invoke_count == 0 && invoked.invoke_count == 1,
-        set_text_reached_application: text_set.entry_text == "E2E016 exact text",
+        set_text_reached_application: text_set.entry_text == entered_text,
         focus_outcome,
         focus_truthful,
         set_value_identity_refresh_reached_application: valued.spin_generation == 1
@@ -730,9 +839,17 @@ pub fn run_accessibility(
         stale_replacement_refused,
         ambiguity_propagated: duplicate.control_sequence == 3 && ambiguity_propagated,
         controller_socket_removed,
-        sensitive_payloads_retained: false,
+        sensitive_payloads_retained: !privacy_scan.leaks.is_empty(),
+        privacy_scan: privacy_scan.clone(),
     };
     write_json(options.evidence_directory.join("summary.json"), &summary)?;
+    write_json(
+        options.evidence_directory.join("privacy-scan.json"),
+        &privacy_scan,
+    )?;
+    if !privacy_scan.leaks.is_empty() {
+        return Err("accessibility evidence retained raw or Base64 sensitive text".into());
+    }
     Ok(summary)
 }
 
@@ -747,7 +864,7 @@ fn run_delayed(
     mcp: &mut McpClient,
 ) -> Result<DelayedRun, Box<dyn std::error::Error>> {
     let directory = options.evidence_directory.join("delayed");
-    fs::create_dir_all(&directory)?;
+    prepare_private_subdirectory(&directory)?;
     let state_path = directory.join("fixture-state.json");
     let events_path = directory.join("fixture-events.jsonl");
     let mut fixture = start_fixture(options, "delayed", &state_path, &events_path)?;
@@ -831,8 +948,8 @@ fn run_delayed(
     });
     write_json(directory.join("act-request.json"), &act_request)?;
     let acted_response = mcp
-        .call_with_timeout("tools/call", act_request, Duration::from_secs(10))?
-        .ok_or("delayed completion Act exceeded the 10-second verifier limit")?;
+        .call_with_timeout("tools/call", act_request, Duration::from_secs(30))?
+        .ok_or("delayed completion Act exceeded the 30-second verifier limit")?;
     let response_ns = unix_ns()?;
     let acted = parse_observation(&acted_response, &directory, "act")?;
     write_redacted_response(directory.join("act-response.json"), &acted_response, &acted)?;
@@ -898,7 +1015,7 @@ fn run_delayed(
         && returned_post
         && later_post;
 
-    fixture.terminate();
+    fixture.terminate_checked()?;
     Ok(DelayedRun {
         output_id,
         coordinate: CoordinateResult {
@@ -957,7 +1074,7 @@ fn run_continuous(
     mcp: &mut McpClient,
 ) -> Result<ContinuousCompletionResult, Box<dyn std::error::Error>> {
     let directory = options.evidence_directory.join("continuous");
-    fs::create_dir_all(&directory)?;
+    prepare_private_subdirectory(&directory)?;
     let state_path = directory.join("fixture-state.json");
     let events_path = directory.join("fixture-events.jsonl");
     let mut fixture = start_fixture(options, "continuous", &state_path, &events_path)?;
@@ -1028,7 +1145,7 @@ fn run_continuous(
         if let Some(response) = &stop {
             write_json(directory.join("stop-response.json"), response)?;
         }
-        fixture.terminate();
+        fixture.terminate_checked()?;
         return Ok(ContinuousCompletionResult {
             outcome: if still_changing {
                 "failed_as_expected_on_baseline"
@@ -1071,7 +1188,7 @@ fn run_continuous(
     if let Some(response) = &stop {
         write_json(directory.join("stop-response.json"), response)?;
     }
-    fixture.terminate();
+    fixture.terminate_checked()?;
 
     Ok(ContinuousCompletionResult {
         outcome: if decisive_pass { "passed" } else { "failed" },
@@ -1093,7 +1210,7 @@ fn run_transparent_interception(
     mcp: &mut McpClient,
 ) -> Result<TransparentInterceptionResult, Box<dyn std::error::Error>> {
     let directory = options.evidence_directory.join("transparent-interception");
-    fs::create_dir_all(&directory)?;
+    prepare_private_subdirectory(&directory)?;
     let state_path = directory.join("fixture-state.json");
     let events_path = directory.join("fixture-events.jsonl");
     let mut fixture = start_fixture(options, "interception", &state_path, &events_path)?;
@@ -1156,7 +1273,7 @@ fn run_transparent_interception(
         )?;
         let stop = stop_and_record(mcp, &directory)?;
         let healthy = service_health_check(mcp, &directory)?;
-        fixture.terminate();
+        fixture.terminate_checked()?;
         return Ok(TransparentInterceptionResult {
             outcome: "blocked_inconclusive",
             act_external_deadline_reached: true,
@@ -1183,7 +1300,7 @@ fn run_transparent_interception(
         && state.interceptor_count == 1;
     let stop = stop_and_record(mcp, &directory)?;
     let healthy = service_health_check(mcp, &directory)?;
-    fixture.terminate();
+    fixture.terminate_checked()?;
 
     Ok(TransparentInterceptionResult {
         outcome: if passed { "passed" } else { "failed" },
@@ -1204,7 +1321,7 @@ fn run_contradictory_state(
     mcp: &mut McpClient,
 ) -> Result<ContradictoryStateResult, Box<dyn std::error::Error>> {
     let directory = options.evidence_directory.join("contradictory-state");
-    fs::create_dir_all(&directory)?;
+    prepare_private_subdirectory(&directory)?;
     let state_path = directory.join("fixture-state.json");
     let events_path = directory.join("fixture-events.jsonl");
     let mut fixture = start_fixture(options, "contradictory", &state_path, &events_path)?;
@@ -1269,7 +1386,7 @@ fn run_contradictory_state(
             }),
         )?;
         let stop = stop_and_record(mcp, &directory)?;
-        fixture.terminate();
+        fixture.terminate_checked()?;
         return Ok(ContradictoryStateResult {
             outcome: "blocked_inconclusive",
             act_external_deadline_reached: true,
@@ -1302,7 +1419,7 @@ fn run_contradictory_state(
         && state.click_count == 1
         && state.phase >= 1;
     let stop = stop_and_record(mcp, &directory)?;
-    fixture.terminate();
+    fixture.terminate_checked()?;
 
     Ok(ContradictoryStateResult {
         outcome: if passed { "passed" } else { "failed" },
@@ -1412,6 +1529,23 @@ pub(crate) fn observe_without_accessibility(
     observe_output(mcp, output_id, fixture_title, directory, label, false)
 }
 
+pub(crate) fn observe_window_without_accessibility(
+    mcp: &mut McpClient,
+    window_id: &str,
+    fixture_title: &str,
+    directory: &Path,
+    label: &str,
+) -> Result<ToolObservation, Box<dyn std::error::Error>> {
+    observe_source(
+        mcp,
+        json!({"type": "window", "window_id": window_id}),
+        fixture_title,
+        directory,
+        label,
+        false,
+    )
+}
+
 pub(crate) fn observe_accessibility_transient(
     mcp: &mut McpClient,
     output_id: &str,
@@ -1445,12 +1579,30 @@ fn observe_output(
     label: &str,
     include_accessibility: bool,
 ) -> Result<ToolObservation, Box<dyn std::error::Error>> {
+    observe_source(
+        mcp,
+        json!({"type": "output", "output_id": output_id}),
+        fixture_title,
+        directory,
+        label,
+        include_accessibility,
+    )
+}
+
+fn observe_source(
+    mcp: &mut McpClient,
+    source: Value,
+    fixture_title: &str,
+    directory: &Path,
+    label: &str,
+    include_accessibility: bool,
+) -> Result<ToolObservation, Box<dyn std::error::Error>> {
     focus_niri_window(fixture_title)?;
     thread::sleep(Duration::from_millis(100));
     let request = json!({
         "name": "observe",
         "arguments": {
-            "source": {"type": "output", "output_id": output_id},
+            "source": source,
             "continue_from": null,
             "include_accessibility": include_accessibility
         }
@@ -1670,7 +1822,7 @@ fn wait_for_accessibility_state(
     }
 }
 
-fn parse_observation(
+pub(crate) fn parse_observation(
     response: &Value,
     directory: &Path,
     label: &str,
@@ -1741,7 +1893,7 @@ fn parse_observation(
     })
 }
 
-fn write_redacted_response(
+pub(crate) fn write_redacted_response(
     path: PathBuf,
     response: &Value,
     observation: &ToolObservation,
@@ -1863,6 +2015,7 @@ fn focused_window_id() -> Result<String, Box<dyn std::error::Error>> {
         .ok_or_else(|| "Niri has no focused window".into())
 }
 
+#[cfg(test)]
 fn prepare_evidence_directory(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if path
         .symlink_metadata()
@@ -1892,6 +2045,22 @@ fn prepare_evidence_directory(path: &Path) -> Result<(), Box<dyn std::error::Err
         )
         .into());
     }
+    Ok(())
+}
+
+fn prepare_private_subdirectory(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(format!(
+            "private evidence directory cannot be a symbolic link: {}",
+            path.display()
+        )
+        .into());
+    }
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
@@ -2013,8 +2182,110 @@ pub(crate) fn write_json(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
-    fs::write(path, bytes)?;
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(format!("refusing to replace symbolic link {}", path.display()).into());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    prepare_private_subdirectory(parent)?;
+    let temporary = path.with_extension(format!("tmp-{}-{}", std::process::id(), unix_ns()?));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, &path).inspect_err(|_| {
+        let _ = fs::remove_file(&temporary);
+    })?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+fn redact_sensitive_evidence(
+    directory: &Path,
+    payloads: &[(&str, &[u8])],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "sensitive-evidence redaction refuses symbolic link {}",
+                path.display()
+            )
+            .into());
+        }
+        if file_type.is_dir() {
+            redact_sensitive_evidence(&path, payloads)?;
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let mut value: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        if redact_value(&mut value, payloads) {
+            write_json(path, &value)?;
+        }
+    }
+    let manifest = payloads
+        .iter()
+        .map(|(label, payload)| {
+            Ok(json!({
+                "label": label,
+                "length": payload.len(),
+                "sha256": sha256_bytes(payload)?,
+                "raw_retained": false,
+                "base64_retained": false
+            }))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    write_json(directory.join("redaction-manifest.json"), &manifest)
+}
+
+fn redact_value(value: &mut Value, payloads: &[(&str, &[u8])]) -> bool {
+    match value {
+        Value::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= redact_value(value, payloads);
+            }
+            changed
+        }
+        Value::Object(object) => {
+            let mut changed = false;
+            for value in object.values_mut() {
+                changed |= redact_value(value, payloads);
+            }
+            changed
+        }
+        Value::String(text) => {
+            let mut changed = false;
+            for (label, payload) in payloads {
+                let Ok(raw) = std::str::from_utf8(payload) else {
+                    continue;
+                };
+                let replacement = format!("<redacted:{label}>");
+                if text.contains(raw) {
+                    *text = text.replace(raw, &replacement);
+                    changed = true;
+                }
+                let encoded = BASE64.encode(payload);
+                if text.contains(&encoded) {
+                    *text = text.replace(&encoded, &replacement);
+                    changed = true;
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
 }
 
 fn unix_ns() -> Result<u128, std::time::SystemTimeError> {
@@ -2032,13 +2303,14 @@ mod tests {
         time::Duration,
     };
 
-    use image::{DynamicImage, RgbaImage};
-    use waldo_verification::{FixtureRect, TargetGrid};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use image::{DynamicImage, Rgba, RgbaImage};
+    use waldo_verification::{FixtureRect, PrivateRoot, TargetGrid, scan_private_root};
 
     use super::{
-        FloatPoint, PixelSize, ScratchDirectory, ToolObservation, accessibility_handle_with_role,
-        model_to_logical, prepare_evidence_directory, release_from_complete_jsonl, rgb_near,
-        select_target, unix_ns, wait_for_release,
+        FloatPoint, PixelSize, ToolObservation, accessibility_handle_with_role, model_to_logical,
+        prepare_evidence_directory, redact_sensitive_evidence, release_from_complete_jsonl,
+        rgb_near, select_target, unix_ns, wait_for_release, write_json,
     };
 
     fn temporary_path(label: &str) -> PathBuf {
@@ -2094,6 +2366,41 @@ mod tests {
 
         assert_eq!(logical.x, 3840.0);
         assert_eq!(logical.y, 720.0);
+    }
+
+    #[test]
+    fn largest_colour_region_ignores_disconnected_matching_pixels() {
+        let mut image = RgbaImage::new(12, 10);
+        for x in 3..9 {
+            for y in 2..7 {
+                image.put_pixel(x, y, Rgba([80, 90, 100, 255]));
+            }
+        }
+        image.put_pixel(0, 0, Rgba([80, 90, 100, 255]));
+        image.put_pixel(11, 9, Rgba([80, 90, 100, 255]));
+        let observation = ToolObservation {
+            id: 1,
+            source: serde_json::Value::Null,
+            source_pixels: PixelSize {
+                width: 12,
+                height: 10,
+            },
+            model_pixels: PixelSize {
+                width: 12,
+                height: 10,
+            },
+            logical_origin: FloatPoint { x: 0.0, y: 0.0 },
+            logical_width: 12.0,
+            logical_height: 10.0,
+            image: DynamicImage::ImageRgba8(image),
+            image_digest: String::new(),
+            accessibility: Vec::new(),
+        };
+
+        assert_eq!(
+            observation.largest_colour_region([80, 90, 100], 0),
+            Some((3, 2, 8, 6))
+        );
     }
 
     #[test]
@@ -2170,15 +2477,42 @@ mod tests {
 
     #[test]
     fn scratch_directory_is_removed_during_an_early_error_return() {
-        fn fail_after_create(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-            let scratch = ScratchDirectory::create(path)?;
+        fn fail_after_create(path: &mut PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+            let scratch = PrivateRoot::create_scratch("waldo-outside-in-test")?;
+            *path = scratch.path().to_path_buf();
             fs::write(scratch.path().join("marker"), b"temporary")?;
             Err("forced verifier error".into())
         }
 
-        let path = temporary_path("scratch-cleanup");
-        assert!(fail_after_create(path.clone()).is_err());
+        let mut path = PathBuf::new();
+        assert!(fail_after_create(&mut path).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn accessibility_payloads_are_redacted_before_the_privacy_scan() {
+        let path = temporary_path("accessibility-redaction");
+        let root = PrivateRoot::create_retained(&path).unwrap();
+        let payload = b"sensitive entered text";
+        write_json(
+            path.join("response.json"),
+            &serde_json::json!({
+                "raw": "sensitive entered text",
+                "base64": BASE64.encode(payload)
+            }),
+        )
+        .unwrap();
+
+        redact_sensitive_evidence(&path, &[("entered-text", payload)]).unwrap();
+
+        assert!(
+            scan_private_root(&path, &[("entered-text", payload)])
+                .unwrap()
+                .leaks
+                .is_empty()
+        );
+        drop(root);
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

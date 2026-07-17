@@ -12,6 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use waldo_clipboard::{ClipboardExecutor, ClipboardSnapshot};
+use waldo_verification::{PrivacyScan, scan_private_root};
 
 use crate::outside_in::{
     McpClient, Options, RuntimeHarness, accessibility_action, accessibility_handle_with_role,
@@ -32,6 +33,7 @@ pub struct ClipboardSummary {
     cleanup: CleanupEvidence,
     keep: KeepEvidence,
     controller_socket_removed: bool,
+    privacy_scan: PrivacyScan,
     generated_payload_leaks: usize,
     sensitive_payloads_retained: bool,
 }
@@ -794,7 +796,12 @@ pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Err
     fixture.0.wait()?;
     transient.remove()?;
     let (_, controller_socket_removed) = harness.shutdown()?;
-    let leaks = count_payload_leaks(&options.evidence_directory, &generated_payloads)?;
+    let payloads: Vec<_> = generated_payloads
+        .iter()
+        .map(|payload| ("generated-clipboard-payload", payload.as_slice()))
+        .collect();
+    let privacy_scan = scan_private_root(&options.evidence_directory, &payloads)?;
+    let leaks = privacy_scan.leaks.len();
     let summary = ClipboardSummary {
         atomic_offer: AtomicOfferEvidence {
             advertised_mime_order: advertised_atomic_order,
@@ -848,10 +855,15 @@ pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Err
             restore_after_keep_failed_without_mutation,
         },
         controller_socket_removed,
+        privacy_scan: privacy_scan.clone(),
         generated_payload_leaks: leaks,
         sensitive_payloads_retained: leaks != 0,
     };
     write_json(options.evidence_directory.join("summary.json"), &summary)?;
+    write_json(
+        options.evidence_directory.join("privacy-scan.json"),
+        &privacy_scan,
+    )?;
     if !summary.atomic_offer.requested_order_preserved
         || !summary.atomic_offer.invalid_mime_refused_without_mutation
         || !summary.direct_values.utf8_exact
@@ -1322,33 +1334,6 @@ fn read_and_remove_secret(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Er
     drop(file);
     fs::remove_file(path)?;
     Ok(secret)
-}
-
-fn count_payload_leaks(
-    directory: &Path,
-    payloads: &[Vec<u8>],
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let mut leaks = 0;
-    for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            leaks += count_payload_leaks(&path, payloads)?;
-            continue;
-        }
-        let bytes = fs::read(path)?;
-        for payload in payloads.iter().filter(|payload| !payload.is_empty()) {
-            leaks += bytes
-                .windows(payload.len())
-                .filter(|window| *window == payload.as_slice())
-                .count();
-            let encoded = BASE64.encode(payload);
-            leaks += bytes
-                .windows(encoded.len())
-                .filter(|window| *window == encoded.as_bytes())
-                .count();
-        }
-    }
-    Ok(leaks)
 }
 
 fn path_text(path: &Path) -> Result<&str, Box<dyn std::error::Error>> {

@@ -8,6 +8,7 @@
     {"name": "window", "file": "window.json", "families": ["window"]},
     {"name": "workspace", "file": "workspace.json", "families": ["workspace"]},
     {"name": "wait-capture", "file": "wait-capture.json", "families": ["wait", "capture"]},
+    {"name": "coherent-act", "file": "coherent-act.json", "families": ["pointer", "drag", "click", "text", "wait", "capture"]},
     {"name": "invalid-order", "file": "invalid-order.json", "families": ["structured-error"]},
     {"name": "stopped-batch", "file": "stopped-batch.json", "families": ["stop"], "stop_after_ms": 25}
   ],

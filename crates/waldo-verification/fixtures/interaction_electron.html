@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Waldo Electron Interaction Oracle</title>
+  <style>
+    body { margin: 18px; font: 16px system-ui; display: grid; gap: 12px; }
+    h1 { text-align: center; }
+    #surface { min-height: 340px; border: 5px solid white; touch-action: none; }
+    input, select, button { font: inherit; padding: 10px; }
+  </style>
+</head>
+<body>
+  <h1 id="marker"></h1>
+  <div id="surface" tabindex="0" aria-label="Interaction surface"></div>
+  <input id="entry" placeholder="Deterministic text and keyboard consumer">
+  <select id="selection"><option>Alpha</option><option>Beta</option><option>Gamma</option></select>
+  <button id="delayed">Complete after a deterministic delay</button>
+  <script>
+    "use strict";
+    const fs = require("node:fs");
+    const crypto = require("node:crypto");
+    const query = new URLSearchParams(location.search);
+    const descriptor = JSON.parse(query.get("descriptor"));
+    document.title = descriptor.title;
+    const statePath = query.get("state");
+    const eventsPath = query.get("events");
+    const controlPath = query.get("control");
+    const sha256 = value => crypto.createHash("sha256").update(value, "utf8").digest("hex");
+    const counters = {
+      pointer_moves: 0, pointer_presses: 0, pointer_releases: 0, clicks: 0,
+      drags: 0, horizontal_scrolls: 0, vertical_scrolls: 0,
+      key_presses: 0, key_releases: 0, text_changes: 0, delayed_completions: 0,
+    };
+    let sequence = 0;
+    let controlSequence = 0;
+    let phase = "starting";
+    let focusedControl = null;
+    let textLength = 0;
+    let textSha256 = null;
+    let selection = "Alpha";
+    let pointerOrigin = null;
+    let dragged = false;
+    let inputOrigin = { x: null, y: null };
+
+    function atomicJson(target, value) {
+      const temporary = `${target}.tmp`;
+      fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+      fs.chmodSync(temporary, 0o600);
+      fs.renameSync(temporary, target);
+      fs.chmodSync(target, 0o600);
+    }
+
+    function writeState() {
+      const targetRect = element => {
+        const bounds = element.getBoundingClientRect();
+        return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
+      };
+      atomicJson(statePath, {
+        descriptor,
+        runtime_backend: "ozone-wayland",
+        recorded_at_unix_ns: Date.now() * 1000000,
+        sequence,
+        ready: phase !== "starting",
+        phase,
+        focused_control: focusedControl,
+        text_length: textLength,
+        text_sha256: textSha256,
+        selection,
+        counters,
+        target_geometry: {
+          screen_x: inputOrigin.x,
+          screen_y: inputOrigin.y,
+          surface: targetRect(surface),
+          entry: targetRect(entry),
+        },
+      });
+    }
+
+    function record(kind, control, values = {}) {
+      sequence += 1;
+      const event = {
+        schema_version: 1,
+        fixture_version: "1",
+        toolkit: descriptor.toolkit,
+        display_route: descriptor.display_route,
+        seed: descriptor.seed,
+        sequence,
+        recorded_at_unix_ns: Date.now() * 1000000,
+        kind,
+        control,
+        x: values.x ?? null,
+        y: values.y ?? null,
+        button: values.button ?? null,
+        horizontal_delta: values.horizontalDelta ?? null,
+        vertical_delta: values.verticalDelta ?? null,
+        physical_key: values.physicalKey ?? null,
+        logical_key_sha256: values.logicalKey ? sha256(values.logicalKey) : null,
+        modifiers: [...(values.modifiers ?? [])].sort(),
+        text_length: values.textLength ?? null,
+        text_sha256: values.textSha256 ?? null,
+      };
+      fs.appendFileSync(eventsPath, `${JSON.stringify(event)}\n`, { mode: 0o600 });
+      fs.chmodSync(eventsPath, 0o600);
+      writeState();
+    }
+
+    function modifiers(event) {
+      return [
+        [event.shiftKey, "shift"], [event.ctrlKey, "control"],
+        [event.altKey, "alt"], [event.metaKey, "super"],
+      ].filter(([active]) => active).map(([, name]) => name);
+    }
+
+    const marker = document.querySelector("#marker");
+    const surface = document.querySelector("#surface");
+    const entry = document.querySelector("#entry");
+    const selectionControl = document.querySelector("#selection");
+    marker.textContent = `ELECTRON-${descriptor.seed.toString(16).padStart(8, "0")}`;
+    surface.style.background = `rgb(${32 + descriptor.seed * 17 % 192}, ${32 + descriptor.seed * 29 % 192}, ${32 + descriptor.seed * 43 % 192})`;
+    fs.closeSync(fs.openSync(eventsPath, "a", 0o600));
+    fs.chmodSync(eventsPath, 0o600);
+
+    surface.addEventListener("pointermove", event => {
+      counters.pointer_moves += 1;
+      if (pointerOrigin) {
+        dragged ||= Math.abs(event.clientX - pointerOrigin.x) + Math.abs(event.clientY - pointerOrigin.y) >= 12;
+      }
+      record("pointer_moved", "interaction-surface", { x: event.offsetX, y: event.offsetY });
+    });
+    document.addEventListener("pointermove", event => {
+      inputOrigin.x = event.screenX - event.clientX;
+      inputOrigin.y = event.screenY - event.clientY;
+      writeState();
+    }, { capture: true });
+    surface.addEventListener("pointerdown", event => {
+      pointerOrigin = { x: event.clientX, y: event.clientY };
+      dragged = false;
+      counters.pointer_presses += 1;
+      record("pointer_pressed", "interaction-surface", { x: event.offsetX, y: event.offsetY, button: event.button + 1 });
+    });
+    surface.addEventListener("pointerup", event => {
+      counters.pointer_releases += 1;
+      counters.clicks += 1;
+      if (dragged) counters.drags += 1;
+      record("pointer_released", "interaction-surface", { x: event.offsetX, y: event.offsetY, button: event.button + 1 });
+      pointerOrigin = null;
+    });
+    surface.addEventListener("wheel", event => {
+      if (event.deltaX) counters.horizontal_scrolls += 1;
+      if (event.deltaY) counters.vertical_scrolls += 1;
+      record("scrolled", "interaction-surface", { horizontalDelta: event.deltaX, verticalDelta: event.deltaY });
+      event.preventDefault();
+    }, { passive: false });
+    entry.addEventListener("keydown", event => {
+      counters.key_presses += 1;
+      record("key_pressed", "text-entry", { physicalKey: event.code, logicalKey: event.key, modifiers: modifiers(event) });
+    });
+    entry.addEventListener("keyup", event => {
+      counters.key_releases += 1;
+      record("key_released", "text-entry", { physicalKey: event.code, logicalKey: event.key, modifiers: modifiers(event) });
+    });
+    entry.addEventListener("input", () => {
+      textLength = [...entry.value].length;
+      textSha256 = entry.value ? sha256(entry.value) : null;
+      counters.text_changes += 1;
+      record("text_changed", "text-entry", { textLength, textSha256 });
+    });
+    entry.addEventListener("focus", () => { focusedControl = "text-entry"; record("focus_changed", "text-entry"); });
+    entry.addEventListener("blur", () => { focusedControl = null; record("focus_changed", "text-entry"); });
+    selectionControl.addEventListener("change", () => { selection = selectionControl.value; record("selection_changed", "selection"); });
+    document.querySelector("#delayed").addEventListener("click", () => {
+      phase = "pending";
+      record("delayed_state_started", "delayed-action");
+      setTimeout(() => { phase = "complete"; counters.delayed_completions += 1; record("delayed_state_completed", "delayed-action"); }, 500);
+    });
+
+    setInterval(() => {
+      try {
+        const command = JSON.parse(fs.readFileSync(controlPath, "utf8"));
+        if (Number(command.sequence ?? 0) <= controlSequence) return;
+        controlSequence = Number(command.sequence);
+        if (command.action === "reset") {
+          entry.value = ""; phase = "ready"; focusedControl = null;
+          textLength = 0; textSha256 = null; selection = "Alpha";
+          selectionControl.value = "Alpha";
+          Object.keys(counters).forEach(name => { counters[name] = 0; });
+          record("fixture_reset", "fixture");
+        } else if (command.action === "complete_delayed_state") {
+          phase = "complete"; counters.delayed_completions += 1;
+          record("delayed_state_completed", "delayed-action");
+        } else if (command.action === "quit") {
+          window.close();
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+      }
+    }, 50);
+
+    phase = "ready";
+    writeState();
+  </script>
+</body>
+</html>

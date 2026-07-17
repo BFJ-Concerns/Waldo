@@ -1,0 +1,55 @@
+{
+  "observation_id": 0,
+  "actions": [
+    {
+      "type": "pointer_move_absolute",
+      "position": {
+        "x": 200.0,
+        "y": 200.0
+      }
+    },
+    {
+      "type": "pointer_drag",
+      "from": {
+        "x": 200.0,
+        "y": 200.0
+      },
+      "to": {
+        "x": 240.0,
+        "y": 220.0
+      },
+      "button": "primary",
+      "duration_ms": 120
+    },
+    {
+      "type": "pointer_click",
+      "position": {
+        "x": 200.0,
+        "y": 260.0
+      },
+      "button": "primary",
+      "count": 1
+    },
+    {
+      "type": "text",
+      "text": "coherent-v2",
+      "route": "virtual_keyboard"
+    },
+    {
+      "type": "wait",
+      "predicate": {
+        "type": "process_exited",
+        "pid": 4294967295
+      },
+      "timeout_ms": 2000
+    },
+    {
+      "type": "capture",
+      "source": {
+        "type": "output",
+        "output_id": "PARITY-1"
+      }
+    }
+  ],
+  "verification": []
+}
