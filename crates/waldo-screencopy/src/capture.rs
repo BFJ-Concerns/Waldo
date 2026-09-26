@@ -19,7 +19,7 @@ use crate::{
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One completed in-memory output capture.
+/// One completed in-memory capture, oriented to the output's logical desktop.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Capture {
     pub png: Vec<u8>,
@@ -93,7 +93,11 @@ impl Screencopy {
                     &handle,
                     (),
                 );
-                state.outputs.push(OutputRecord { output, name: None });
+                state.outputs.push(OutputRecord {
+                    output,
+                    name: None,
+                    transform: None,
+                });
             }
         });
         queue
@@ -103,8 +107,11 @@ impl Screencopy {
             .outputs
             .iter()
             .find(|output| output.name.as_deref() == Some(output_name))
-            .map(|output| output.output.clone())
             .ok_or_else(|| CaptureError::OutputMissing(output_name.to_owned()))?;
+        state.transform = output.transform.ok_or_else(|| {
+            CaptureError::Wayland("output did not report a supported transform".into())
+        })?;
+        let output = output.output.clone();
 
         let frame = match region {
             Some((x, y, width, height)) => manager.capture_output_region(
@@ -174,6 +181,7 @@ fn dispatch_until(
 struct OutputRecord {
     output: wl_output::WlOutput,
     name: Option<String>,
+    transform: Option<wl_output::Transform>,
 }
 
 struct BufferOffer {
@@ -190,6 +198,7 @@ struct State {
     offer: Option<BufferOffer>,
     buffer: Option<ShmBuffer>,
     y_inverted: bool,
+    transform: wl_output::Transform,
     result: Option<Result<Capture, CaptureError>>,
 }
 
@@ -202,6 +211,7 @@ impl State {
             offer: None,
             buffer: None,
             y_inverted: false,
+            transform: wl_output::Transform::Normal,
             result: None,
         }
     }
@@ -253,10 +263,17 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         _connection: &Connection,
         _queue: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event
-            && let Some(record) = state.outputs.iter_mut().find(|item| item.output == *proxy)
-        {
-            record.name = Some(name);
+        if let Some(record) = state.outputs.iter_mut().find(|item| item.output == *proxy) {
+            match event {
+                wl_output::Event::Name { name } => record.name = Some(name),
+                wl_output::Event::Geometry { transform, .. } => {
+                    record.transform = match transform {
+                        WEnum::Value(transform) => Some(transform),
+                        WEnum::Unknown(_) => None,
+                    };
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -340,12 +357,14 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                     Some(buffer) => captured_at_unix_ms
                         .map_err(|error| CaptureError::Wayland(error.to_string()))
                         .and_then(|captured_at_unix_ms| {
-                            encode::png(buffer, state.y_inverted).map(|png| Capture {
-                                png,
-                                width: buffer.width,
-                                height: buffer.height,
-                                captured_at_unix_ms,
-                            })
+                            encode::png(buffer, state.y_inverted, state.transform).map(
+                                |(png, width, height)| Capture {
+                                    png,
+                                    width,
+                                    height,
+                                    captured_at_unix_ms,
+                                },
+                            )
                         }),
                     None => Err(CaptureError::InvalidBuffer(
                         "ready arrived before a copy buffer was created".into(),

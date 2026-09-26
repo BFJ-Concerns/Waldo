@@ -11,7 +11,8 @@ use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
 use waldo_controller::ExecutionToken;
 use waldo_niri::NiriInspector;
 use waldo_protocol::{
-    Action, ActionRoute, ErrorCode, InputState, LogicalPoint, PointerButton, ProtocolError,
+    Action, ActionRoute, ErrorCode, InputState, LogicalPoint, OutputTransform, PointerButton,
+    ProtocolError,
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle,
@@ -480,16 +481,27 @@ impl PreparedPoint {
         let output = geometry.output_at(point).ok_or_else(|| {
             invalid("pointer position lies outside every active output in the desktop layout")
         })?;
-        let width = extent(output.logical_bounds.width, "output width")?;
-        let height = extent(output.logical_bounds.height, "output height")?;
+        let bounds = output.logical_bounds;
+        let (width, height) = (bounds.width, bounds.height);
+        let (x, y) = (point.x - bounds.origin.x, point.y - bounds.origin.y);
+        // Niri applies the output transform to output-bound absolute input.
+        // Send its inverse in the untransformed output extent.
+        let (x, y, width, height) = match output.transform {
+            OutputTransform::Normal => (x, y, width, height),
+            OutputTransform::Rotate90 => (y, width - x, height, width),
+            OutputTransform::Rotate180 => (width - x, height - y, width, height),
+            OutputTransform::Rotate270 => (height - y, x, height, width),
+            OutputTransform::Flipped => (width - x, y, width, height),
+            OutputTransform::Flipped90 => (y, x, height, width),
+            OutputTransform::Flipped180 => (x, height - y, width, height),
+            OutputTransform::Flipped270 => (height - y, width - x, height, width),
+        };
+        let width = extent(width, "output width")?;
+        let height = extent(height, "output height")?;
         Ok(Self {
             output: output.name.clone(),
-            x: coordinate(point.x - output.logical_bounds.origin.x, width, "pointer x")?,
-            y: coordinate(
-                point.y - output.logical_bounds.origin.y,
-                height,
-                "pointer y",
-            )?,
+            x: coordinate(x, width, "pointer x")?,
+            y: coordinate(y, height, "pointer y")?,
             width,
             height,
         })
@@ -716,6 +728,41 @@ mod tests {
     use waldo_protocol::{
         LogicalPoint, LogicalRect, OutputId, OutputState, OutputTransform, PointerButton,
     };
+
+    #[test]
+    fn absolute_points_undo_the_output_transform_before_dispatch() {
+        let cases = [
+            (OutputTransform::Normal, (100, 60, 800, 600)),
+            (OutputTransform::Rotate90, (60, 700, 600, 800)),
+            (OutputTransform::Rotate180, (700, 540, 800, 600)),
+            (OutputTransform::Rotate270, (540, 100, 600, 800)),
+            (OutputTransform::Flipped, (700, 60, 800, 600)),
+            (OutputTransform::Flipped90, (60, 100, 600, 800)),
+            (OutputTransform::Flipped180, (100, 540, 800, 600)),
+            (OutputTransform::Flipped270, (540, 700, 600, 800)),
+        ];
+        for (transform, expected) in cases {
+            let mut output = output("transformed", -1200.0, 300.0, 800.0, 600.0);
+            output.transform = transform;
+            output.scale = 1.5;
+            let geometry = DesktopGeometry {
+                outputs: vec![output],
+            };
+            let point = PreparedPoint::new(
+                LogicalPoint {
+                    x: -1100.0,
+                    y: 360.0,
+                },
+                &geometry,
+            )
+            .unwrap();
+            assert_eq!(
+                (point.x, point.y, point.width, point.height),
+                expected,
+                "{transform:?}"
+            );
+        }
+    }
 
     #[test]
     fn desktop_coordinates_are_grounded_to_the_containing_output() {
