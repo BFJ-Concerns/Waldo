@@ -21,10 +21,10 @@ waldo query --include-windows
 The installer builds `waldod`, `waldo` and `waldo-mcp`, enables the user service,
 installs the personal plugin and records the discovered environment at
 `${XDG_STATE_HOME:-$HOME/.local/state}/waldo/environment.json`.
-It currently requires Cargo, Codex, Git, jq, realpath, ripgrep, rsync, sha256sum and
+It currently requires Cargo, Codex, Git, jq, realpath, rsync, sha256sum and
 systemctl on `PATH`, plus an authenticated Codex session for its installation
 proof. When Claude Code is present, canonical installation also registers the
-plugin there. The installer still uses Codex to verify skill loading and MCP
+plugin there. The installer still uses Codex to verify plugin loading and MCP
 image delivery; a Claude-Code-only installation is not yet supported.
 
 `WALDO_INSTALL_ROOT` selects a disposable installation tree and a separate

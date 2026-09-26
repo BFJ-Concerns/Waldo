@@ -291,6 +291,7 @@ if [[ "$install_mode" == canonical ]] && command -v claude >/dev/null; then
     claude plugin marketplace update personal 2>/dev/null \
         || claude plugin marketplace add "$claude_marketplace_root"
     claude plugin install waldo@personal
+    claude plugin update waldo@personal
 fi
 
 failure_stage="controller readiness"
@@ -318,29 +319,21 @@ fi
 jq -e '.type == "queried" and (.result.outputs | length) > 0' "$query_output" >/dev/null
 
 failure_stage="installed stock-Codex plugin and first-image proof"
-mapfile -t installed_skills < <(
-    rg --files "$codex_home/plugins/cache/personal/waldo" \
-        | rg '/skills/desktop-control/SKILL\.md$' \
+mapfile -t installed_plugin_manifests < <(
+    find "$codex_home/plugins/cache/personal/waldo" -path '*/.codex-plugin/plugin.json' \
         | sort
 )
-if [[ ${#installed_skills[@]} -eq 0 ]]; then
-    printf 'Codex installed no desktop-control skill beneath %s.\n' "$codex_home/plugins/cache/personal/waldo" >&2
+if [[ ${#installed_plugin_manifests[@]} -eq 0 ]]; then
+    printf 'Codex installed no waldo plugin beneath %s.\n' "$codex_home/plugins/cache/personal/waldo" >&2
     exit 1
 fi
-installed_skill="${installed_skills[${#installed_skills[@]}-1]}"
-installed_plugin_root="$(dirname -- "$(dirname -- "$(dirname -- "$installed_skill")")")"
-installed_plugin_manifest="$installed_plugin_root/.codex-plugin/plugin.json"
+installed_plugin_manifest="${installed_plugin_manifests[${#installed_plugin_manifests[@]}-1]}"
+installed_plugin_root="$(dirname -- "$(dirname -- "$installed_plugin_manifest")")"
 installed_mcp_manifest="$installed_plugin_root/.mcp.json"
-for installed_file in "$installed_skill" "$installed_plugin_manifest" "$installed_mcp_manifest"; do
-    if [[ ! -f "$installed_file" ]]; then
-        printf 'Installed plugin proof is missing %s.\n' "$installed_file" >&2
-        exit 1
-    fi
-done
-cmp -s "$plugin_home/skills/desktop-control/SKILL.md" "$installed_skill" || {
-    printf 'Installed Codex skill bytes do not match the candidate plugin.\n' >&2
+if [[ ! -f "$installed_mcp_manifest" ]]; then
+    printf 'Installed plugin proof is missing %s.\n' "$installed_mcp_manifest" >&2
     exit 1
-}
+fi
 cmp -s "$plugin_home/.mcp.json" "$installed_mcp_manifest" || {
     printf 'Installed Codex MCP manifest bytes do not match the candidate plugin.\n' >&2
     exit 1
@@ -348,7 +341,7 @@ cmp -s "$plugin_home/.mcp.json" "$installed_mcp_manifest" || {
 
 proof_transcript="$(mktemp)"
 chmod 0600 "$proof_transcript"
-proof_prompt='Use the installed Waldo desktop-control skill. Query Waldo to choose one available output, call Waldo Observe exactly once on that output, then reply with MCP_IMAGE_PROOF_OK. Do not call Act or any mutating tool.'
+proof_prompt='Query Waldo to choose one available output, call Waldo Observe exactly once on that output, then reply with MCP_IMAGE_PROOF_OK. Do not call Act or any mutating tool.'
 proof_workdir="$repo_root"
 if [[ "$install_mode" == redirected ]]; then
     proof_workdir="$install_root"
@@ -361,7 +354,7 @@ run_codex codex exec \
     --skip-git-repo-check \
     "$proof_prompt" </dev/null >"$proof_transcript"
 
-proof_summary="$(jq -s --arg skill "$installed_skill" '
+proof_summary="$(jq -s '
     . as $events
     | [$events[]
         | select(
@@ -386,12 +379,6 @@ proof_summary="$(jq -s --arg skill "$installed_skill" '
     | {
         observe_calls: ($observe_calls | length),
         image_results: ($image_results | length),
-        skill_reads: ([$events[]
-            | select(
-                .type == "item.completed"
-                and .item.type == "command_execution"
-                and (.item.command | contains($skill))
-            )] | length),
         mutating_calls: ([$events[]
             | select(
                 .type == "item.completed"
@@ -410,11 +397,10 @@ proof_summary="$(jq -s --arg skill "$installed_skill" '
 if ! jq -e '
     .observe_calls == 1
     and .image_results == 1
-    and .skill_reads >= 1
     and .mutating_calls == 0
     and .completion_markers >= 1
 ' <<<"$proof_summary" >/dev/null; then
-    printf 'Stock Codex did not prove installed skill loading and one structured MCP image: %s\n' \
+    printf 'Stock Codex did not prove plugin loading and one structured MCP image: %s\n' \
         "$proof_summary" >&2
     exit 1
 fi
@@ -435,8 +421,6 @@ jq \
     --arg codex_version "$(codex --version)" \
     --arg plugin_manifest "$installed_plugin_manifest" \
     --arg plugin_manifest_sha256 "$(sha256sum "$installed_plugin_manifest" | cut -d' ' -f1)" \
-    --arg skill "$installed_skill" \
-    --arg skill_sha256 "$(sha256sum "$installed_skill" | cut -d' ' -f1)" \
     --arg mcp_binary "$mcp_bin" \
     --arg mcp_binary_sha256 "$(sha256sum "$mcp_bin" | cut -d' ' -f1)" \
     --argjson proof "$proof_summary" \
@@ -451,7 +435,6 @@ jq \
             mcp_image_delivery: true,
             codex_version: $codex_version,
             plugin_manifest: {path: $plugin_manifest, sha256: $plugin_manifest_sha256},
-            skill: {path: $skill, sha256: $skill_sha256},
             mcp_binary: {path: $mcp_binary, sha256: $mcp_binary_sha256},
             proof: $proof
         },
