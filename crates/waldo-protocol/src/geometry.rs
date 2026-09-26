@@ -51,7 +51,7 @@ pub enum OutputTransform {
 /// The mappings needed to ground model-image points in desktop input space.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct CoordinateMapping {
-    /// Exact dimensions of the compositor capture before presentation resizing.
+    /// Desktop-oriented capture dimensions before presentation resizing.
     pub source_pixels: PixelSize,
     /// Exact decoded dimensions of the image delivered to the model consumer.
     pub model_image_pixels: PixelSize,
@@ -61,5 +61,6 @@ pub struct CoordinateMapping {
     /// `logical_x = origin.x + image_x * width / model_image_pixels.width`.
     pub logical_bounds: LogicalRect,
     pub scale: f64,
+    /// Output buffer transform, already accounted for in the delivered image.
     pub transform: OutputTransform,
 }

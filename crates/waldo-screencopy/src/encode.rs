@@ -1,39 +1,69 @@
 use std::io::Cursor;
 
-use image::{ImageEncoder, codecs::png::PngEncoder};
-use wayland_client::protocol::wl_shm;
+use image::{ImageEncoder, RgbaImage, codecs::png::PngEncoder};
+use wayland_client::protocol::{wl_output::Transform, wl_shm};
 
 use crate::{CaptureError, shm::ShmBuffer};
 
-pub(crate) fn png(buffer: &ShmBuffer, y_inverted: bool) -> Result<Vec<u8>, CaptureError> {
+pub(crate) fn png(
+    buffer: &ShmBuffer,
+    y_inverted: bool,
+    transform: Transform,
+) -> Result<(Vec<u8>, u32, u32), CaptureError> {
     png_bytes(
         &buffer.map,
-        buffer.width,
-        buffer.height,
+        (buffer.width, buffer.height),
         buffer.stride,
         buffer.format,
         y_inverted,
+        transform,
     )
 }
 
 fn png_bytes(
     source: &[u8],
-    width: u32,
-    height: u32,
+    dimensions: (u32, u32),
     stride: u32,
     format: wl_shm::Format,
     y_inverted: bool,
-) -> Result<Vec<u8>, CaptureError> {
+    transform: Transform,
+) -> Result<(Vec<u8>, u32, u32), CaptureError> {
+    let (width, height) = dimensions;
     let rgba = rgba(source, width, height, stride, format, y_inverted)?;
+    let image = RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| CaptureError::InvalidBuffer("RGBA dimensions do not match buffer".into()))?;
+    let image = orient(image, transform)?;
+    let (width, height) = image.dimensions();
 
     let mut encoded = Cursor::new(Vec::new());
     PngEncoder::new(&mut encoded).write_image(
-        &rgba,
+        image.as_raw(),
         width,
         height,
         image::ExtendedColorType::Rgba8,
     )?;
-    Ok(encoded.into_inner())
+    Ok((encoded.into_inner(), width, height))
+}
+
+/// Screencopy row inversion and output orientation are independent transforms.
+/// Present pixels in desktop orientation so image points map linearly to logical bounds.
+fn orient(image: RgbaImage, transform: Transform) -> Result<RgbaImage, CaptureError> {
+    use image::imageops::{flip_horizontal, rotate90, rotate180, rotate270};
+    Ok(match transform {
+        Transform::Normal => image,
+        Transform::_90 => rotate90(&image),
+        Transform::_180 => rotate180(&image),
+        Transform::_270 => rotate270(&image),
+        Transform::Flipped => flip_horizontal(&image),
+        Transform::Flipped90 => flip_horizontal(&rotate90(&image)),
+        Transform::Flipped180 => flip_horizontal(&rotate180(&image)),
+        Transform::Flipped270 => flip_horizontal(&rotate270(&image)),
+        _ => {
+            return Err(CaptureError::InvalidBuffer(
+                "unsupported output transform".into(),
+            ));
+        }
+    })
 }
 
 fn rgba(
@@ -99,12 +129,59 @@ fn rgba(
 #[cfg(test)]
 mod tests {
     use image::ImageFormat;
-    use wayland_client::protocol::wl_shm;
+    use wayland_client::protocol::{wl_output::Transform, wl_shm};
 
     use super::{png_bytes, rgba};
 
     fn native_pixel(argb: u32) -> [u8; 4] {
         argb.to_ne_bytes()
+    }
+
+    #[test]
+    fn presents_every_output_transform_in_logical_orientation_with_either_row_order() {
+        let cases = [
+            (Transform::Normal, (3, 2), [1, 2, 3, 4, 5, 6]),
+            (Transform::_90, (2, 3), [4, 1, 5, 2, 6, 3]),
+            (Transform::_180, (3, 2), [6, 5, 4, 3, 2, 1]),
+            (Transform::_270, (2, 3), [3, 6, 2, 5, 1, 4]),
+            (Transform::Flipped, (3, 2), [3, 2, 1, 6, 5, 4]),
+            (Transform::Flipped90, (2, 3), [1, 4, 2, 5, 3, 6]),
+            (Transform::Flipped180, (3, 2), [4, 5, 6, 1, 2, 3]),
+            (Transform::Flipped270, (2, 3), [6, 3, 5, 2, 4, 1]),
+        ];
+        for (transform, dimensions, expected) in cases {
+            for y_inverted in [false, true] {
+                let pixels = if y_inverted {
+                    [4, 5, 6, 1, 2, 3]
+                } else {
+                    [1, 2, 3, 4, 5, 6]
+                };
+                let mut bytes = Vec::new();
+                for row in pixels.chunks_exact(3) {
+                    for pixel in row {
+                        bytes.extend(native_pixel(*pixel));
+                    }
+                    bytes.extend([0xff; 4]); // Non-pixel stride padding.
+                }
+                let (png, width, height) = png_bytes(
+                    &bytes,
+                    (3, 2),
+                    16,
+                    wl_shm::Format::Xrgb8888,
+                    y_inverted,
+                    transform,
+                )
+                .unwrap();
+                let decoded = image::load_from_memory(&png).unwrap().into_rgba8();
+                assert_eq!((width, height), dimensions, "{transform:?}");
+                assert_eq!(decoded.dimensions(), dimensions, "{transform:?}");
+                assert_eq!(
+                    decoded.pixels().map(|pixel| pixel[2]).collect::<Vec<_>>(),
+                    expected,
+                    "{transform:?}, inverted={y_inverted}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -156,15 +233,16 @@ mod tests {
 
         // Screencopy damage describes which pixels changed; the compositor still
         // copied a complete buffer, so encoding must consume the complete extent.
-        let png = png_bytes(
+        let (png, encoded_width, encoded_height) = png_bytes(
             &source,
-            width,
-            height,
+            (width, height),
             width * 4,
             wl_shm::Format::Xrgb8888,
             false,
+            Transform::Normal,
         )
         .unwrap();
+        assert_eq!((encoded_width, encoded_height), (width, height));
         let decoded = image::load_from_memory_with_format(&png, ImageFormat::Png)
             .unwrap()
             .into_rgba8();
