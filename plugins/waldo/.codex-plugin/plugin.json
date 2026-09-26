@@ -5,7 +5,6 @@
   "author": {
     "name": "BFJ Concerns"
   },
-  "skills": "./skills/",
   "interface": {
     "displayName": "Waldo",
     "shortDescription": "Control the live Niri desktop from Codex.",
