@@ -227,6 +227,20 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(manifest["metadata"], {"description": "kept"})
         self.assertEqual(manifest["plugins"], [other, {"name": "waldo", "source": "./waldo"}])
 
+    def test_marketplace_writer_fails_without_touching_a_malformed_manifest(self):
+        # The writers may run where errexit is suspended, so a failed merge
+        # must report failure itself and leave the manifest as it was.
+        marketplace = self.root / "plugins/.claude-plugin/marketplace.json"
+        marketplace.parent.mkdir(parents=True)
+        marketplace.write_text("{not json")
+        result = self.steps('resolve_installation\n'
+                            'if write_claude_marketplace; then echo wrote; else echo refused; fi',
+                            WALDO_PLUGIN_HOME=str(self.root / "plugins/waldo"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "refused")
+        self.assertEqual(marketplace.read_text(), "{not json")
+        self.assertEqual(sorted(path.name for path in self.root.iterdir() if path.name.startswith("tmp")), [])
+
     def test_claude_marketplace_is_created_beside_the_plugin_home(self):
         plugin_home = self.root / "elsewhere/waldo-candidate"
         self.successful_steps('resolve_installation\nwrite_claude_marketplace\n'

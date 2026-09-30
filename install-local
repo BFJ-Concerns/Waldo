@@ -139,12 +139,14 @@ install_plugin_copy() {
 # A marketplace manifest is shared with other plugins. Merge into it: the
 # name, owner and waldo entry are Waldo's to set; every other entry and key
 # survives. The optional third argument is an agent-specific jq filter
-# applied to the merged manifest.
+# applied to the merged manifest. Success means the merge succeeded, and a
+# failed merge leaves the manifest untouched: the writer may run where
+# errexit is suspended, so it guards its own steps.
 write_marketplace() {
     local manifest="$1" entry="$2" extra_filter="${3:-.}"
     local manifest_tmp filter
-    install -d -m 0755 "$(dirname -- "$manifest")"
-    manifest_tmp="$(mktemp)"
+    install -d -m 0755 "$(dirname -- "$manifest")" || return 1
+    manifest_tmp="$(mktemp)" || return 1
     filter='.name = $name
         | .owner = {"name": $owner}
         | .plugins = ((.plugins // []) | map(select(.name != "waldo")) + [$entry])
@@ -155,8 +157,14 @@ write_marketplace() {
     else
         jq -n --arg name "$marketplace_name" --arg owner "$marketplace_owner" \
             --argjson entry "$entry" "$filter" >"$manifest_tmp"
-    fi
-    install -m 0644 "$manifest_tmp" "$manifest"
+    fi || {
+        rm -f -- "$manifest_tmp"
+        return 1
+    }
+    install -m 0644 "$manifest_tmp" "$manifest" || {
+        rm -f -- "$manifest_tmp"
+        return 1
+    }
     rm -f -- "$manifest_tmp"
 }
 
@@ -172,14 +180,14 @@ write_codex_marketplace() {
         "source": {"source": "local", "path": $source},
         "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
         "category": "Productivity"
-    }')"
+    }')" || return 1
     write_marketplace "$marketplace" "$entry" \
         '.interface = (.interface // {"displayName": "Personal"})'
 }
 
 write_claude_marketplace() {
     local entry
-    entry="$(jq -n --arg source "./$(basename -- "$plugin_home")" '{"name": "waldo", "source": $source}')"
+    entry="$(jq -n --arg source "./$(basename -- "$plugin_home")" '{"name": "waldo", "source": $source}')" || return 1
     write_marketplace "$claude_marketplace" "$entry"
 }
 
@@ -306,7 +314,7 @@ summarise_codex_turn() {
                     .type == "item.completed"
                     and .item.type == "mcp_tool_call"
                     and .item.server == "waldo"
-                    and (.item.tool == "act" or .item.tool == "stop" or .item.tool == "handover")
+                    and (.item.tool == "act" or .item.tool == "stop")
                 )] | length),
             completion_markers: ([$events[]
                 | select(
@@ -560,15 +568,17 @@ codex_registration_and_proof() {
             codex_diagnostic="redirected Codex proof needs an existing Codex login at $auth_source"
             return 1
         fi
-        auth_link="$codex_home/auth.json"
-        if [[ -e "$auth_link" || -L "$auth_link" ]]; then
-            codex_diagnostic="refusing to replace existing redirected Codex authentication at $auth_link"
+        local auth_candidate="$codex_home/auth.json"
+        if [[ -e "$auth_candidate" || -L "$auth_candidate" ]]; then
+            codex_diagnostic="refusing to replace existing redirected Codex authentication at $auth_candidate"
             return 1
         fi
-        ln -s -- "$auth_source" "$auth_link" || {
+        ln -s -- "$auth_source" "$auth_candidate" || {
             codex_diagnostic="could not link the Codex login into $codex_home"
             return 1
         }
+        # Cleanup removes only a link this run created.
+        auth_link="$auth_candidate"
     fi
     write_codex_marketplace || {
         codex_diagnostic="could not write the Codex marketplace $marketplace"
@@ -605,10 +615,12 @@ codex_registration_and_proof() {
         codex_diagnostic="codex exec failed"
         return 1
     }
-    codex_summary="$(summarise_codex_turn "$transcript")" || {
+    local summary
+    summary="$(summarise_codex_turn "$transcript")" || {
         codex_diagnostic="Codex transcript could not be summarised"
         return 1
     }
+    codex_summary="$summary"
     codex_turn_proves "$codex_summary" || {
         codex_diagnostic="Codex did not prove plugin loading and one structured MCP image"
         return 1
