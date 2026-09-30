@@ -10,14 +10,15 @@ use waldo_clipboard::ClipboardExecutor;
 use waldo_controller::ExecutionToken;
 use waldo_niri::NiriActionExecutor;
 use waldo_protocol::{Action, ActionRoute, ErrorCode, ProtocolError, TextRoutePreference};
-use waldo_virtual_keyboard::VirtualKeyboardExecutor;
+use waldo_virtual_keyboard::{ActiveLayoutSource, VirtualKeyboardExecutor};
 use waldo_virtual_pointer::VirtualPointerExecutor;
 
 /// Routes each action to the one live backend which owns its semantics.
 pub(crate) struct DesktopActionExecutor {
     niri: NiriActionExecutor,
     pointer: Option<VirtualPointerExecutor>,
-    keyboard: Option<VirtualKeyboardExecutor>,
+    /// The keyboard, or the limitation Query discloses for why there is none.
+    keyboard: Result<VirtualKeyboardExecutor, String>,
     clipboard: Option<ClipboardExecutor>,
     accessibility: Option<Arc<AccessibilityBackend>>,
 }
@@ -25,17 +26,26 @@ pub(crate) struct DesktopActionExecutor {
 impl DesktopActionExecutor {
     pub(crate) fn initialise(
         accessibility: Option<Arc<AccessibilityBackend>>,
-        active_keyboard_layout: Option<String>,
+        active_layout: ActiveLayoutSource,
     ) -> Self {
         Self {
             niri: NiriActionExecutor,
             pointer: VirtualPointerExecutor::initialise().ok(),
-            keyboard: active_keyboard_layout
-                .as_deref()
-                .and_then(|layout| VirtualKeyboardExecutor::initialise(layout).ok()),
+            keyboard: VirtualKeyboardExecutor::initialise(active_layout)
+                .map_err(|unavailable| unavailable.limitation),
             clipboard: ClipboardExecutor::initialise().ok(),
             accessibility,
         }
+    }
+
+    fn keyboard(&self) -> Result<&VirtualKeyboardExecutor, ActionExecutionFailure> {
+        self.keyboard.as_ref().map_err(|limitation| {
+            ActionExecutionFailure::not_executed(ProtocolError {
+                code: ErrorCode::UnsupportedCapability,
+                message: format!("Wayland virtual-keyboard backend is unavailable: {limitation}"),
+                retryable: false,
+            })
+        })
     }
 
     fn execute_text(
@@ -72,16 +82,13 @@ impl DesktopActionExecutor {
         text: &str,
         cancellation: &ExecutionToken,
     ) -> Result<ActionExecution, ActionExecutionFailure> {
-        self.keyboard
-            .as_ref()
-            .ok_or_else(|| unsupported("Wayland virtual-keyboard text entry is unavailable"))?
-            .execute(
-                &Action::Text {
-                    text: text.to_owned(),
-                    route: TextRoutePreference::VirtualKeyboard,
-                },
-                cancellation,
-            )
+        self.keyboard()?.execute(
+            &Action::Text {
+                text: text.to_owned(),
+                route: TextRoutePreference::VirtualKeyboard,
+            },
+            cancellation,
+        )
     }
 
     fn clipboard_paste(
@@ -93,10 +100,7 @@ impl DesktopActionExecutor {
             .clipboard
             .as_ref()
             .ok_or_else(|| unsupported("Wayland clipboard paste is unavailable"))?;
-        let keyboard = self
-            .keyboard
-            .as_ref()
-            .ok_or_else(|| unsupported("clipboard paste requires the virtual keyboard"))?;
+        let keyboard = self.keyboard()?;
         let snapshot = clipboard
             .snapshot()
             .map_err(ActionExecutionFailure::not_executed)?;
@@ -197,17 +201,9 @@ impl ActionExecutor for DesktopActionExecutor {
                     })
                 })?
                 .execute(action, cancellation),
-            Action::Key { .. } | Action::KeyChord { .. } => self
-                .keyboard
-                .as_ref()
-                .ok_or_else(|| {
-                    ActionExecutionFailure::not_executed(ProtocolError {
-                        code: ErrorCode::UnsupportedCapability,
-                        message: "Wayland virtual-keyboard backend is unavailable".into(),
-                        retryable: true,
-                    })
-                })?
-                .execute(action, cancellation),
+            Action::Key { .. } | Action::KeyChord { .. } => {
+                self.keyboard()?.execute(action, cancellation)
+            }
             Action::Text { text, route } => self.execute_text(text, *route, cancellation),
             Action::ClipboardRead { .. }
             | Action::ClipboardWrite { .. }
@@ -250,12 +246,12 @@ impl ActionExecutor for DesktopActionExecutor {
             ActionRoute::VirtualKeyboard => self
                 .keyboard
                 .as_ref()
-                .is_some_and(|keyboard| keyboard.supports(route)),
+                .is_ok_and(|keyboard| keyboard.supports(route)),
             ActionRoute::Clipboard => self
                 .clipboard
                 .as_ref()
                 .is_some_and(|clipboard| clipboard.supports(route)),
-            ActionRoute::ClipboardPaste => self.clipboard.is_some() && self.keyboard.is_some(),
+            ActionRoute::ClipboardPaste => self.clipboard.is_some() && self.keyboard.is_ok(),
             ActionRoute::Accessibility => self
                 .accessibility
                 .as_ref()
@@ -266,10 +262,20 @@ impl ActionExecutor for DesktopActionExecutor {
 
     fn limitation(&self, route: ActionRoute) -> Option<String> {
         match route {
-            ActionRoute::Clipboard | ActionRoute::ClipboardPaste => self
+            ActionRoute::VirtualKeyboard => self.keyboard.as_ref().err().cloned(),
+            ActionRoute::Clipboard => self
                 .clipboard
                 .as_ref()
                 .and_then(|clipboard| clipboard.limitation()),
+            ActionRoute::ClipboardPaste => self
+                .clipboard
+                .as_ref()
+                .and_then(|clipboard| clipboard.limitation())
+                .or_else(|| {
+                    self.keyboard.as_ref().err().map(|limitation| {
+                        format!("clipboard paste needs the keyboard: {limitation}")
+                    })
+                }),
             _ => None,
         }
     }
@@ -278,7 +284,7 @@ impl ActionExecutor for DesktopActionExecutor {
         if let Some(pointer) = &self.pointer {
             pointer.release_all();
         }
-        if let Some(keyboard) = &self.keyboard {
+        if let Ok(keyboard) = &self.keyboard {
             keyboard.release_all();
         }
         if let Some(clipboard) = &self.clipboard {

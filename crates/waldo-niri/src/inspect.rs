@@ -44,6 +44,26 @@ impl NiriSnapshot {
     }
 }
 
+/// The compositor's active keyboard layout: its group index into the
+/// keymap and its name, as Niri reports them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveKeyboardLayout {
+    pub index: u32,
+    pub name: Option<String>,
+}
+
+/// Reads just the keyboard layouts from Niri, cheaply enough to run before
+/// every keyboard action.
+pub fn active_keyboard_layout() -> Result<ActiveKeyboardLayout, InspectionError> {
+    let mut socket = Socket::connect()?;
+    let keyboard = response_keyboard(send(&mut socket, Request::KeyboardLayouts)?)?;
+    let index = u32::from(keyboard.current_idx);
+    Ok(ActiveKeyboardLayout {
+        name: keyboard.names.get(index as usize).cloned(),
+        index,
+    })
+}
+
 /// Read-only desktop discovery seam used by the controller service.
 pub trait SessionInspector: Send + Sync {
     fn inspect(&self, include_windows: bool) -> Result<NiriSnapshot, InspectionError>;

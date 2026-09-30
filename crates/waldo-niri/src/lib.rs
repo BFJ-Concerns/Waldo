@@ -8,4 +8,7 @@ mod wayland_registry;
 
 pub use action::NiriActionExecutor;
 pub use error::InspectionError;
-pub use inspect::{NiriInspector, NiriSnapshot, SessionInspector, UnavailableInspector};
+pub use inspect::{
+    ActiveKeyboardLayout, NiriInspector, NiriSnapshot, SessionInspector, UnavailableInspector,
+    active_keyboard_layout,
+};

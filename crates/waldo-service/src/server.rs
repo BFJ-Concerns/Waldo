@@ -19,10 +19,12 @@ use waldo_action::{ActionExecutor, UnavailableActionExecutor};
 use waldo_controller::Controller;
 use waldo_niri::{NiriInspector, SessionInspector};
 use waldo_protocol::{
-    Capabilities, ClientMessage, ProtocolError, RequestId, SCHEMA_MAJOR_VERSION, ServerMessage,
+    Capabilities, ClientMessage, ErrorCode, ProtocolError, RequestId, SCHEMA_MAJOR_VERSION,
+    ServerMessage,
 };
 use waldo_screencopy::{ScreenCapturer, Screencopy, UnavailableCapturer};
 use waldo_socket::{TransportError, read_frame, write_message};
+use waldo_virtual_keyboard::{ActiveLayout, ActiveLayoutSource};
 
 use crate::{ServiceError, dispatch::dispatch, executor::DesktopActionExecutor, socket_path};
 
@@ -149,13 +151,21 @@ impl ControllerService {
                 )),
             ),
         };
-        let active_keyboard_layout = inspector
-            .inspect(false)
-            .ok()
-            .and_then(|snapshot| snapshot.active_keyboard_layout);
+        let active_layout: ActiveLayoutSource = Arc::new(|| {
+            waldo_niri::active_keyboard_layout()
+                .map(|layout| ActiveLayout {
+                    index: layout.index,
+                    name: layout.name,
+                })
+                .map_err(|error| ProtocolError {
+                    code: ErrorCode::BackendFailure,
+                    message: format!("read the active keyboard layout from Niri: {error}"),
+                    retryable: true,
+                })
+        });
         let executor: Arc<dyn ActionExecutor> = Arc::new(DesktopActionExecutor::initialise(
             accessibility.as_ref().map(Arc::clone),
-            active_keyboard_layout,
+            active_layout,
         ));
         Self::bind_with_runtime_backends(
             path,
@@ -313,11 +323,15 @@ pub(crate) fn enable_action_capabilities(
                 .into(),
         );
     }
-    if executor.supports(waldo_protocol::ActionRoute::VirtualKeyboard)
-        && capabilities.virtual_keyboard.version.is_some()
-    {
-        capabilities.virtual_keyboard.available = true;
-        capabilities.virtual_keyboard.limitation = None;
+    if capabilities.virtual_keyboard.version.is_some() {
+        if let Some(limitation) = executor.limitation(waldo_protocol::ActionRoute::VirtualKeyboard)
+        {
+            capabilities.virtual_keyboard.available = false;
+            capabilities.virtual_keyboard.limitation = Some(limitation);
+        } else if executor.supports(waldo_protocol::ActionRoute::VirtualKeyboard) {
+            capabilities.virtual_keyboard.available = true;
+            capabilities.virtual_keyboard.limitation = None;
+        }
     }
     if executor.supports(waldo_protocol::ActionRoute::Clipboard)
         && capabilities.clipboard.version.is_some()
