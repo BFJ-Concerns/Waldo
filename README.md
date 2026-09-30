@@ -35,9 +35,9 @@ Codex login for verification.
 ## Controller and tools
 
 `waldod` serves a private Unix socket at
-`$XDG_RUNTIME_DIR/waldo/controller.sock`. The CLI accepts `--socket PATH`;
-`WALDO_SOCKET_PATH` overrides the default for both client bindings.
-`waldo-mcp` serves MCP over standard input and output.
+`$XDG_RUNTIME_DIR/waldo/controller.sock` unless the `WALDO_SOCKET_PATH`
+setting names another (see Configuration). The CLI and `waldod` also accept
+`--socket PATH`. `waldo-mcp` serves MCP over standard input and output.
 
 | MCP tool | Request | Result |
 | --- | --- | --- |
@@ -82,6 +82,36 @@ waldo act act.json --observe observe.json
 
 Explicit lease handover is available through the CLI only. MCP clients finish
 their driving session with Stop.
+
+## Configuration
+
+Values that differ between machines or people are settings; nothing else
+needs a source edit. A runtime setting is resolved, highest precedence
+first, from a command-line flag where the binary offers one, the process
+environment, the settings file, then its default. The settings file is
+`${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`, one `NAME=VALUE` per
+line with `#` comments and no quoting, and is read by every Waldo binary
+however it was launched; a name there that is not a setting is an error.
+Restart `waldod` after changing a value it reads.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `WALDO_SOCKET_PATH` | `$XDG_RUNTIME_DIR/waldo/controller.sock` | The private controller socket `waldod` serves and both bindings connect to. |
+| `WALDO_LEASE_IDLE_TIMEOUT_SECONDS` | `30` | Seconds without a request or a running batch before a driving lease lapses and held input is released. Whole seconds, at least 1; the timeout cannot be disabled. |
+
+Installer settings are read from the environment of the `./install-local`
+invocation only:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `WALDO_INSTALL_ROOT` | unset | Names a disposable installation tree for a rehearsal install that leaves the canonical service alone; the settings below default beneath it. |
+| `WALDO_PLUGIN_HOME` | `~/plugins/waldo` | Where the plugin source is copied for the agents' marketplaces. |
+| `WALDO_MARKETPLACE` | `~/.agents/plugins/marketplace.json` | The Codex marketplace file the plugin is registered in. |
+| `WALDO_SERVICE_FILE` | `~/.config/systemd/user/waldod.service` | Where the user service file is written; the unit name stays `waldod.service`. |
+| `WALDO_PROFILE_FILE` | `${XDG_STATE_HOME:-~/.local/state}/waldo/environment.json` | Where the recorded installation environment is written. |
+| `WALDO_CODEX_HOME` | `<install root>/codex` | Rehearsal installs only: the Codex home used for the installation proof. |
+| `WALDO_CODEX_AUTH_SOURCE` | `${CODEX_HOME:-~/.codex}/auth.json` | Rehearsal installs only: the existing Codex login linked into that home. |
+| `WALDO_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/waldo-install-<hash>` | Rehearsal installs only: the runtime directory holding the temporary controller socket. |
 
 ## Image coordinates and results
 

@@ -1,0 +1,393 @@
+//! Operator settings: the values that differ between machines or people.
+//!
+//! Every such value is declared once here as a [`SettingSpec`], read from one
+//! precedence chain — a command-line flag where the binary offers one, then
+//! the process environment, then the settings file, then the declared
+//! default — and named in the README's configuration reference, which a test
+//! in this crate enforces. Tuning internals (poll intervals, quiet periods,
+//! deadlines, resource caps) are not settings and do not belong here.
+//!
+//! The settings file is `${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`:
+//! one `NAME=VALUE` per line, `#` comments, no quoting or expansion. It
+//! exists so the operator sets a value once for every Waldo binary, however
+//! each is launched — the controller under systemd, the MCP server under the
+//! agent, the CLI from a shell — without editing a service file or a plugin
+//! manifest. A name the file carries that no binary declares is an error,
+//! so a misspelt setting never silently does nothing.
+
+use std::{
+    collections::BTreeMap,
+    env, fmt, fs, io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+/// One operator-settable value: its environment-variable name and the
+/// default the README documents for it (`None` when the default is derived,
+/// such as a path beneath a runtime directory).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettingSpec {
+    pub name: &'static str,
+    pub default: Option<&'static str>,
+}
+
+/// Path of the private controller socket both bindings and the service use.
+pub const SOCKET_PATH: SettingSpec = SettingSpec {
+    name: "WALDO_SOCKET_PATH",
+    default: None,
+};
+
+/// Seconds without a request or running batch after which a driving lease
+/// lapses. It has a default and cannot be disabled.
+pub const LEASE_IDLE_TIMEOUT_SECONDS: SettingSpec = SettingSpec {
+    name: "WALDO_LEASE_IDLE_TIMEOUT_SECONDS",
+    default: Some("30"),
+};
+
+/// Every declared setting. A setting absent from this list is unreadable
+/// through [`Settings`], and a name present here without a README row fails
+/// the documentation test.
+pub const ALL: &[SettingSpec] = &[SOCKET_PATH, LEASE_IDLE_TIMEOUT_SECONDS];
+
+/// Where a resolved value came from, for error messages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    Environment,
+    File(PathBuf),
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Environment => formatter.write_str("the process environment"),
+            Self::File(path) => write!(formatter, "{}", path.display()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum SettingsError {
+    UnreadableFile {
+        path: PathBuf,
+        error: io::Error,
+    },
+    MalformedLine {
+        path: PathBuf,
+        line: usize,
+    },
+    UnknownName {
+        path: PathBuf,
+        line: usize,
+        name: String,
+    },
+    InvalidValue {
+        name: &'static str,
+        source: Source,
+        value: String,
+        reason: String,
+    },
+    RuntimeDirectoryMissing,
+}
+
+impl fmt::Display for SettingsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnreadableFile { path, error } => {
+                write!(
+                    formatter,
+                    "cannot read settings file {}: {error}",
+                    path.display()
+                )
+            }
+            Self::MalformedLine { path, line } => {
+                write!(formatter, "{}:{line}: expected NAME=VALUE", path.display())
+            }
+            Self::UnknownName { path, line, name } => write!(
+                formatter,
+                "{}:{line}: {name} is not a Waldo setting",
+                path.display()
+            ),
+            Self::InvalidValue {
+                name,
+                source,
+                value,
+                reason,
+            } => write!(
+                formatter,
+                "{name}={value:?} (from {source}) is invalid: {reason}"
+            ),
+            Self::RuntimeDirectoryMissing => formatter
+                .write_str("XDG_RUNTIME_DIR is not set and WALDO_SOCKET_PATH names no socket"),
+        }
+    }
+}
+
+impl std::error::Error for SettingsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnreadableFile { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// The resolved values of every declared setting for this process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settings {
+    values: BTreeMap<&'static str, (String, Source)>,
+    runtime_directory: Option<PathBuf>,
+}
+
+impl Settings {
+    /// Reads the settings file (when present) and the process environment.
+    pub fn load() -> Result<Self, SettingsError> {
+        let path = settings_file_path();
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(SettingsError::UnreadableFile { path, error }),
+        };
+        Self::from_sources(
+            contents
+                .as_deref()
+                .map(|contents| (path.as_path(), contents)),
+            env::vars_os().filter_map(|(name, value)| {
+                Some((name.into_string().ok()?, value.into_string().ok()?))
+            }),
+            env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        )
+    }
+
+    /// Resolves from explicit sources; the environment wins over the file.
+    pub fn from_sources(
+        file: Option<(&Path, &str)>,
+        environment: impl IntoIterator<Item = (String, String)>,
+        runtime_directory: Option<PathBuf>,
+    ) -> Result<Self, SettingsError> {
+        let mut values = BTreeMap::new();
+        if let Some((path, contents)) = file {
+            for (index, raw) in contents.lines().enumerate() {
+                let line = index + 1;
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let (name, value) =
+                    trimmed
+                        .split_once('=')
+                        .ok_or_else(|| SettingsError::MalformedLine {
+                            path: path.to_owned(),
+                            line,
+                        })?;
+                let spec = declared(name.trim()).ok_or_else(|| SettingsError::UnknownName {
+                    path: path.to_owned(),
+                    line,
+                    name: name.trim().to_owned(),
+                })?;
+                values.insert(
+                    spec.name,
+                    (value.trim().to_owned(), Source::File(path.to_owned())),
+                );
+            }
+        }
+        for (name, value) in environment {
+            if let Some(spec) = declared(&name) {
+                values.insert(spec.name, (value, Source::Environment));
+            }
+        }
+        Ok(Self {
+            values,
+            runtime_directory,
+        })
+    }
+
+    /// The raw value and its source, when the operator set one.
+    pub fn raw(&self, spec: SettingSpec) -> Option<(&str, &Source)> {
+        self.values
+            .get(spec.name)
+            .map(|(value, source)| (value.as_str(), source))
+    }
+
+    /// The controller socket: `WALDO_SOCKET_PATH`, or
+    /// `$XDG_RUNTIME_DIR/waldo/controller.sock`.
+    pub fn socket_path(&self) -> Result<PathBuf, SettingsError> {
+        if let Some((value, _)) = self.raw(SOCKET_PATH) {
+            return Ok(PathBuf::from(value));
+        }
+        self.runtime_directory
+            .as_ref()
+            .map(|runtime| runtime.join("waldo/controller.sock"))
+            .ok_or(SettingsError::RuntimeDirectoryMissing)
+    }
+
+    /// The driving lease's idle timeout: at least one second, never disabled.
+    pub fn lease_idle_timeout(&self) -> Result<Duration, SettingsError> {
+        let (value, source) = match self.raw(LEASE_IDLE_TIMEOUT_SECONDS) {
+            Some((value, source)) => (value, source.clone()),
+            None => {
+                let default = LEASE_IDLE_TIMEOUT_SECONDS
+                    .default
+                    .expect("the lease idle timeout declares a default");
+                return Ok(Duration::from_secs(
+                    default.parse().expect("the declared default parses"),
+                ));
+            }
+        };
+        let seconds: u64 = value.parse().map_err(|_| SettingsError::InvalidValue {
+            name: LEASE_IDLE_TIMEOUT_SECONDS.name,
+            source: source.clone(),
+            value: value.to_owned(),
+            reason: "expected a whole number of seconds".into(),
+        })?;
+        if seconds == 0 {
+            return Err(SettingsError::InvalidValue {
+                name: LEASE_IDLE_TIMEOUT_SECONDS.name,
+                source,
+                value: value.to_owned(),
+                reason: "the lease idle timeout cannot be disabled".into(),
+            });
+        }
+        Ok(Duration::from_secs(seconds))
+    }
+}
+
+/// `${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`.
+pub fn settings_file_path() -> PathBuf {
+    let config_home = env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    config_home.join("waldo/settings")
+}
+
+fn declared(name: &str) -> Option<SettingSpec> {
+    ALL.iter().copied().find(|spec| spec.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, time::Duration};
+
+    use super::{LEASE_IDLE_TIMEOUT_SECONDS, SOCKET_PATH, Settings, SettingsError, Source};
+
+    fn settings(
+        file: Option<&str>,
+        environment: &[(&str, &str)],
+    ) -> Result<Settings, SettingsError> {
+        Settings::from_sources(
+            file.map(|contents| (Path::new("/etc/waldo/settings"), contents)),
+            environment
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+            Some("/run/user/1000".into()),
+        )
+    }
+
+    #[test]
+    fn defaults_apply_when_nothing_is_set() {
+        let settings = settings(None, &[]).unwrap();
+        assert_eq!(
+            settings.socket_path().unwrap(),
+            Path::new("/run/user/1000/waldo/controller.sock")
+        );
+        assert_eq!(
+            settings.lease_idle_timeout().unwrap(),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_file() {
+        let settings = settings(
+            Some("WALDO_LEASE_IDLE_TIMEOUT_SECONDS=90\nWALDO_SOCKET_PATH=/tmp/file.sock\n"),
+            &[("WALDO_LEASE_IDLE_TIMEOUT_SECONDS", "45")],
+        )
+        .unwrap();
+        assert_eq!(
+            settings.lease_idle_timeout().unwrap(),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            settings.raw(LEASE_IDLE_TIMEOUT_SECONDS),
+            Some(("45", &Source::Environment))
+        );
+        assert_eq!(settings.socket_path().unwrap(), Path::new("/tmp/file.sock"));
+        assert!(matches!(
+            settings.raw(SOCKET_PATH),
+            Some((_, Source::File(path))) if path == Path::new("/etc/waldo/settings")
+        ));
+    }
+
+    #[test]
+    fn the_file_tolerates_comments_blank_lines_and_padding() {
+        let settings = settings(
+            Some("# lease\n\n  WALDO_LEASE_IDLE_TIMEOUT_SECONDS = 120 \n"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            settings.lease_idle_timeout().unwrap(),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_in_the_file_is_refused_with_its_line() {
+        let error =
+            settings(Some("WALDO_SOCKET_PATH=/a\nWALDO_LEASE_TIMEOUT=5\n"), &[]).unwrap_err();
+        assert!(matches!(
+            error,
+            SettingsError::UnknownName { line: 2, ref name, .. } if name == "WALDO_LEASE_TIMEOUT"
+        ));
+    }
+
+    #[test]
+    fn a_line_without_an_equals_sign_is_malformed() {
+        let error = settings(Some("WALDO_SOCKET_PATH\n"), &[]).unwrap_err();
+        assert!(matches!(
+            error,
+            SettingsError::MalformedLine { line: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn unrelated_environment_variables_are_ignored() {
+        let settings = settings(None, &[("WALDO_LEASE_TIMEOUT", "5"), ("PATH", "/bin")]).unwrap();
+        assert_eq!(
+            settings.lease_idle_timeout().unwrap(),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn the_lease_idle_timeout_cannot_be_disabled_or_malformed() {
+        let disabled = settings(None, &[("WALDO_LEASE_IDLE_TIMEOUT_SECONDS", "0")])
+            .unwrap()
+            .lease_idle_timeout()
+            .unwrap_err();
+        assert!(matches!(
+            disabled,
+            SettingsError::InvalidValue { name: "WALDO_LEASE_IDLE_TIMEOUT_SECONDS", ref reason, .. }
+                if reason.contains("cannot be disabled")
+        ));
+        let malformed = settings(None, &[("WALDO_LEASE_IDLE_TIMEOUT_SECONDS", "never")])
+            .unwrap()
+            .lease_idle_timeout()
+            .unwrap_err();
+        assert!(matches!(malformed, SettingsError::InvalidValue { .. }));
+        assert_eq!(
+            malformed.to_string(),
+            "WALDO_LEASE_IDLE_TIMEOUT_SECONDS=\"never\" (from the process environment) is invalid: expected a whole number of seconds"
+        );
+    }
+
+    #[test]
+    fn the_socket_needs_a_runtime_directory_when_not_set_explicitly() {
+        let settings = Settings::from_sources(None, Vec::new(), None).unwrap();
+        assert!(matches!(
+            settings.socket_path(),
+            Err(SettingsError::RuntimeDirectoryMissing)
+        ));
+    }
+}

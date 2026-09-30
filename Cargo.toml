@@ -10,6 +10,7 @@ members = [
     "crates/waldo-protocol",
     "crates/waldo-screencopy",
     "crates/waldo-service",
+    "crates/waldo-settings",
     "crates/waldo-socket",
     "crates/waldo-virtual-pointer",
     "crates/waldo-virtual-keyboard",

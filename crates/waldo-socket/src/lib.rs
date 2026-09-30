@@ -2,7 +2,6 @@
 
 use std::{
     collections::HashMap,
-    env,
     error::Error,
     fmt, io,
     path::{Path, PathBuf},
@@ -18,6 +17,7 @@ use waldo_protocol::{
     Capabilities, ClientId, ClientMessage, ConnectionId, RequestId, SCHEMA_MAJOR_VERSION,
     ServerMessage,
 };
+use waldo_settings::{Settings, SettingsError};
 
 /// Maximum accepted JSON payload, excluding the four-byte length prefix.
 ///
@@ -39,7 +39,7 @@ pub enum TransportError {
         expected: RequestId,
         received: Option<RequestId>,
     },
-    RuntimeDirectoryMissing,
+    Settings(SettingsError),
 }
 
 impl fmt::Display for TransportError {
@@ -60,30 +60,20 @@ impl fmt::Display for TransportError {
                 "controller response id {received:?} does not match request {}",
                 expected.get()
             ),
-            Self::RuntimeDirectoryMissing => {
-                formatter.write_str("XDG_RUNTIME_DIR is not set; cannot locate the private socket")
-            }
+            Self::Settings(error) => write!(formatter, "controller socket settings: {error}"),
         }
     }
 }
 
-/// Returns the controller socket beneath the user's private runtime directory.
+/// Returns the controller socket the operator's settings name.
 pub fn default_socket_path() -> Result<PathBuf, TransportError> {
-    socket_path(
-        env::var_os("WALDO_SOCKET_PATH"),
-        env::var_os("XDG_RUNTIME_DIR"),
-    )
+    Ok(Settings::load()?.socket_path()?)
 }
 
-fn socket_path(
-    explicit: Option<std::ffi::OsString>,
-    runtime: Option<std::ffi::OsString>,
-) -> Result<PathBuf, TransportError> {
-    if let Some(path) = explicit {
-        return Ok(PathBuf::from(path));
+impl From<SettingsError> for TransportError {
+    fn from(error: SettingsError) -> Self {
+        Self::Settings(error)
     }
-    let runtime = runtime.ok_or(TransportError::RuntimeDirectoryMissing)?;
-    Ok(PathBuf::from(runtime).join("waldo/controller.sock"))
 }
 
 impl Error for TransportError {
@@ -91,6 +81,7 @@ impl Error for TransportError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::Settings(error) => Some(error),
             _ => None,
         }
     }
@@ -398,16 +389,5 @@ mod tests {
         let base64_ceiling = rgba_bytes.div_ceil(3) * 4;
 
         assert!(MAX_FRAME_BYTES > base64_ceiling);
-    }
-
-    #[test]
-    fn explicit_socket_override_supports_disposable_installed_proofs() {
-        let path = super::socket_path(
-            Some("/tmp/waldo-disposable.sock".into()),
-            Some("/run/user/1000".into()),
-        )
-        .unwrap();
-
-        assert_eq!(path, std::path::Path::new("/tmp/waldo-disposable.sock"));
     }
 }

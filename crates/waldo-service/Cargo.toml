@@ -17,6 +17,7 @@ waldo-controller = { path = "../waldo-controller" }
 waldo-niri = { path = "../waldo-niri" }
 waldo-protocol = { path = "../waldo-protocol" }
 waldo-screencopy = { path = "../waldo-screencopy" }
+waldo-settings = { path = "../waldo-settings" }
 waldo-socket = { path = "../waldo-socket" }
 waldo-virtual-pointer = { path = "../waldo-virtual-pointer" }
 waldo-virtual-keyboard = { path = "../waldo-virtual-keyboard" }

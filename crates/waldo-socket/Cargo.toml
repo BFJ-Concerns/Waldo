@@ -9,6 +9,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 waldo-protocol = { path = "../waldo-protocol" }
+waldo-settings = { path = "../waldo-settings" }
 
 [lib]
 path = "src/lib.rs"

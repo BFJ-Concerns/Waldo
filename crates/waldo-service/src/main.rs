@@ -1,30 +1,37 @@
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
-use waldo_service::{ControllerService, default_socket_path};
+use waldo_service::ControllerService;
+use waldo_settings::Settings;
 
 #[derive(Debug, Parser)]
 #[command(name = "waldod", about = "Waldo's session-scoped desktop controller")]
 struct Arguments {
-    /// Override the private controller socket path.
+    /// Override the private controller socket path (otherwise WALDO_SOCKET_PATH).
     #[arg(long)]
     socket: Option<PathBuf>,
 
-    /// Release an inactive driving lease after this many seconds.
-    #[arg(long, default_value_t = 30)]
-    idle_timeout_seconds: u64,
+    /// Release an inactive driving lease after this many seconds (otherwise
+    /// WALDO_LEASE_IDLE_TIMEOUT_SECONDS). Zero is refused: the lease cannot be
+    /// left to persist ambiently.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    idle_timeout_seconds: Option<u64>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arguments::parse();
+    let settings = Settings::load()?;
     let socket = match arguments.socket {
         Some(path) => path,
-        None => default_socket_path()?,
+        None => settings.socket_path()?,
     };
-    let service =
-        ControllerService::bind(&socket, Duration::from_secs(arguments.idle_timeout_seconds))?;
+    let idle_timeout = match arguments.idle_timeout_seconds {
+        Some(seconds) => std::time::Duration::from_secs(seconds),
+        None => settings.lease_idle_timeout()?,
+    };
+    let service = ControllerService::bind(&socket, idle_timeout)?;
 
     eprintln!("Waldo controller listening on {}", socket.display());
     let mut terminate = signal(SignalKind::terminate())?;

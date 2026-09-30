@@ -1371,10 +1371,15 @@ dependencies = [
  "waldo-niri",
  "waldo-protocol",
  "waldo-screencopy",
+ "waldo-settings",
  "waldo-socket",
  "waldo-virtual-keyboard",
  "waldo-virtual-pointer",
 ]
+
+[[package]]
+name = "waldo-settings"
+version = "0.1.0"
 
 [[package]]
 name = "waldo-socket"
@@ -1384,6 +1389,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "waldo-protocol",
+ "waldo-settings",
 ]
 
 [[package]]
