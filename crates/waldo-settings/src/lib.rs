@@ -17,7 +17,9 @@
 
 use std::{
     collections::BTreeMap,
-    env, fmt, fs, io,
+    env,
+    ffi::{OsStr, OsString},
+    fmt, fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -134,7 +136,9 @@ impl std::error::Error for SettingsError {
 /// The resolved values of every declared setting for this process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
-    values: BTreeMap<&'static str, (String, Source)>,
+    /// Values are kept as the operating system gave them: a path setting
+    /// need not be UTF-8.
+    values: BTreeMap<&'static str, (OsString, Source)>,
     runtime_directory: Option<PathBuf>,
 }
 
@@ -151,9 +155,7 @@ impl Settings {
             contents
                 .as_deref()
                 .map(|contents| (path.as_path(), contents)),
-            env::vars_os().filter_map(|(name, value)| {
-                Some((name.into_string().ok()?, value.into_string().ok()?))
-            }),
+            env::vars_os(),
             env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
         )
     }
@@ -161,7 +163,7 @@ impl Settings {
     /// Resolves from explicit sources; the environment wins over the file.
     pub fn from_sources(
         file: Option<(&Path, &str)>,
-        environment: impl IntoIterator<Item = (String, String)>,
+        environment: impl IntoIterator<Item = (OsString, OsString)>,
         runtime_directory: Option<PathBuf>,
     ) -> Result<Self, SettingsError> {
         let mut values = BTreeMap::new();
@@ -186,12 +188,12 @@ impl Settings {
                 })?;
                 values.insert(
                     spec.name,
-                    (value.trim().to_owned(), Source::File(path.to_owned())),
+                    (OsString::from(value.trim()), Source::File(path.to_owned())),
                 );
             }
         }
         for (name, value) in environment {
-            if let Some(spec) = declared(&name) {
+            if let Some(spec) = name.to_str().and_then(declared) {
                 values.insert(spec.name, (value, Source::Environment));
             }
         }
@@ -202,10 +204,29 @@ impl Settings {
     }
 
     /// The raw value and its source, when the operator set one.
-    pub fn raw(&self, spec: SettingSpec) -> Option<(&str, &Source)> {
+    pub fn raw(&self, spec: SettingSpec) -> Option<(&OsStr, &Source)> {
         self.values
             .get(spec.name)
-            .map(|(value, source)| (value.as_str(), source))
+            .map(|(value, source)| (value.as_os_str(), source))
+    }
+
+    /// A raw value as text, or an `InvalidValue` naming the setting when
+    /// the operating system gave bytes that are not UTF-8.
+    fn text(&self, spec: SettingSpec) -> Result<Option<(&str, &Source)>, SettingsError> {
+        match self.raw(spec) {
+            None => Ok(None),
+            Some((value, source)) => {
+                value
+                    .to_str()
+                    .map(|text| Some((text, source)))
+                    .ok_or_else(|| SettingsError::InvalidValue {
+                        name: spec.name,
+                        source: source.clone(),
+                        value: value.to_string_lossy().into_owned(),
+                        reason: "expected UTF-8 text".into(),
+                    })
+            }
+        }
     }
 
     /// The controller socket: `WALDO_SOCKET_PATH`, or
@@ -222,7 +243,7 @@ impl Settings {
 
     /// The driving lease's idle timeout: at least one second, never disabled.
     pub fn lease_idle_timeout(&self) -> Result<Duration, SettingsError> {
-        let (value, source) = match self.raw(LEASE_IDLE_TIMEOUT_SECONDS) {
+        let (value, source) = match self.text(LEASE_IDLE_TIMEOUT_SECONDS)? {
             Some((value, source)) => (value, source.clone()),
             None => {
                 let default = LEASE_IDLE_TIMEOUT_SECONDS
@@ -267,7 +288,12 @@ fn declared(name: &str) -> Option<SettingSpec> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, time::Duration};
+    use std::{
+        ffi::{OsStr, OsString},
+        os::unix::ffi::OsStrExt,
+        path::Path,
+        time::Duration,
+    };
 
     use super::{LEASE_IDLE_TIMEOUT_SECONDS, SOCKET_PATH, Settings, SettingsError, Source};
 
@@ -279,7 +305,7 @@ mod tests {
             file.map(|contents| (Path::new("/etc/waldo/settings"), contents)),
             environment
                 .iter()
-                .map(|(name, value)| (name.to_string(), value.to_string())),
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
             Some("/run/user/1000".into()),
         )
     }
@@ -310,7 +336,7 @@ mod tests {
         );
         assert_eq!(
             settings.raw(LEASE_IDLE_TIMEOUT_SECONDS),
-            Some(("45", &Source::Environment))
+            Some((OsStr::new("45"), &Source::Environment))
         );
         assert_eq!(settings.socket_path().unwrap(), Path::new("/tmp/file.sock"));
         assert!(matches!(
@@ -379,6 +405,29 @@ mod tests {
         assert_eq!(
             malformed.to_string(),
             "WALDO_LEASE_IDLE_TIMEOUT_SECONDS=\"never\" (from the process environment) is invalid: expected a whole number of seconds"
+        );
+    }
+
+    #[test]
+    fn a_socket_path_that_is_not_utf8_is_kept_byte_for_byte() {
+        let raw = OsString::from(OsStr::from_bytes(b"/run/waldo-\xff/controller.sock"));
+        let settings = Settings::from_sources(
+            None,
+            vec![(OsString::from("WALDO_SOCKET_PATH"), raw.clone())],
+            None,
+        )
+        .unwrap();
+        assert_eq!(settings.socket_path().unwrap().as_os_str(), raw.as_os_str());
+        let timeout = Settings::from_sources(
+            None,
+            vec![(OsString::from("WALDO_LEASE_IDLE_TIMEOUT_SECONDS"), raw)],
+            None,
+        )
+        .unwrap()
+        .lease_idle_timeout()
+        .unwrap_err();
+        assert!(
+            matches!(timeout, SettingsError::InvalidValue { ref reason, .. } if reason == "expected UTF-8 text")
         );
     }
 

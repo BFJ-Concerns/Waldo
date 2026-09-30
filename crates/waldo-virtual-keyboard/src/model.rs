@@ -323,6 +323,151 @@ mod tests {
         assert!(!model.has_active_modifiers());
     }
 
+    /// An independent consumer: xkbcommon's own state machine fed the
+    /// planned transitions exactly as the compositor would receive them,
+    /// reporting what each non-modifier press would type.
+    struct Consumer {
+        state: xkb::State,
+    }
+
+    impl Consumer {
+        fn new(keymap: &CompiledKeymap) -> Self {
+            let context = xkb::Context::new(xkb::CONTEXT_NO_ENVIRONMENT_NAMES);
+            let compiled = xkb::Keymap::new_from_string(
+                &context,
+                keymap.text.clone(),
+                xkb::KEYMAP_FORMAT_TEXT_V1,
+                xkb::COMPILE_NO_FLAGS,
+            )
+            .expect("the uploaded keymap text compiles for the consumer");
+            Self {
+                state: xkb::State::new(&compiled),
+            }
+        }
+
+        /// Applies the transitions and returns the text the presses typed.
+        fn consume(&mut self, transitions: &[KeyboardTransition]) -> String {
+            let mut typed = String::new();
+            for transition in transitions {
+                match *transition {
+                    KeyboardTransition::Key { keycode, state } => {
+                        let xkb_keycode =
+                            xkb::Keycode::new(keycode + crate::keymap::XKB_EVDEV_OFFSET);
+                        if state == InputState::Pressed {
+                            typed.push_str(&self.state.key_get_utf8(xkb_keycode));
+                        }
+                        self.state.update_key(
+                            xkb_keycode,
+                            match state {
+                                InputState::Pressed => xkb::KeyDirection::Down,
+                                InputState::Released => xkb::KeyDirection::Up,
+                            },
+                        );
+                    }
+                    KeyboardTransition::Modifiers {
+                        depressed,
+                        latched,
+                        locked,
+                        group,
+                    } => {
+                        self.state
+                            .update_mask(depressed, latched, locked, 0, 0, group);
+                    }
+                }
+            }
+            typed
+        }
+    }
+
+    fn text_plan(
+        keymap: &CompiledKeymap,
+        group: u32,
+        text: &str,
+    ) -> Vec<crate::keymap::KeySequence> {
+        let table = keymap.group(group).unwrap();
+        text.chars()
+            .map(|character| table.sequences[&crate::names::text_keysym(character).raw()].clone())
+            .collect()
+    }
+
+    #[test]
+    fn every_typeable_character_types_back_to_itself_through_an_xkb_consumer() {
+        for layouts in ["gb", "us", "de", "fr"] {
+            let keymap = keymap(layouts);
+            let table = keymap.group(0).unwrap();
+            for (&keysym, sequence) in &table.sequences {
+                let Some(character) = xkb::Keysym::new(keysym).key_char() else {
+                    continue;
+                };
+                if character.is_control() {
+                    continue;
+                }
+                let mut model = model(&keymap, 0);
+                let transitions = model
+                    .plan(PreparedKeyboardAction::Text(vec![sequence.clone()]))
+                    .unwrap();
+                let typed = Consumer::new(&keymap).consume(&transitions);
+                assert_eq!(
+                    typed,
+                    character.to_string(),
+                    "{layouts}: keysym {keysym:#x} planned as {transitions:?}"
+                );
+                assert!(
+                    model.held_keys().is_empty(),
+                    "{layouts}: {character:?} left keys held"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_announced_group_selects_which_layout_the_consumer_types_with() {
+        let keymap = keymap("gb,us");
+        for (group, text) in [(0, "Waldo €42! \"#"), (1, "Waldo $42! \"#")] {
+            let mut model = model(&keymap, group);
+            let transitions = model
+                .plan(PreparedKeyboardAction::Text(text_plan(
+                    &keymap, group, text,
+                )))
+                .unwrap();
+            assert_eq!(Consumer::new(&keymap).consume(&transitions), text);
+        }
+    }
+
+    #[test]
+    fn a_chord_reaches_the_consumer_with_its_modifiers_active() {
+        let keymap = keymap("gb");
+        let mut model = model(&keymap, 0);
+        let ctrl = named(&keymap, xkb::keysyms::KEY_Control_L);
+        let a = named(&keymap, xkb::Keysym::from_char('a').raw());
+        let transitions = model
+            .plan(PreparedKeyboardAction::Chord(vec![a, ctrl]))
+            .unwrap();
+        let mut consumer = Consumer::new(&keymap);
+        let mut control_active_at_a = None;
+        for transition in &transitions {
+            if let KeyboardTransition::Key {
+                keycode,
+                state: InputState::Pressed,
+            } = transition
+                && *keycode == a
+            {
+                control_active_at_a = Some(
+                    consumer
+                        .state
+                        .mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE),
+                );
+            }
+            consumer.consume(std::slice::from_ref(transition));
+        }
+        assert_eq!(control_active_at_a, Some(true));
+        assert!(
+            !consumer
+                .state
+                .mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE)
+        );
+    }
+
     #[test]
     fn a_refused_text_plan_leaves_no_group_announcement_behind() {
         let keymap = keymap("gb,us");
