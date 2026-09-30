@@ -27,6 +27,14 @@ fn portable_transient_fallback_honours_tmpdir() {
         .output()
         .unwrap();
     fs::remove_dir(&parent).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("running 1 test")
+            && stdout.contains("test clipboard_outside_in::transient_defaults::portable_transient_fallback_honours_tmpdir ... ok")
+            && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+        "child did not pass exactly the intended test:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         output.status.success(),
         "child output:\n{}\n{}",
