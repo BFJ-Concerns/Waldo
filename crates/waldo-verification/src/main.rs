@@ -8,6 +8,7 @@ use waldo_verification::{
 mod clipboard_outside_in;
 mod final_campaign;
 mod outside_in;
+mod private_json;
 mod toolkit_preflight;
 
 #[derive(Debug, Parser)]
@@ -298,11 +299,11 @@ fn emit_json(
     value: &impl serde::Serialize,
     output: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut json = serde_json::to_vec_pretty(value)?;
-    json.push(b'\n');
     if let Some(output) = output {
-        fs::write(output, json)?;
+        private_json::write(output, value)?;
     } else {
+        let mut json = serde_json::to_vec_pretty(value)?;
+        json.push(b'\n');
         print!("{}", String::from_utf8(json)?);
     }
     Ok(())
