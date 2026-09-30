@@ -97,14 +97,15 @@ Restart `waldod` after changing a value it reads.
 
 Keyboard input uses the keymap the compositor reports, so the layout needs
 no setting. Text includes characters produced by one dead key followed by a
-base key, using the Compose data for `waldod`'s locale (`LC_ALL`, `LC_CTYPE`,
-then `LANG`). Direct keys take precedence. If Compose data is unavailable,
-direct typing remains available; characters without a supported sequence are
-refused with the active layout named. Only when the session exposes no keymap does Waldo fall back to
-the standard XKB environment — `XKB_DEFAULT_LAYOUT`, and optionally
-`XKB_DEFAULT_VARIANT`, `XKB_DEFAULT_MODEL`, `XKB_DEFAULT_OPTIONS` and
-`XKB_DEFAULT_RULES` — in `waldod`'s environment; with neither, Query reports
-the keyboard route unavailable and says why.
+base key, using the Compose data for `waldod`'s locale (`LC_ALL`,
+`LC_CTYPE`, then `LANG`). Direct keys take precedence. If Compose data is
+unavailable, direct typing remains available; characters without a
+supported sequence are refused with the active layout named. Only when the
+session exposes no keymap does Waldo fall back to the standard XKB
+environment — `XKB_DEFAULT_LAYOUT`, and optionally `XKB_DEFAULT_VARIANT`,
+`XKB_DEFAULT_MODEL`, `XKB_DEFAULT_OPTIONS` and `XKB_DEFAULT_RULES` — in
+`waldod`'s environment; with neither, Query reports the keyboard route
+unavailable and says why.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
