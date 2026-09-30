@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# The repository's quality gate: every check CI runs, in one command, so a
+# contributor sees locally exactly what a push will see. Exit status is
+# non-zero when any stage fails. Stages run in order and the first failure
+# stops the run; pass --all to run every stage regardless and report at the
+# end, which is how CI runs it so one red stage never hides another.
+#
+# Live-session tests (screencopy, Niri IPC, virtual input, clipboard, AT-SPI)
+# skip themselves when no graphical session is present; run this inside the
+# Niri session to include them.
+set -euo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+run_all=false
+if [[ "${1:-}" == "--all" ]]; then
+    run_all=true
+fi
+
+failed=()
+stage() {
+    local name="$1"
+    shift
+    printf '\n==> %s\n' "$name"
+    if "$@"; then
+        return 0
+    fi
+    failed+=("$name")
+    if [[ "$run_all" == false ]]; then
+        printf '\nGate failed at: %s\n' "$name" >&2
+        exit 1
+    fi
+    return 0
+}
+
+verify_service_file() {
+    # systemd-analyze needs a runtime directory even to verify a unit file
+    # offline; give it a private one when the environment has none.
+    local runtime="${XDG_RUNTIME_DIR:-}"
+    local scratch=""
+    if [[ -z "$runtime" || ! -d "$runtime" ]]; then
+        scratch="$(mktemp -d)"
+        runtime="$scratch"
+    fi
+    local status=0
+    XDG_RUNTIME_DIR="$runtime" systemd-analyze --user --man=no --generators=no \
+        verify packaging/waldod.service || status=$?
+    if [[ -n "$scratch" ]]; then
+        rm -rf -- "$scratch"
+    fi
+    return "$status"
+}
+
+stage "cargo fmt --check" cargo fmt --all --check
+stage "cargo check" cargo check --workspace --all-targets
+stage "clippy (warnings denied)" cargo clippy --workspace --all-targets -- -D warnings
+stage "systemd-analyze verify" verify_service_file
+stage "cargo test" cargo test --workspace
+
+if [[ ${#failed[@]} -gt 0 ]]; then
+    printf '\nGate failed at: %s\n' "${failed[*]}" >&2
+    exit 1
+fi
+printf '\nGate passed.\n'
