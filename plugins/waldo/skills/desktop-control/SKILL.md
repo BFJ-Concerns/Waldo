@@ -24,14 +24,17 @@ already authorised — so the approval can be obtained before that step runs.
 
 1. Query the desktop for its outputs, windows, focus, capability limits and
    lease state: `{"include_windows":true}` returns the window identifiers and
-   per-window `capture` availability the later steps rely on. Capability
+   per-window `capture` availability the later steps rely on. Every tool
+   takes its request as this bare JSON object; there is no wrapper. Capability
    results disclose which capture and action routes are available and, for
    each unavailable one, the limitation. A Query `request_id` is transport
    correlation only and never grounds an Act.
 2. Observe the relevant output, visible foreground window or region:
    `{"source":{"type":"output","output_id":"DP-1"},"include_accessibility":true}`.
    A region of an output is
-   `{"source":{"type":"region","output_id":"DP-1","region":{"origin":{"x":0,"y":0},"width":800,"height":600}},"include_accessibility":false}`.
+   `{"source":{"type":"region","output_id":"DP-1","region":{"origin":{"x":0,"y":0},"width":800,"height":600}},"include_accessibility":false}`,
+   and a visible foreground window whose Query `capture` is available is
+   `{"source":{"type":"window","window_id":"16"},"include_accessibility":true}`.
    Accessibility element handles exist only in an observation taken with
    `include_accessibility` true. The returned observation identifier,
    geometry, focus, target identity and image are one grounding record, and it
@@ -124,8 +127,9 @@ already authorised — so the approval can be obtained before that step runs.
      `{"type":"clipboard_restore","preservation_id":3}` puts the exact prior
      offer back, or `{"type":"clipboard_keep","preservation_id":3}` releases
      the guard leaving the new contents in place. One guard exists per
-     driving session; a batch that preserved and did not restore or keep
-     leaves the guard for the next batch;
+     driving session: a second `clipboard_preserve` while one is active is
+     refused, and a batch that preserved without restoring or keeping
+     leaves the guard for the next batch to restore or keep;
    - a wait names `"predicate"`, whose accessibility handle is also called
      `"element"`:
      `{"type":"wait","predicate":{"type":"element_state","element":"element-17","state":"focused","present":true},"timeout_ms":500}`;

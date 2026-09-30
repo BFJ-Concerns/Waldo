@@ -12,14 +12,19 @@ is kept truthful in the same change as any behaviour it describes.
 `scripts/gate` is the repository's quality gate: formatting, `cargo check`,
 Clippy with warnings denied, `systemd-analyze --user verify` on the service
 file, and `cargo test --workspace`. CI runs exactly that command on every push
-and pull request. Run it before proposing a change; run it inside the Niri
-session so the live-session tests (screencopy, Niri IPC, virtual input,
-clipboard, AT-SPI) execute rather than skip — a skip is reported as not run,
-never as a pass. For fast iteration, `cargo check --workspace` alone.
+and pull request, and every pull request — documentation included — is
+expected to pass it. Run it inside the Niri session so the live-session
+tests (screencopy, Niri IPC, virtual input, clipboard, AT-SPI) execute rather
+than skip — a skip is reported as not run, never as a pass. Those tests start
+their own controllers on private sockets and open their own fixture windows
+on the live desktop; they do not touch an installed service or its lease.
+For fast iteration between gate runs, `cargo check --workspace` alone.
 
 Run `./install-local` only when a change is ready to replace the operator's
 live installation: it builds and installs the binaries, enables the user
-service, installs the plugin and records the proved environment. It needs the
+service, installs the plugin, proves plugin loading and image delivery, and
+records the environment that proof exercised — outputs, scale, transforms,
+keyboard layout, capabilities — as the installation's profile. It needs the
 active Niri session. `plugins/waldo/` is the plugin source; never patch the
 installed copy. With the service running, `waldo query` shows the current
 profile, capabilities, outputs and keyboard layout through the controller.
@@ -57,14 +62,15 @@ stay internal.
 ## The desktop-control skill
 
 `plugins/waldo/skills/desktop-control/SKILL.md` is the driving guidance the
-plugin ships and the MCP server's instructions tell the model to load. A
-change the runtime needs the skill to carry — a new action
-variant, a changed result field, a grounding rule learnt from an agent going
-wrong — is described in the README's "Guidance the agent skill must carry"
-section in the same change, and the skill is updated to match. The
-protocol tests check that every JSON example in the skill validates against
-the schema and that every action variant has one, so a runtime change that
-outgrows the skill fails the gate until the skill catches up.
+plugin ships and the MCP server's instructions tell the model to load. A change
+the runtime needs the skill to carry — a new action variant, a changed
+result field, a grounding rule learnt from an agent going wrong — updates
+the skill's literal examples and stated facts here, in the same change, and
+is described in the README's "Guidance the agent skill must carry" section.
+The protocol tests decode every
+JSON example in the skill through the protocol crate's wire types and
+require every action and predicate variant to have one, so a runtime change
+that outgrows the skill fails the gate until the skill catches up.
 
 Defects in Waldo are reported on the public issue tracker named in the
 README.
