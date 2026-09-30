@@ -7,7 +7,7 @@
 //! AltGr and Level5 characters resolve, provided the level's modifier mask
 //! is one the modifier keys on the keymap can hold down.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, env, ffi::OsStr};
 
 use xkbcommon::xkb;
 
@@ -22,7 +22,7 @@ pub(crate) struct KeyStroke {
 }
 
 /// The strokes that type one keysym, in order. One stroke for a direct
-/// key; a dead-key sequence would be two.
+/// key; two for a dead key followed by a base key.
 pub(crate) type KeySequence = Vec<KeyStroke>;
 
 /// Typing tables for one layout group of the keymap.
@@ -116,6 +116,26 @@ impl CompiledKeymap {
     }
 
     fn from_keymap(keymap: &xkb::Keymap, text: &str) -> Result<Self, KeymapError> {
+        let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .into_iter()
+            .filter_map(env::var_os)
+            .find(|value| !value.is_empty())
+            .unwrap_or_else(|| "C".into());
+        Self::from_keymap_for_locale(keymap, text, &locale)
+    }
+
+    fn from_keymap_for_locale(
+        keymap: &xkb::Keymap,
+        text: &str,
+        locale: &OsStr,
+    ) -> Result<Self, KeymapError> {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_ENVIRONMENT_NAMES);
+        let compose_table =
+            xkb::compose::Table::new_from_locale(&context, locale, xkb::compose::COMPILE_NO_FLAGS)
+                .ok();
+        let mut compose = compose_table
+            .as_ref()
+            .map(|table| xkb::compose::State::new(table, xkb::compose::STATE_NO_FLAGS));
         let layouts = keymap.num_layouts();
         if layouts == 0 {
             return Err(KeymapError::NoLayouts);
@@ -228,6 +248,9 @@ impl CompiledKeymap {
                     }
                 }
             }
+            if let Some(compose) = &mut compose {
+                extend_dead_keys(&mut table, compose);
+            }
             groups.push(table);
         }
 
@@ -249,6 +272,50 @@ impl CompiledKeymap {
             .iter()
             .map(|group| group.name.as_str())
             .collect()
+    }
+}
+
+/// Adds only one-dead-key compositions of strokes this group can emit.
+fn extend_dead_keys(table: &mut GroupTable, compose: &mut xkb::compose::State) {
+    let direct = table.sequences.clone();
+    for (&dead, dead_sequence) in &direct {
+        // Compose recognises many starters, including Multi_key. Only dead
+        // keysyms are eligible here; xkbcommon supplies their names.
+        if !xkb::keysym_get_name(dead.into()).starts_with("dead_") {
+            continue;
+        }
+        for (&base, base_sequence) in &direct {
+            if xkb::keysym_get_name(base.into()).starts_with("dead_") {
+                continue;
+            }
+            compose.reset();
+            compose.feed(dead.into());
+            if compose.status() != xkb::compose::Status::Composing {
+                continue;
+            }
+            compose.feed(base.into());
+            if compose.status() != xkb::compose::Status::Composed {
+                continue;
+            }
+            let Some(text) = compose.utf8() else {
+                continue;
+            };
+            let mut characters = text.chars();
+            let Some(character) = characters.next() else {
+                continue;
+            };
+            if characters.next().is_some() {
+                continue;
+            }
+            table
+                .sequences
+                .entry(xkb::Keysym::from_char(character).raw())
+                .or_insert_with(|| {
+                    let mut sequence = dead_sequence.clone();
+                    sequence.extend(base_sequence.iter().cloned());
+                    sequence
+                });
+        }
     }
 }
 
@@ -292,17 +359,26 @@ fn locked_mask(keymap: &xkb::Keymap, evdev: u32) -> u32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{CompiledKeymap, KeyStroke, KeymapError};
+    use std::ffi::OsStr;
     use xkbcommon::xkb;
 
     /// A keymap compiled from layout names with the environment ignored,
     /// so tests are deterministic whatever the session runs.
     pub(crate) fn keymap(layouts: &str) -> CompiledKeymap {
+        keymap_for_locale(layouts, "C.UTF-8")
+    }
+
+    fn keymap_for_locale(layouts: &str, locale: &str) -> CompiledKeymap {
         let context = xkb::Context::new(xkb::CONTEXT_NO_ENVIRONMENT_NAMES);
         let compiled =
             xkb::Keymap::new_from_names(&context, "", "", layouts, "", None, xkb::COMPILE_NO_FLAGS)
                 .expect("xkeyboard-config provides the test layouts");
-        CompiledKeymap::compile(&compiled.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
-            .expect("the test keymap compiles")
+        CompiledKeymap::from_keymap_for_locale(
+            &compiled,
+            &compiled.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1),
+            OsStr::new(locale),
+        )
+        .expect("the test keymap compiles")
     }
 
     fn sequence(keymap: &CompiledKeymap, group: u32, character: char) -> Option<Vec<KeyStroke>> {
@@ -312,6 +388,53 @@ pub(crate) mod tests {
             .sequences
             .get(&xkb::Keysym::from_char(character).raw())
             .cloned()
+    }
+
+    #[test]
+    fn dead_keys_extend_missing_characters_without_displacing_direct_strokes() {
+        let intl = keymap("us(intl)");
+        let table = intl.group(0).unwrap();
+        assert!(
+            !table
+                .named_keycodes
+                .contains_key(&xkb::Keysym::from_char('ê').raw()),
+            "the discriminating character must have no direct stroke"
+        );
+        let expected = vec![
+            KeyStroke {
+                keycode: table.named_keycodes[&xkb::keysyms::KEY_dead_circumflex],
+                held: vec![intl.level_keys.shift.unwrap()],
+            },
+            KeyStroke {
+                keycode: table.named_keycodes[&xkb::Keysym::from_char('e').raw()],
+                held: vec![],
+            },
+        ];
+        assert_eq!(sequence(&intl, 0, 'ê'), Some(expected));
+        assert_eq!(
+            sequence(&intl, 0, 'é'),
+            Some(vec![KeyStroke {
+                keycode: table.named_keycodes[&xkb::Keysym::from_char('e').raw()],
+                held: vec![intl.level_keys.level3.unwrap()],
+            }])
+        );
+        assert_eq!(sequence(&intl, 0, '漢'), None);
+        assert_eq!(sequence(&keymap("us"), 0, 'ê'), None);
+    }
+
+    #[test]
+    fn unavailable_compose_data_keeps_direct_typing_available() {
+        let intl = keymap_for_locale("us(intl)", "waldo_nonexistent_locale");
+        assert_eq!(sequence(&intl, 0, 'ê'), None);
+        let table = intl.group(0).unwrap();
+        assert_eq!(
+            sequence(&intl, 0, 'é'),
+            Some(vec![KeyStroke {
+                keycode: table.named_keycodes[&xkb::Keysym::from_char('e').raw()],
+                held: vec![intl.level_keys.level3.unwrap()],
+            }])
+        );
+        assert!(sequence(&intl, 0, 'a').is_some());
     }
 
     #[test]

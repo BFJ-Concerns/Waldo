@@ -98,16 +98,33 @@ however it was launched; a name there that is not a setting is an error.
 Restart `waldod` after changing a value it reads.
 
 Keyboard input uses the keymap the compositor reports, so the layout needs
-no setting. Only when the session exposes no keymap does Waldo fall back to
-the standard XKB environment — `XKB_DEFAULT_LAYOUT`, and optionally
-`XKB_DEFAULT_VARIANT`, `XKB_DEFAULT_MODEL`, `XKB_DEFAULT_OPTIONS` and
-`XKB_DEFAULT_RULES` — in `waldod`'s environment; with neither, Query reports
-the keyboard route unavailable and says why.
+no setting. Text includes characters produced by one dead key followed by a
+base key, using the Compose data for `waldod`'s locale (`LC_ALL`,
+`LC_CTYPE`, then `LANG`). Direct keys take precedence. If Compose data is
+unavailable, direct typing remains available; characters without a
+supported sequence are refused with the active layout named. Only when the
+session exposes no keymap does Waldo fall back to the standard XKB
+environment — `XKB_DEFAULT_LAYOUT`, and optionally `XKB_DEFAULT_VARIANT`,
+`XKB_DEFAULT_MODEL`, `XKB_DEFAULT_OPTIONS` and `XKB_DEFAULT_RULES` — in
+`waldod`'s environment; with neither, Query reports the keyboard route
+unavailable and says why.
+
+Waldo presses the dead key and then the base key; the character arrives
+only where the receiving application composes dead keys. GTK 4 on Wayland
+composes them only with a running input method or
+`GTK_IM_MODULE=gtk-im-context-simple`. Where exact text matters and
+composition is uncertain, use the clipboard-paste route, which delivers
+the string exactly. The automatic route tries clipboard paste before the
+keyboard but falls back to the keyboard when clipboard paste is
+unavailable, so its receipt names the route that actually carried the
+text.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `WALDO_SOCKET_PATH` | `$XDG_RUNTIME_DIR/waldo/controller.sock` | The private controller socket `waldod` serves and both bindings connect to. |
 | `WALDO_LEASE_IDLE_TIMEOUT_SECONDS` | `30` | Seconds without a request or a running batch before a driving lease lapses and held input is released. Whole seconds, at least 1; the timeout cannot be disabled. |
+| `WALDO_CLIPBOARD_PASTE_CHORD` | `ctrl+v` | Clipboard-paste key names separated by `+`; whitespace around each name is trimmed and empty names are refused at start-up. Key names use the virtual keyboard vocabulary and are checked against the active layout at paste time; an unavailable key fails without a default-chord fallback. |
+| `WALDO_MODEL_IMAGE_MAX_EDGE` | `2048` | Maximum longest edge in pixels for MCP images. A positive whole number; smaller images are delivered unscaled. Restart the MCP process after changing it. |
 
 Installer settings are read from the environment of the `./install-local`
 invocation only. The installer passes an explicit Cargo install root: the
@@ -148,7 +165,8 @@ it has already been accounted for in the image.
 
 `source_pixels` gives the desktop-oriented capture dimensions.
 `model_image_pixels` gives the delivered image dimensions. MCP preserves aspect
-ratio and limits the longest image edge to 2048 pixels; the CLI returns the
+ratio and limits the longest image edge to `WALDO_MODEL_IMAGE_MAX_EDGE`
+(default 2048 pixels), leaving smaller images unscaled; the CLI returns the
 controller image without that presentation resize. An image point maps into
 `logical_bounds` as follows:
 

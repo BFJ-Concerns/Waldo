@@ -40,7 +40,12 @@ async fn observation_grounding_reaches_capture_and_fail_closed_target_checks() {
         panic!("Niri has no focused output");
     };
     let path = test_socket();
-    let service = ControllerService::bind(&path, Duration::from_secs(30)).unwrap();
+    let service = ControllerService::bind(
+        &path,
+        Duration::from_secs(30),
+        &waldo_settings::Settings::from_sources(None, [], None).unwrap(),
+    )
+    .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(service.run_until(async {
         let _ = shutdown_rx.await;
