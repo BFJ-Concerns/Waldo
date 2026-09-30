@@ -161,7 +161,12 @@ write_marketplace() {
 }
 
 write_codex_marketplace() {
-    local entry
+    local marketplace_source entry
+    if [[ "$plugin_home" == "$install_home"/* ]]; then
+        marketplace_source="./${plugin_home#"$install_home"/}"
+    else
+        marketplace_source="$plugin_home"
+    fi
     entry="$(jq -n --arg source "$marketplace_source" '{
         "name": "waldo",
         "source": {"source": "local", "path": $source},
@@ -549,11 +554,6 @@ codex_registration_and_proof() {
     codex_diagnostic=""
     codex_summary="null"
     installed_codex_manifest=""
-    if [[ "$plugin_home" == "$install_home"/* ]]; then
-        marketplace_source="./${plugin_home#"$install_home"/}"
-    else
-        marketplace_source="$plugin_home"
-    fi
     if [[ "$install_mode" == redirected ]]; then
         local auth_source="${WALDO_CODEX_AUTH_SOURCE:-$operator_codex_home/auth.json}"
         if [[ ! -f "$auth_source" ]]; then

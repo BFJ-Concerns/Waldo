@@ -200,8 +200,7 @@ class InstallerTests(unittest.TestCase):
             with self.subTest(existing=existing):
                 if existing:
                     marketplace.write_text('{"name":"old","plugins":[]}')
-                self.successful_steps('resolve_installation\nmarketplace_source=./plugins/waldo\n'
-                                      'write_codex_marketplace',
+                self.successful_steps('resolve_installation\nwrite_codex_marketplace',
                                       WALDO_MARKETPLACE=str(marketplace),
                                       WALDO_MARKETPLACE_NAME="workshop",
                                       WALDO_MARKETPLACE_OWNER='Workshop "Owner"')
