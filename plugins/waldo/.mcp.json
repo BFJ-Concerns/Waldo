@@ -3,7 +3,7 @@
     "waldo": {
       "type": "stdio",
       "command": "waldo-mcp",
-      "env_vars": ["XDG_RUNTIME_DIR", "WALDO_SOCKET_PATH"]
+      "env_vars": ["XDG_RUNTIME_DIR", "WALDO_SOCKET_PATH", "XDG_CONFIG_HOME"]
     }
   }
 }

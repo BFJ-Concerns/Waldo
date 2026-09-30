@@ -108,11 +108,27 @@ the keyboard route unavailable and says why.
 | `WALDO_LEASE_IDLE_TIMEOUT_SECONDS` | `30` | Seconds without a request or a running batch before a driving lease lapses and held input is released. Whole seconds, at least 1; the timeout cannot be disabled. |
 
 Installer settings are read from the environment of the `./install-local`
-invocation only:
+invocation only. The installer passes an explicit Cargo install root: the
+canonical default is `CARGO_INSTALL_ROOT`, then `CARGO_HOME`, then `~/.cargo`
+(the usual Cargo location); Cargo's `install.root` configuration is not used.
+Binaries land in `<root>/bin`, and that directory supplies the service and
+proof clients regardless of the caller's `PATH`.
+
+The controller, readiness query and plugin proof honour `WALDO_SOCKET_PATH`,
+then the runtime settings file, then the runtime default. An environment
+socket override is written into the installed service; without one, the
+service resolves its socket through the settings file and default. A custom
+`XDG_CONFIG_HOME` is carried into the service and MCP proof too. Rehearsals
+use `<install root>/home/.config` as their config home and, when no socket
+override is set, export a private socket beneath `WALDO_RUNTIME_DIR` to every
+child so they cannot connect to the live controller.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `WALDO_INSTALL_ROOT` | unset | Names a disposable installation tree for a rehearsal install that leaves the canonical service alone; the settings below default beneath it. |
+| `WALDO_CARGO_INSTALL_ROOT` | `${CARGO_INSTALL_ROOT:-${CARGO_HOME:-~/.cargo}}` | Cargo install root; binaries land in `<root>/bin`. Rehearsal default: `<install root>/cargo`. Relative paths are resolved from the invocation directory. |
+| `WALDO_MARKETPLACE_NAME` | `personal` | Marketplace name used in both manifests, plugin registration and the Codex cache lookup. |
+| `WALDO_MARKETPLACE_OWNER` | `BFJ Concerns` | Owner name written into both marketplace manifests. |
 | `WALDO_PLUGIN_HOME` | `~/plugins/waldo` | Where the plugin source is copied for the agents' marketplaces. |
 | `WALDO_MARKETPLACE` | `~/.agents/plugins/marketplace.json` | The Codex marketplace file the plugin is registered in. |
 | `WALDO_SERVICE_FILE` | `~/.config/systemd/user/waldod.service` | Where the user service file is written; the unit name stays `waldod.service`. |
