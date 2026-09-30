@@ -29,7 +29,7 @@ jobs:
       - name: Install native build and check dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libxkbcommon-dev systemd
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libx11-data systemd
 
       - name: Cache cargo registry and build output
         uses: actions/cache@v4

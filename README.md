@@ -96,11 +96,26 @@ however it was launched; a name there that is not a setting is an error.
 Restart `waldod` after changing a value it reads.
 
 Keyboard input uses the keymap the compositor reports, so the layout needs
-no setting. Only when the session exposes no keymap does Waldo fall back to
-the standard XKB environment — `XKB_DEFAULT_LAYOUT`, and optionally
-`XKB_DEFAULT_VARIANT`, `XKB_DEFAULT_MODEL`, `XKB_DEFAULT_OPTIONS` and
-`XKB_DEFAULT_RULES` — in `waldod`'s environment; with neither, Query reports
-the keyboard route unavailable and says why.
+no setting. Text includes characters produced by one dead key followed by a
+base key, using the Compose data for `waldod`'s locale (`LC_ALL`,
+`LC_CTYPE`, then `LANG`). Direct keys take precedence. If Compose data is
+unavailable, direct typing remains available; characters without a
+supported sequence are refused with the active layout named. Only when the
+session exposes no keymap does Waldo fall back to the standard XKB
+environment — `XKB_DEFAULT_LAYOUT`, and optionally `XKB_DEFAULT_VARIANT`,
+`XKB_DEFAULT_MODEL`, `XKB_DEFAULT_OPTIONS` and `XKB_DEFAULT_RULES` — in
+`waldod`'s environment; with neither, Query reports the keyboard route
+unavailable and says why.
+
+Waldo presses the dead key and then the base key; the character arrives
+only where the receiving application composes dead keys. GTK 4 on Wayland
+composes them only with a running input method or
+`GTK_IM_MODULE=gtk-im-context-simple`. Where exact text matters and
+composition is uncertain, use the clipboard-paste route, which delivers
+the string exactly. The automatic route tries clipboard paste before the
+keyboard but falls back to the keyboard when clipboard paste is
+unavailable, so its receipt names the route that actually carried the
+text.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
