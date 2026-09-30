@@ -17,13 +17,11 @@ import unittest
 
 REPO = Path(__file__).resolve().parent.parent
 BINARIES = REPO / "target/debug"
-SCRATCH = Path("/tmp/waldo-installer-tests")
 
 
 class InstallerTests(unittest.TestCase):
     def setUp(self):
-        SCRATCH.mkdir(parents=True, exist_ok=True)
-        self.directory = tempfile.TemporaryDirectory(prefix="case-", dir=SCRATCH)
+        self.directory = tempfile.TemporaryDirectory(prefix="waldo-installer-case-")
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.env = {key: value for key, value in os.environ.items()
@@ -185,9 +183,4 @@ if __name__ == "__main__":
     parser.add_argument("--binaries", type=Path, default=BINARIES)
     options, remaining = parser.parse_known_args()
     BINARIES = options.binaries.resolve()
-    try:
-        unittest.main(argv=[__file__, *remaining], verbosity=2)
-    finally:
-        # Cases own their directories; remove the task parent when empty.
-        if SCRATCH.exists():
-            SCRATCH.rmdir()
+    unittest.main(argv=[__file__, *remaining], verbosity=2)
