@@ -33,11 +33,10 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(socket: impl Into<PathBuf>) -> Result<Self, McpError> {
-        let default = waldo_settings::MODEL_IMAGE_MAX_EDGE
-            .default
-            .expect("image edge declares a default")
-            .parse()
-            .expect("the declared default parses");
+        let default = waldo_settings::Settings::from_sources(None, [], None)
+            .expect("empty settings sources are valid")
+            .model_image_max_edge()
+            .expect("the declared image edge default is valid");
         Self::with_image_max_edge(socket, default)
     }
 
