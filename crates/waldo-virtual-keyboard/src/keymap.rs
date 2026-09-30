@@ -62,8 +62,8 @@ pub(crate) enum KeymapError {
     Uncompilable,
     /// The keymap defines no layout group.
     NoLayouts,
-    /// The keymap has no key producing `Shift_L`, so no shifted level can
-    /// be typed.
+    /// The keymap has no key producing `Shift_L` or `Shift_R`, so no shifted
+    /// level can be typed.
     NoShiftKey,
 }
 
@@ -126,11 +126,14 @@ impl CompiledKeymap {
             .collect();
 
         let level_keys = LevelKeys {
-            shift: find_key(keymap, &keycodes, xkb::keysyms::KEY_Shift_L),
+            shift: find_key(keymap, &keycodes, xkb::keysyms::KEY_Shift_L)
+                .or_else(|| find_key(keymap, &keycodes, xkb::keysyms::KEY_Shift_R)),
             level3: find_key(keymap, &keycodes, xkb::keysyms::KEY_ISO_Level3_Shift),
             level5: find_key(keymap, &keycodes, xkb::keysyms::KEY_ISO_Level5_Shift),
         };
-        let shift = level_keys.shift.ok_or(KeymapError::NoShiftKey)?;
+        if level_keys.shift.is_none() {
+            return Err(KeymapError::NoShiftKey);
+        }
 
         let mut modifiers_by_keycode = BTreeMap::new();
         for keysym in [
@@ -189,7 +192,6 @@ impl CompiledKeymap {
             realisable.entry(mask).or_insert(held);
         }
         debug_assert!(realisable.contains_key(&0));
-        let _ = shift;
 
         let mut groups = Vec::with_capacity(layouts as usize);
         for group in 0..layouts {

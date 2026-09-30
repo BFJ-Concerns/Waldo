@@ -83,6 +83,16 @@ impl KeyboardModel {
         &mut self,
         prepared: PreparedKeyboardAction,
     ) -> Result<Vec<KeyboardTransition>, ProtocolError> {
+        // Refuse before recording anything: a plan that fails emits no
+        // transition, so it must leave no announcement behind either.
+        if matches!(prepared, PreparedKeyboardAction::Text(_)) && self.has_active_modifiers() {
+            return Err(ProtocolError {
+                code: ErrorCode::UnsupportedCapability,
+                message: "virtual-keyboard text is unavailable while an explicit modifier or lock state is active"
+                    .into(),
+                retryable: false,
+            });
+        }
         let mut transitions = Vec::new();
         if self.announced_group != Some(self.group) {
             transitions.push(self.modifiers_transition());
@@ -101,14 +111,6 @@ impl KeyboardModel {
                 }
             }
             PreparedKeyboardAction::Text(sequences) => {
-                if self.has_active_modifiers() {
-                    return Err(ProtocolError {
-                        code: ErrorCode::UnsupportedCapability,
-                        message: "virtual-keyboard text is unavailable while an explicit modifier or lock state is active"
-                            .into(),
-                        retryable: false,
-                    });
-                }
                 for stroke in sequences.into_iter().flatten() {
                     for held in &stroke.held {
                         self.push_key(&mut transitions, *held, InputState::Pressed);
@@ -319,5 +321,32 @@ mod tests {
         assert_eq!(refused.code, ErrorCode::UnsupportedCapability);
         assert_eq!(model.clear_modifier_state(), Some(modifiers(0, 0, 0)));
         assert!(!model.has_active_modifiers());
+    }
+
+    #[test]
+    fn a_refused_text_plan_leaves_no_group_announcement_behind() {
+        let keymap = keymap("gb,us");
+        let mut model = model(&keymap, 0);
+        model.announced_group = Some(0);
+        let caps = named(&keymap, xkb::keysyms::KEY_Caps_Lock);
+        model
+            .plan(PreparedKeyboardAction::Chord(vec![caps]))
+            .unwrap();
+        let lock_mask = keymap.locking_modifiers_by_keycode[&caps];
+        model.set_group(1);
+        assert!(
+            model
+                .plan(PreparedKeyboardAction::Text(Vec::new()))
+                .is_err()
+        );
+        assert_eq!(model.announced_group, Some(0));
+        let a = named(&keymap, xkb::Keysym::from_char('a').raw());
+        let transitions = model
+            .plan(PreparedKeyboardAction::Key {
+                keycode: a,
+                state: InputState::Pressed,
+            })
+            .unwrap();
+        assert_eq!(transitions[0], modifiers(0, lock_mask, 1));
     }
 }

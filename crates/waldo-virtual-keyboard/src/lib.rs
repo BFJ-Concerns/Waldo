@@ -156,6 +156,10 @@ struct KeyboardState {
     keymap: CompiledKeymap,
     group: u32,
     model: KeyboardModel,
+    /// Set when the compositor changed to a keymap that could not be
+    /// adopted: the tables no longer match the compositor, so every action
+    /// is refused with this until a usable keymap arrives.
+    stale: Option<ProtocolError>,
 }
 
 impl KeyboardState {
@@ -197,6 +201,7 @@ impl KeyboardState {
                 keymap,
                 group,
                 model,
+                stale: None,
             },
             origin,
         ))
@@ -206,12 +211,17 @@ impl KeyboardState {
     /// active now, or reports why the keyboard no longer matches.
     fn refresh(&mut self, active_layout: &ActiveLayoutSource) -> Result<(), ProtocolError> {
         if let Some(text) = self.device.poll_keymap()? {
-            let keymap = CompiledKeymap::compile(&text).map_err(|error| {
-                unsupported_layout(format!(
-                    "the compositor's new keymap cannot be used: {error}"
-                ))
-                .error
-            })?;
+            let keymap = match CompiledKeymap::compile(&text) {
+                Ok(keymap) => keymap,
+                Err(error) => {
+                    let error = unsupported_layout(format!(
+                        "the compositor's new keymap cannot be used: {error}"
+                    ))
+                    .error;
+                    self.stale = Some(error.clone());
+                    return Err(error);
+                }
+            };
             self.device.upload_keymap(&keymap.text)?;
             self.model = KeyboardModel::new(
                 keymap.modifiers_by_keycode.clone(),
@@ -219,6 +229,10 @@ impl KeyboardState {
                 self.group,
             );
             self.keymap = keymap;
+            self.stale = None;
+        }
+        if let Some(error) = &self.stale {
+            return Err(error.clone());
         }
         self.group = active_group(active_layout, &self.keymap)?;
         self.model.set_group(self.group);
