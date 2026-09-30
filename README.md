@@ -22,6 +22,8 @@ waldo query --include-windows
 The installer builds `waldod`, `waldo` and `waldo-mcp`, enables the user service,
 installs the personal plugin and records the discovered environment at
 `${XDG_STATE_HOME:-$HOME/.local/state}/waldo/environment.json`.
+The installed plugin launches `waldo-mcp` by its resolved absolute path under
+the Cargo install root, so later agent sessions need no additional `PATH` setup.
 It currently requires Cargo, Codex, Git, jq, realpath, rsync, sha256sum and
 systemctl on `PATH`, plus an authenticated Codex session for its installation
 proof. When Claude Code is present, canonical installation also registers the

@@ -118,6 +118,27 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(manifest["owner"]["name"], 'Workshop "Owner"')
                 self.assertEqual(manifest["plugins"][0]["source"]["path"], "./plugins/waldo")
 
+    def test_plugin_copy_uses_absolute_mcp_binary_without_changing_source(self):
+        source = REPO / "plugins/waldo/.mcp.json"
+        original = source.read_bytes()
+        destination = self.root / 'cargo root " $place'
+        install_root = self.root / "rehearsal"
+        plugin_home = install_root / "home/plugins/waldo"
+        # Execute the installer's copy/rewrite block, stopping before registration.
+        installer = (REPO / "install-local").read_text()
+        copy_step = installer.split('failure_stage="plugin installation"\n', 1)[1].split(
+            '\nif [[ "$plugin_home" == "$install_home"/* ]]; then', 1)[0]
+        self.successful_steps('resolve_installation\n' + copy_step,
+                              WALDO_INSTALL_ROOT=str(install_root),
+                              WALDO_CARGO_INSTALL_ROOT=str(destination))
+        installed = json.loads((plugin_home / ".mcp.json").read_text())
+        self.assertEqual(installed["mcpServers"]["waldo"]["command"],
+                         str(destination / "bin/waldo-mcp"))
+        expected = json.loads(original)
+        expected["mcpServers"]["waldo"]["command"] = str(destination / "bin/waldo-mcp")
+        self.assertEqual(installed, expected)
+        self.assertEqual(source.read_bytes(), original)
+
     def test_readiness_queries_real_controller_via_environment_and_settings_file(self):
         for source in ("environment", "file"):
             with self.subTest(source=source):

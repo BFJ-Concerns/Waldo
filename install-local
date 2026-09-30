@@ -304,6 +304,11 @@ fi
 failure_stage="plugin installation"
 install -d -m 0755 "$plugin_home"
 rsync -a --delete "$repo_root/plugins/waldo/" "$plugin_home/"
+mcp_manifest_tmp="$(mktemp)"
+jq --arg command "$mcp_bin" '.mcpServers.waldo.command = $command' \
+    "$plugin_home/.mcp.json" >"$mcp_manifest_tmp"
+install -m 0644 "$mcp_manifest_tmp" "$plugin_home/.mcp.json"
+rm -f -- "$mcp_manifest_tmp"
 cachebuster="$(date -u +%Y%m%d%H%M%S)"
 for client in codex claude; do
     plugin_manifest="$plugin_home/.$client-plugin/plugin.json"
