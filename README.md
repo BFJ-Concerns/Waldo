@@ -20,20 +20,35 @@ waldo query --include-windows
 ```
 
 The installer builds `waldod`, `waldo` and `waldo-mcp`, enables the user service,
-installs the personal plugin and records the discovered environment at
+registers the plugin in Claude Code through a personal marketplace, proves
+the installation through one real headless Claude Code turn, and records the
+discovered environment at
 `${XDG_STATE_HOME:-$HOME/.local/state}/waldo/environment.json`.
 The installed plugin launches `waldo-mcp` by its resolved absolute path under
 the Cargo install root, so later agent sessions need no additional `PATH` setup.
-It currently requires Cargo, Codex, Git, jq, realpath, rsync, sha256sum and
-systemctl on `PATH`, plus an authenticated Codex session for its installation
-proof. When Claude Code is present, canonical installation also registers the
-plugin there. The installer still uses Codex to verify plugin loading and MCP
-image delivery; a Claude-Code-only installation is not yet supported.
+It requires Cargo, Claude Code (`claude`, logged in), Git, jq, realpath,
+rsync, sha256sum and systemctl on `PATH`.
+
+The proof turn runs Claude Code with the built-in tools removed and only the
+read-only Waldo tools permitted, from an empty private directory; it passes
+only when the transcript shows the plugin loaded from the marketplace, its
+MCP server connected, and one Observe tool result carrying an image content
+block inside the turn. The model's reply is never the evidence. The
+environment file records the proof summary under `installation.agents.claude`
+and nothing is recorded as available without it.
+
+Codex support is best-effort. When `codex` is on `PATH` the installer also
+registers the plugin in Codex's marketplace and runs the same proof turn
+there, recording the outcome under `installation.agents.codex`; a Codex
+failure is reported and recorded, never fatal, and an absent Codex is
+recorded as `{"present": false}`.
 
 `WALDO_INSTALL_ROOT` selects a disposable installation tree and a separate
-controller socket. This mode leaves the canonical service alone and removes
-its temporary controller on exit; it still requires access to an existing
-Codex login for verification.
+controller socket. This mode leaves the canonical service and the operator's
+Claude Code configuration alone: the candidate plugin is loaded for the proof
+turn only, with `claude --plugin-dir`, and the temporary controller is
+removed on exit. The Codex half of a rehearsal links the operator's existing
+Codex login into a private Codex home.
 
 ## Controller and tools
 
@@ -146,14 +161,14 @@ child so they cannot connect to the live controller.
 | --- | --- | --- |
 | `WALDO_INSTALL_ROOT` | unset | Names a disposable installation tree for a rehearsal install that leaves the canonical service alone; the settings below default beneath it. |
 | `WALDO_CARGO_INSTALL_ROOT` | `${CARGO_INSTALL_ROOT:-${CARGO_HOME:-~/.cargo}}` | Cargo install root; binaries land in `<root>/bin`. Rehearsal default: `<install root>/cargo`. Relative paths are resolved from the invocation directory. |
-| `WALDO_MARKETPLACE_NAME` | `personal` | Marketplace name used in both manifests, plugin registration and the Codex cache lookup. |
+| `WALDO_MARKETPLACE_NAME` | `personal` | Marketplace name used in both manifests, plugin registration and the Codex cache lookup. Registration refuses a Claude Code marketplace of this name that lives elsewhere. |
 | `WALDO_MARKETPLACE_OWNER` | `BFJ Concerns` | Owner name written into both marketplace manifests. |
-| `WALDO_PLUGIN_HOME` | `~/plugins/waldo` | Where the plugin source is copied for the agents' marketplaces. |
-| `WALDO_MARKETPLACE` | `~/.agents/plugins/marketplace.json` | The Codex marketplace file the plugin is registered in. |
+| `WALDO_PLUGIN_HOME` | `~/plugins/waldo` | Where the plugin source is copied for the agents' marketplaces. Its parent directory is the Claude Code marketplace, whose manifest `<parent>/.claude-plugin/marketplace.json` keeps any other plugins it lists. |
+| `WALDO_MARKETPLACE` | `~/.agents/plugins/marketplace.json` | The Codex marketplace file the plugin is registered in; other plugins it lists are kept. |
 | `WALDO_SERVICE_FILE` | `~/.config/systemd/user/waldod.service` | Where the user service file is written; the unit name stays `waldod.service`. |
 | `WALDO_PROFILE_FILE` | `${XDG_STATE_HOME:-~/.local/state}/waldo/environment.json` | Where the recorded installation environment is written. |
-| `WALDO_CODEX_HOME` | `<install root>/codex` | Rehearsal installs only: the Codex home used for the installation proof. |
-| `WALDO_CODEX_AUTH_SOURCE` | `${CODEX_HOME:-~/.codex}/auth.json` | Rehearsal installs only: the existing Codex login linked into that home. |
+| `WALDO_CODEX_HOME` | `<install root>/codex` | Rehearsal installs with `codex` present only: the Codex home used for the best-effort Codex proof. |
+| `WALDO_CODEX_AUTH_SOURCE` | `${CODEX_HOME:-~/.codex}/auth.json` | Rehearsal installs with `codex` present only: the existing Codex login linked into that home. |
 | `WALDO_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/waldo-install-<hash>` | Rehearsal installs only: the runtime directory holding the temporary controller socket. |
 
 ## Image coordinates and results
