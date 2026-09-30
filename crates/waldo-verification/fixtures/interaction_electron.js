@@ -1,4 +1,4 @@
-#!/usr/bin/env electron39
+#!/usr/bin/env electron
 "use strict";
 
 const path = require("node:path");

@@ -746,11 +746,7 @@ fn run_coherent_act(
     )?;
     let targets = targets(&observation, seed, spec, &initial)?;
 
-    let mut wait_process = Command::new("/usr/bin/sleep")
-        .arg("2")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut wait_process = wait_command().spawn()?;
     let wait_pid = wait_process.id();
     let wait_reaper = thread::spawn(move || wait_process.wait());
     let template_path = options.corpus_directory.join("coherent-act.json");
@@ -1266,3 +1262,13 @@ fn path_text(path: &Path) -> Result<&str, Box<dyn std::error::Error>> {
     path.to_str()
         .ok_or_else(|| format!("non-UTF-8 path: {}", path.display()).into())
 }
+
+fn wait_command() -> Command {
+    let mut command = Command::new("sleep");
+    command.arg("2").stdout(Stdio::null()).stderr(Stdio::null());
+    command
+}
+
+#[cfg(test)]
+#[path = "tests/sleep_defaults.rs"]
+mod sleep_defaults;

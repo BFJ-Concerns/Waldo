@@ -107,6 +107,7 @@ the keyboard route unavailable and says why.
 | `WALDO_SOCKET_PATH` | `$XDG_RUNTIME_DIR/waldo/controller.sock` | The private controller socket `waldod` serves and both bindings connect to. |
 | `WALDO_LEASE_IDLE_TIMEOUT_SECONDS` | `30` | Seconds without a request or a running batch before a driving lease lapses and held input is released. Whole seconds, at least 1; the timeout cannot be disabled. |
 | `WALDO_CLIPBOARD_PASTE_CHORD` | `ctrl+v` | Clipboard-paste key names separated by `+`; whitespace around each name is trimmed and empty names are refused at start-up. Key names use the virtual keyboard vocabulary and are checked against the active layout at paste time; an unavailable key fails without a default-chord fallback. |
+| `WALDO_MODEL_IMAGE_MAX_EDGE` | `2048` | Maximum longest edge in pixels for MCP images. A positive whole number; smaller images are delivered unscaled. Restart the MCP process after changing it. |
 
 Installer settings are read from the environment of the `./install-local`
 invocation only:
@@ -131,7 +132,8 @@ it has already been accounted for in the image.
 
 `source_pixels` gives the desktop-oriented capture dimensions.
 `model_image_pixels` gives the delivered image dimensions. MCP preserves aspect
-ratio and limits the longest image edge to 2048 pixels; the CLI returns the
+ratio and limits the longest image edge to `WALDO_MODEL_IMAGE_MAX_EDGE`
+(default 2048 pixels), leaving smaller images unscaled; the CLI returns the
 controller image without that presentation resize. An image point maps into
 `logical_bounds` as follows:
 

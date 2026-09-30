@@ -8,6 +8,7 @@ use waldo_verification::{
 mod clipboard_outside_in;
 mod final_campaign;
 mod outside_in;
+mod private_json;
 mod toolkit_preflight;
 
 #[derive(Debug, Parser)]
@@ -107,7 +108,7 @@ enum Command {
         fixture_directory: PathBuf,
         #[arg(long, default_value = "python3")]
         python: PathBuf,
-        #[arg(long, default_value = "/usr/bin/electron39")]
+        #[arg(long, default_value = "electron")]
         electron: PathBuf,
         #[arg(long, default_value_t = 0xd35c)]
         seed: u64,
@@ -131,7 +132,7 @@ enum Command {
         plugin_manifest: PathBuf,
         #[arg(long, default_value = "python3")]
         python: PathBuf,
-        #[arg(long, default_value = "/usr/bin/electron39")]
+        #[arg(long, default_value = "electron")]
         electron: PathBuf,
         #[arg(long, default_value_t = 0xf17a)]
         seed: u64,
@@ -298,12 +299,16 @@ fn emit_json(
     value: &impl serde::Serialize,
     output: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut json = serde_json::to_vec_pretty(value)?;
-    json.push(b'\n');
     if let Some(output) = output {
-        fs::write(output, json)?;
+        private_json::write(output, value)?;
     } else {
+        let mut json = serde_json::to_vec_pretty(value)?;
+        json.push(b'\n');
         print!("{}", String::from_utf8(json)?);
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/electron_defaults.rs"]
+mod electron_defaults;

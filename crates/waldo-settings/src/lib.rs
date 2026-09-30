@@ -52,6 +52,12 @@ pub const CLIPBOARD_PASTE_CHORD: SettingSpec = SettingSpec {
     default: Some("ctrl+v"),
 };
 
+/// Longest edge of images delivered through MCP, in pixels.
+pub const MODEL_IMAGE_MAX_EDGE: SettingSpec = SettingSpec {
+    name: "WALDO_MODEL_IMAGE_MAX_EDGE",
+    default: Some("2048"),
+};
+
 /// Every declared setting. A setting absent from this list is unreadable
 /// through [`Settings`], and a name present here without a README row fails
 /// the documentation test.
@@ -59,6 +65,7 @@ pub const ALL: &[SettingSpec] = &[
     SOCKET_PATH,
     LEASE_IDLE_TIMEOUT_SECONDS,
     CLIPBOARD_PASTE_CHORD,
+    MODEL_IMAGE_MAX_EDGE,
 ];
 
 /// Where a resolved value came from, for error messages.
@@ -276,6 +283,30 @@ impl Settings {
         Ok(keys)
     }
 
+    /// Maximum delivered MCP image edge: a positive whole number of pixels.
+    pub fn model_image_max_edge(&self) -> Result<u32, SettingsError> {
+        let (value, source) = match self.text(MODEL_IMAGE_MAX_EDGE)? {
+            Some((value, source)) => (value, source),
+            None => {
+                return Ok(MODEL_IMAGE_MAX_EDGE
+                    .default
+                    .expect("image edge declares a default")
+                    .parse()
+                    .expect("the declared default parses"));
+            }
+        };
+        value
+            .parse::<u32>()
+            .ok()
+            .filter(|edge| *edge > 0)
+            .ok_or_else(|| SettingsError::InvalidValue {
+                name: MODEL_IMAGE_MAX_EDGE.name,
+                source: source.clone(),
+                value: value.to_owned(),
+                reason: "expected a positive whole number of pixels fitting u32".into(),
+            })
+    }
+
     /// The driving lease's idle timeout: at least one second, never disabled.
     pub fn lease_idle_timeout(&self) -> Result<Duration, SettingsError> {
         let (value, source) = match self.text(LEASE_IDLE_TIMEOUT_SECONDS)? {
@@ -436,6 +467,50 @@ mod tests {
             settings.raw(SOCKET_PATH),
             Some((_, Source::File(path))) if path == Path::new("/etc/waldo/settings")
         ));
+    }
+
+    #[test]
+    fn model_image_edge_defaults_to_2048() {
+        assert_eq!(
+            settings(None, &[]).unwrap().model_image_max_edge().unwrap(),
+            2048
+        );
+    }
+
+    #[test]
+    fn model_image_edge_resolves_environment_over_file() {
+        let file = "WALDO_MODEL_IMAGE_MAX_EDGE=640\n";
+        assert_eq!(
+            settings(Some(file), &[])
+                .unwrap()
+                .model_image_max_edge()
+                .unwrap(),
+            640
+        );
+        assert_eq!(
+            settings(Some(file), &[("WALDO_MODEL_IMAGE_MAX_EDGE", "1280")])
+                .unwrap()
+                .model_image_max_edge()
+                .unwrap(),
+            1280
+        );
+    }
+
+    #[test]
+    fn model_image_edge_refuses_invalid_values_by_name() {
+        for value in ["0", "no", "-1", "4294967296"] {
+            let error = settings(None, &[("WALDO_MODEL_IMAGE_MAX_EDGE", value)])
+                .unwrap()
+                .model_image_max_edge()
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SettingsError::InvalidValue {
+                    name: "WALDO_MODEL_IMAGE_MAX_EDGE",
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

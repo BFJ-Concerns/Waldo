@@ -147,10 +147,17 @@ struct TransientDirectory(PathBuf);
 
 impl TransientDirectory {
     fn create(seed: u64) -> Result<Self, Box<dyn std::error::Error>> {
-        let base = if Path::new("/dev/shm").is_dir() {
-            Path::new("/dev/shm")
+        Self::create_with_shared_memory(seed, Path::new("/dev/shm"))
+    }
+
+    fn create_with_shared_memory(
+        seed: u64,
+        shared_memory: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let base = if shared_memory.is_dir() {
+            shared_memory.to_path_buf()
         } else {
-            Path::new("/tmp")
+            std::env::temp_dir()
         };
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path = base.join(format!(
@@ -1403,3 +1410,7 @@ mod tests {
         assert!(!is_pre_dispatch_focus_changed(&similar_code));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/transient_defaults.rs"]
+mod transient_defaults;

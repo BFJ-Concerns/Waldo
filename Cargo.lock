@@ -1317,6 +1317,7 @@ dependencies = [
  "waldo-protocol",
  "waldo-screencopy",
  "waldo-service",
+ "waldo-settings",
  "waldo-socket",
 ]
 
