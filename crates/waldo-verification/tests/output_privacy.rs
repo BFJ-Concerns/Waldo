@@ -12,12 +12,16 @@ struct ScratchDirectory(PathBuf);
 
 impl ScratchDirectory {
     fn new() -> Self {
-        let path = PathBuf::from("/tmp").join(format!(
+        let path = std::env::temp_dir().join(format!(
             "waldo-output-privacy-{}-{}",
             std::process::id(),
             NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
         println!("Created scratch directory: {}", path.display());
         Self(path)
     }
