@@ -11,7 +11,8 @@ is kept truthful in the same change as any behaviour it describes.
 
 `scripts/gate` is the repository's quality gate: formatting, `cargo check`,
 Clippy with warnings denied, `systemd-analyze --user verify` on the service
-file, and `cargo test --workspace`. CI runs exactly that command on every push
+file, `cargo test --workspace`, and the Python launcher tests under
+`scripts/tests`. CI runs exactly that command on every push
 and pull request, and every pull request — documentation included — is
 expected to pass it. Run it inside the Niri session so the live-session
 tests (screencopy, Niri IPC, virtual input, clipboard, AT-SPI) execute rather
