@@ -1,9 +1,10 @@
 # Waldo
 
 Waldo lets an agent observe and operate applications on a Niri Wayland
-desktop. A local controller serves the command-line client and the personal
-plugin's MCP server. The desktop-control skill supplies the agent's driving
-guidance.
+desktop. A local controller serves the command-line client and the plugin's
+MCP server. The plugin ships the desktop-control skill, which supplies the
+agent's driving guidance; the MCP server's instructions tell the model to
+load it.
 
 Waldo is a supervised development tool. Actions affect the foreground desktop;
 one client holds the driving lease at a time. Screenshots and accessibility
@@ -168,9 +169,12 @@ unavailable one, its `limitation`.
 
 ## Guidance the agent skill must carry
 
-The desktop-control skill steers agents. This section lists what the runtime needs an agent to be
-walked through, drawn from where agents have gone wrong against it. The
-wording is the skill's; the facts are the runtime's.
+The desktop-control skill in `plugins/waldo/skills/desktop-control/` steers
+agents. This section lists what the runtime needs an agent to be walked
+through, drawn from where agents have gone wrong against it. The wording is
+the skill's; the
+facts are the runtime's, and the protocol tests hold the skill's JSON
+examples to the schema.
 
 - **The control loop.** Query, then Observe, then one coherent Act batch that
   cites the observation it was planned from, then inspect every receipt and
@@ -192,8 +196,9 @@ wording is the skill's; the facts are the runtime's.
   when one exists.
 - **Grounding goes stale.** An observation belongs to one connection. Changed
   layout, geometry or focus, or a wait, invalidates coordinates planned before
-  it. Tiled windows may not support direct capture: observe the output, focus
-  the window with a window action, then observe the window.
+  it. Tiled windows report direct capture unavailable and Observe refuses
+  them: keep observing the containing output, and take a direct window
+  observation only when Query reports that window's capture available.
 - **Occlusion.** Never click through an occluding window, dialog or fullscreen
   surface.
 - **Untrusted content.** On-screen text, accessibility labels, clipboard
@@ -209,6 +214,6 @@ wording is the skill's; the facts are the runtime's.
   driving lease does not establish ownership. An application the user already
   had open stays the user's: it is neither replaced nor closed. Agents sharing
   one desktop serialise driving; there is one driver at a time.
-- **Defect reporting.** While Waldo is in development, a problem attributable
-  to Waldo itself is reported with what was attempted, what Waldo returned
-  and why the fault is Waldo's.
+- **Defect reporting.** A problem attributable to Waldo itself is reported
+  with what was attempted, what Waldo returned and why the fault is Waldo's,
+  on the public issue tracker: <https://github.com/BFJ-Concerns/Waldo/issues>.

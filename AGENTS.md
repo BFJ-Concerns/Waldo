@@ -1,46 +1,70 @@
 # Waldo
 
-## Development
+Waldo lets a Claude Code session observe and operate applications on a live
+Niri Wayland desktop: a local controller (`waldod`) serves a private socket,
+and two bindings speak its versioned protocol — the `waldo` CLI for
+full-fidelity reproduction and diagnostics, and `waldo-mcp`, the plugin's MCP
+server, for the agent's normal loop. `README.md` is the operator's guide and
+is kept truthful in the same change as any behaviour it describes.
 
-Run workspace checks from the repository root:
+## The gate
 
-- `cargo check --workspace` for normal iteration.
-- `cargo test --workspace` for the full suite. Some tests connect to the active
-  Niri, Wayland screencopy, and AT-SPI session, so run them inside the operator's
-  graphical session.
-- `cargo clippy --workspace --all-targets -- -D warnings` for the strict lint
-  gate.
-- `systemd-analyze --user verify packaging/waldod.service` after service-file
-  changes.
+`scripts/gate` is the repository's quality gate: formatting, `cargo check`,
+Clippy with warnings denied, `systemd-analyze --user verify` on the service
+file, and `cargo test --workspace`. CI runs exactly that command on every push
+and pull request. Run it before proposing a change; run it inside the Niri
+session so the live-session tests (screencopy, Niri IPC, virtual input,
+clipboard, AT-SPI) execute rather than skip — a skip is reported as not run,
+never as a pass. For fast iteration, `cargo check --workspace` alone.
 
-Run `./install-local` only when a change is ready to replace the operator's live
-installation. It requires the active Niri session and updates the installed
-binaries, user service, personal plugin, marketplace entry, and discovered
-environment record. `plugins/waldo/` is the plugin source; do not patch the
-installed copy.
-
-With the installed service running, use `waldo query` to inspect the current
-profile, capabilities, outputs, and keyboard layout through the controller.
+Run `./install-local` only when a change is ready to replace the operator's
+live installation: it builds and installs the binaries, enables the user
+service, installs the plugin and records the proved environment. It needs the
+active Niri session. `plugins/waldo/` is the plugin source; never patch the
+installed copy. With the service running, `waldo query` shows the current
+profile, capabilities, outputs and keyboard layout through the controller.
 
 ## Architecture
 
-- `waldo-protocol` owns the shared wire schema and action/result types.
+- `waldo-protocol` owns the shared wire schema and action/result types. An
+  incompatible request change needs a new schema major; additive result
+  fields stay ignorable.
 - `waldo-controller` owns sessions and the driving lease. `waldo-service`
-  connects that state machine to the live desktop, batches, verification, and
+  connects that state machine to the live desktop, batches, verification and
   the private controller socket.
 - `waldo-cli` and `waldo-mcp` are bindings over the same controller protocol;
   `waldo-socket` supplies their transport.
+- `waldo-settings` declares every operator setting once — each value that
+  differs between machines or people — and the README's Configuration section
+  names each one; a test enforces that.
 - `waldo-action` grounds ordered actions. The Niri, screencopy, accessibility,
-  clipboard, virtual-pointer, and virtual-keyboard crates provide the desktop
+  clipboard, virtual-pointer and virtual-keyboard crates provide the desktop
   backends.
-- `waldo-verification` contains deterministic fixtures and outside-in evidence
+- `waldo-verification` holds deterministic fixtures and outside-in evidence
   for the live contract.
 
 ## Cross-machine adaptability
 
-Build Waldo from runtime-discovered capabilities and reported desktop state so
-it remains useful across machines. Derive behaviour from output geometry,
-scale, transforms, keyboard layout, compositor capabilities, and application
-state. Keep workstation-specific identifiers, paths, timings, applications,
-and display layouts out of product logic; when a genuine machine difference
-needs policy, expose it as a discovered capability or explicit configuration.
+Derive behaviour from runtime-discovered desktop state — output geometry,
+scale, transforms, the compositor's keyboard layout, compositor capabilities,
+application state — never from workstation-specific identifiers. Keep paths,
+timings, applications and display layouts out of product logic. When a
+genuine machine difference needs policy, expose it as a discovered capability
+or as a setting declared in `waldo-settings` and documented in the README;
+tuning internals (poll intervals, quiet periods, deadlines, resource caps)
+stay internal.
+
+## The desktop-control skill
+
+`plugins/waldo/skills/desktop-control/SKILL.md` is the driving guidance the
+plugin ships and the MCP server's instructions tell the model to load. A
+change the runtime needs the skill to carry — a new action
+variant, a changed result field, a grounding rule learnt from an agent going
+wrong — is described in the README's "Guidance the agent skill must carry"
+section in the same change, and the skill is updated to match. The
+protocol tests check that every JSON example in the skill validates against
+the schema and that every action variant has one, so a runtime change that
+outgrows the skill fails the gate until the skill catches up.
+
+Defects in Waldo are reported on the public issue tracker named in the
+README.
