@@ -25,6 +25,7 @@ use crate::{
 #[derive(Clone)]
 pub struct McpServer {
     socket: Arc<PathBuf>,
+    model_image_max_edge: u32,
     client_id: ClientId,
     controller: Arc<Mutex<Option<PipelinedControllerClient>>>,
     next_request_id: Arc<AtomicU64>,
@@ -32,10 +33,24 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(socket: impl Into<PathBuf>) -> Result<Self, McpError> {
+        let default = waldo_settings::MODEL_IMAGE_MAX_EDGE
+            .default
+            .expect("image edge declares a default")
+            .parse()
+            .expect("the declared default parses");
+        Self::with_image_max_edge(socket, default)
+    }
+
+    /// Uses the operator-resolved limit for MCP image presentation.
+    pub fn with_image_max_edge(
+        socket: impl Into<PathBuf>,
+        model_image_max_edge: u32,
+    ) -> Result<Self, McpError> {
         let client_id = ClientId::new(format!("waldo-mcp-{}", std::process::id()))
             .map_err(|_| McpError::InvalidClientId)?;
         Ok(Self {
             socket: Arc::new(socket.into()),
+            model_image_max_edge,
             client_id,
             controller: Arc::new(Mutex::new(None)),
             next_request_id: Arc::new(AtomicU64::new(2)),
@@ -138,7 +153,7 @@ impl McpServer {
             Err(error) => return Ok(crate::result::transport_failure(error.to_string())),
         };
         match response {
-            Ok(response) => Ok(tool_response(response)),
+            Ok(response) => Ok(tool_response(response, self.model_image_max_edge)),
             Err(error) => {
                 *self.controller.lock().await = None;
                 Ok(crate::result::transport_failure(error.to_string()))

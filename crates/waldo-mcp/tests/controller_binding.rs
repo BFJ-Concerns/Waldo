@@ -14,7 +14,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgba};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::oneshot,
 };
 use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
@@ -209,14 +209,16 @@ fn test_socket() -> PathBuf {
         .join("controller.sock")
 }
 
-async fn send(writer: &mut DuplexStream, value: Value) {
+async fn send(writer: &mut (impl tokio::io::AsyncWrite + Unpin), value: Value) {
     writer
         .write_all(format!("{value}\n").as_bytes())
         .await
         .unwrap();
 }
 
-async fn receive(reader: &mut tokio::io::Lines<BufReader<DuplexStream>>) -> Value {
+async fn receive(
+    reader: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+) -> Value {
     serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap()
 }
 
@@ -588,4 +590,97 @@ async fn resized_model_grid_maps_to_the_exact_final_pointer_consumer() {
     shutdown_tx.send(()).unwrap();
     service_task.await.unwrap().unwrap();
     let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn binary_resolves_image_edge_settings_and_reports_delivered_dimensions() {
+    let directory =
+        std::env::temp_dir().join(format!("waldo-mcp-image-edge-{}", std::process::id()));
+    fs::create_dir_all(directory.join("waldo")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        directory.join("waldo/settings"),
+        "WALDO_MODEL_IMAGE_MAX_EDGE=640\n",
+    )
+    .unwrap();
+    let path = directory.join("controller.sock");
+    let png = encoded_image(2560, 1440, |_, _| Rgba([17, 61, 101, 255]));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(GridInspector),
+        Arc::new(GridCapturer {
+            before: png.clone(),
+            after: png,
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(RecordingExecutor {
+            actions: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let service_task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    for (environment, expected) in [
+        (None, (640, 360)),
+        (Some("1280"), (1280, 720)),
+        (Some("3000"), (2560, 1440)),
+    ] {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_waldo-mcp"));
+        command
+            .env("XDG_CONFIG_HOME", &directory)
+            .env("WALDO_SOCKET_PATH", &path)
+            .env_remove("WALDO_MODEL_IMAGE_MAX_EDGE")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(value) = environment {
+            command.env("WALDO_MODEL_IMAGE_MAX_EDGE", value);
+        }
+        let mut child = command.spawn().unwrap();
+        let mut writer = child.stdin.take().unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap()).lines();
+        send(&mut writer, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).await;
+        assert!(receive(&mut reader).await["result"]["protocolVersion"].is_string());
+        send(
+            &mut writer,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        )
+        .await;
+        assert_eq!(
+            receive(&mut reader).await["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        send(&mut writer, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"observe","arguments":{"source":{"type":"output","output_id":"GRID-1"},"continue_from":null,"include_accessibility":false}}})).await;
+        let response = receive(&mut reader).await;
+        let png = BASE64
+            .decode(response["result"]["content"][1]["data"].as_str().unwrap())
+            .unwrap();
+        let delivered = image::load_from_memory_with_format(&png, ImageFormat::Png).unwrap();
+        assert_eq!(
+            delivered.dimensions(),
+            expected,
+            "setting must reach binary image presentation"
+        );
+        let coordinates = &response["result"]["structuredContent"]["observation"]["coordinates"];
+        assert_eq!(
+            coordinates["source_pixels"],
+            json!({"width":2560,"height":1440})
+        );
+        assert_eq!(
+            coordinates["model_image_pixels"],
+            json!({"width":expected.0,"height":expected.1})
+        );
+        drop(writer);
+        assert!(child.wait().await.unwrap().success());
+    }
+    shutdown_tx.send(()).unwrap();
+    service_task.await.unwrap().unwrap();
+    fs::remove_dir_all(directory).unwrap();
 }
