@@ -7,14 +7,12 @@ use waldo_protocol::{ErrorCode, Observation, PixelSize, ProtocolError, ServerMes
 
 use crate::tools::ToolResult;
 
-const MAX_MODEL_IMAGE_EDGE: u32 = 2048;
-
-pub(crate) fn tool_response(mut response: ServerMessage) -> Value {
+pub(crate) fn tool_response(mut response: ServerMessage, max_edge: u32) -> Value {
     if let ServerMessage::Error { error, .. } = &response {
         return tool_failure(error.clone());
     }
 
-    if let Err(error) = present_response_images(&mut response, MAX_MODEL_IMAGE_EDGE) {
+    if let Err(error) = present_response_images(&mut response, max_edge) {
         return tool_failure(ProtocolError {
             code: ErrorCode::Internal,
             message: format!("image presentation failed: {error}"),
