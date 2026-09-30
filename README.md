@@ -111,9 +111,11 @@ Waldo presses the dead key and then the base key; the character arrives
 only where the receiving application composes dead keys. GTK 4 on Wayland
 composes them only with a running input method or
 `GTK_IM_MODULE=gtk-im-context-simple`. Where exact text matters and
-composition is uncertain, the clipboard-paste route, or the automatic
-route, which tries clipboard paste before the keyboard, delivers the
-string exactly.
+composition is uncertain, use the clipboard-paste route, which delivers
+the string exactly. The automatic route tries clipboard paste before the
+keyboard but falls back to the keyboard when clipboard paste is
+unavailable, so its receipt names the route that actually carried the
+text.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
