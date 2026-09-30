@@ -107,7 +107,7 @@ enum Command {
         fixture_directory: PathBuf,
         #[arg(long, default_value = "python3")]
         python: PathBuf,
-        #[arg(long, default_value = "/usr/bin/electron39")]
+        #[arg(long, default_value = "electron")]
         electron: PathBuf,
         #[arg(long, default_value_t = 0xd35c)]
         seed: u64,
@@ -131,7 +131,7 @@ enum Command {
         plugin_manifest: PathBuf,
         #[arg(long, default_value = "python3")]
         python: PathBuf,
-        #[arg(long, default_value = "/usr/bin/electron39")]
+        #[arg(long, default_value = "electron")]
         electron: PathBuf,
         #[arg(long, default_value_t = 0xf17a)]
         seed: u64,
@@ -307,3 +307,7 @@ fn emit_json(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/electron_defaults.rs"]
+mod electron_defaults;
