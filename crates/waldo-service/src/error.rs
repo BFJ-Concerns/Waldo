@@ -5,6 +5,7 @@ use waldo_socket::TransportError;
 #[derive(Debug)]
 pub enum ServiceError {
     Io(io::Error),
+    Settings(waldo_settings::SettingsError),
     Transport(TransportError),
     UnsafeSocketPath(String),
     PeerCredential(String),
@@ -16,6 +17,7 @@ impl fmt::Display for ServiceError {
         match self {
             Self::Io(error) => write!(formatter, "controller service I/O failed: {error}"),
             Self::Transport(error) => error.fmt(formatter),
+            Self::Settings(error) => error.fmt(formatter),
             Self::UnsafeSocketPath(reason) => {
                 write!(
                     formatter,
@@ -37,6 +39,7 @@ impl Error for ServiceError {
         match self {
             Self::Io(error) => Some(error),
             Self::Transport(error) => Some(error),
+            Self::Settings(error) => Some(error),
             _ => None,
         }
     }
@@ -51,5 +54,11 @@ impl From<io::Error> for ServiceError {
 impl From<TransportError> for ServiceError {
     fn from(value: TransportError) -> Self {
         Self::Transport(value)
+    }
+}
+
+impl From<waldo_settings::SettingsError> for ServiceError {
+    fn from(value: waldo_settings::SettingsError) -> Self {
+        Self::Settings(value)
     }
 }

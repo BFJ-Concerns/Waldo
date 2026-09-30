@@ -2720,7 +2720,7 @@ fn binding_refuses_a_symlinked_socket_directory() {
     let error = ControllerService::bind(
         linked.join("controller.sock"),
         Duration::from_secs(30),
-        vec!["ctrl".into(), "v".into()],
+        &waldo_settings::Settings::from_sources(None, [], None).unwrap(),
     )
     .err()
     .expect("a symlinked socket directory must be refused");
@@ -2739,7 +2739,7 @@ fn binding_never_replaces_an_unrelated_file() {
     let error = ControllerService::bind(
         &path,
         Duration::from_secs(30),
-        vec!["ctrl".into(), "v".into()],
+        &waldo_settings::Settings::from_sources(None, [], None).unwrap(),
     )
     .err()
     .expect("an unrelated file at the socket path must be refused");
@@ -2763,7 +2763,7 @@ fn binding_does_not_change_an_existing_shared_directory() {
     let error = ControllerService::bind(
         &path,
         Duration::from_secs(30),
-        vec!["ctrl".into(), "v".into()],
+        &waldo_settings::Settings::from_sources(None, [], None).unwrap(),
     )
     .err()
     .expect("an existing shared directory must be refused");

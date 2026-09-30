@@ -19,7 +19,7 @@ async fn empty_clipboard_preservation_returns_through_the_service() {
     let service = ControllerService::bind(
         &socket,
         Duration::from_secs(30),
-        vec!["ctrl".into(), "v".into()],
+        &waldo_settings::Settings::from_sources(None, [], None).unwrap(),
     )
     .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

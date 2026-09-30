@@ -43,7 +43,7 @@ async fn observation_grounding_reaches_capture_and_fail_closed_target_checks() {
     let service = ControllerService::bind(
         &path,
         Duration::from_secs(30),
-        vec!["ctrl".into(), "v".into()],
+        &waldo_settings::Settings::from_sources(None, [], None).unwrap(),
     )
     .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

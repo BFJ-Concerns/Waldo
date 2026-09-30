@@ -141,7 +141,7 @@ impl ControllerService {
     pub fn bind(
         path: impl AsRef<Path>,
         idle_timeout: Duration,
-        paste_chord: Vec<String>,
+        settings: &waldo_settings::Settings,
     ) -> Result<Self, ServiceError> {
         let inspector: Arc<dyn SessionInspector> = Arc::new(NiriInspector);
         let capturer: Arc<dyn ScreenCapturer> = Arc::new(Screencopy);
@@ -170,8 +170,8 @@ impl ControllerService {
         let executor: Arc<dyn ActionExecutor> = Arc::new(DesktopActionExecutor::initialise(
             accessibility.as_ref().map(Arc::clone),
             active_layout,
-            paste_chord,
-        ));
+            settings,
+        )?);
         Self::bind_with_runtime_backends(
             path,
             idle_timeout,
