@@ -669,6 +669,28 @@ async fn binary_resolves_image_edge_settings_and_reports_delivered_dimensions() 
             "setting must reach binary image presentation"
         );
         let coordinates = &response["result"]["structuredContent"]["observation"]["coordinates"];
+        let mapping: waldo_protocol::CoordinateMapping =
+            serde_json::from_value(coordinates.clone()).unwrap();
+        let image_centre = LogicalPoint {
+            x: f64::from(delivered.width()) / 2.0,
+            y: f64::from(delivered.height()) / 2.0,
+        };
+        let logical_centre = LogicalPoint {
+            x: mapping.logical_bounds.origin.x
+                + image_centre.x * mapping.logical_bounds.width
+                    / f64::from(mapping.model_image_pixels.width),
+            y: mapping.logical_bounds.origin.y
+                + image_centre.y * mapping.logical_bounds.height
+                    / f64::from(mapping.model_image_pixels.height),
+        };
+        assert_eq!(
+            logical_centre,
+            LogicalPoint {
+                x: 1280.0,
+                y: 720.0
+            },
+            "delivered image centre must map to the logical capture centre"
+        );
         assert_eq!(
             coordinates["source_pixels"],
             json!({"width":2560,"height":1440})
