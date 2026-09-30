@@ -18,7 +18,8 @@ tests (screencopy, Niri IPC, virtual input, clipboard, AT-SPI) execute rather
 than skip — a skip is reported as not run, never as a pass. Those tests start
 their own controllers on private sockets and open their own fixture windows
 on the live desktop; they do not touch an installed service or its lease.
-For fast iteration between gate runs, `cargo check --workspace` alone.
+For fast iteration between gate runs, `scripts/gate --check` runs every stage
+but the test suite, and `cargo check --workspace` alone is faster still.
 
 Run `./install-local` only when a change is ready to replace the operator's
 live installation: it builds and installs the binaries, enables the user
