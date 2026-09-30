@@ -107,6 +107,14 @@ environment — `XKB_DEFAULT_LAYOUT`, and optionally `XKB_DEFAULT_VARIANT`,
 `waldod`'s environment; with neither, Query reports the keyboard route
 unavailable and says why.
 
+Waldo presses the dead key and then the base key; the character arrives
+only where the receiving application composes dead keys. GTK 4 on Wayland
+composes them only with a running input method or
+`GTK_IM_MODULE=gtk-im-context-simple`. Where exact text matters and
+composition is uncertain, the clipboard-paste route, or the automatic
+route, which tries clipboard paste before the keyboard, delivers the
+string exactly.
+
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `WALDO_SOCKET_PATH` | `$XDG_RUNTIME_DIR/waldo/controller.sock` | The private controller socket `waldod` serves and both bindings connect to. |
