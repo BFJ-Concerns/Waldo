@@ -13,17 +13,60 @@ use waldo_protocol::{Action, ActionRoute, ErrorCode, ProtocolError, TextRoutePre
 use waldo_virtual_keyboard::{ActiveLayoutSource, KeyboardUnavailable, VirtualKeyboardExecutor};
 use waldo_virtual_pointer::VirtualPointerExecutor;
 
+pub(crate) trait PasteClipboard: ActionExecutor {
+    type Snapshot;
+    fn snapshot(&self) -> Result<Self::Snapshot, ProtocolError>;
+    fn offer_text_once(&self, text: &str) -> Result<(), ActionExecutionFailure>;
+    fn is_empty(&self) -> Result<bool, ProtocolError>;
+    fn restore_temporary(&self, snapshot: Self::Snapshot) -> Result<(), ProtocolError>;
+    fn cleanup_preservation(&self);
+    fn clipboard_limitation(&self) -> Option<String>;
+}
+
+impl PasteClipboard for ClipboardExecutor {
+    fn clipboard_limitation(&self) -> Option<String> {
+        self.limitation()
+    }
+    type Snapshot = waldo_clipboard::ClipboardSnapshot;
+    fn snapshot(&self) -> Result<Self::Snapshot, ProtocolError> {
+        self.snapshot()
+    }
+    fn offer_text_once(&self, text: &str) -> Result<(), ActionExecutionFailure> {
+        self.offer_text_once(text)
+    }
+    fn is_empty(&self) -> Result<bool, ProtocolError> {
+        self.is_empty()
+    }
+    fn restore_temporary(&self, snapshot: Self::Snapshot) -> Result<(), ProtocolError> {
+        self.restore_temporary(snapshot)
+    }
+    fn cleanup_preservation(&self) {
+        self.cleanup_preservation();
+    }
+}
+
+pub(crate) trait PasteKeyboard: ActionExecutor + Sized {
+    fn initialise(active_layout: ActiveLayoutSource) -> Result<Self, KeyboardUnavailable>;
+}
+
+impl PasteKeyboard for VirtualKeyboardExecutor {
+    fn initialise(active_layout: ActiveLayoutSource) -> Result<Self, KeyboardUnavailable> {
+        Self::initialise(active_layout)
+    }
+}
+
 /// Routes each action to the one live backend which owns its semantics.
-pub(crate) struct DesktopActionExecutor {
+pub(crate) struct DesktopActionExecutor<C = ClipboardExecutor, K = VirtualKeyboardExecutor> {
     niri: NiriActionExecutor,
     pointer: Option<VirtualPointerExecutor>,
     /// The keyboard, or why there is none. A retryable failure (Niri not
     /// answering at start-up, say) is retried on the next use, so a
     /// transient fault at daemon start does not disable the route for the
     /// daemon's life.
-    keyboard: Mutex<Result<VirtualKeyboardExecutor, KeyboardUnavailable>>,
+    keyboard: Mutex<Result<K, KeyboardUnavailable>>,
     active_layout: ActiveLayoutSource,
-    clipboard: Option<ClipboardExecutor>,
+    clipboard: Option<C>,
+    paste_chord: Vec<String>,
     accessibility: Option<Arc<AccessibilityBackend>>,
 }
 
@@ -31,25 +74,42 @@ impl DesktopActionExecutor {
     pub(crate) fn initialise(
         accessibility: Option<Arc<AccessibilityBackend>>,
         active_layout: ActiveLayoutSource,
-    ) -> Self {
-        Self {
-            niri: NiriActionExecutor,
-            pointer: VirtualPointerExecutor::initialise().ok(),
-            keyboard: Mutex::new(VirtualKeyboardExecutor::initialise(Arc::clone(
-                &active_layout,
-            ))),
-            active_layout,
-            clipboard: ClipboardExecutor::initialise().ok(),
+        settings: &waldo_settings::Settings,
+    ) -> Result<Self, waldo_settings::SettingsError> {
+        Self::with_backends(
             accessibility,
-        }
+            Arc::clone(&active_layout),
+            settings,
+            VirtualPointerExecutor::initialise().ok(),
+            VirtualKeyboardExecutor::initialise(active_layout),
+            ClipboardExecutor::initialise().ok(),
+        )
+    }
+}
+
+impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
+    fn with_backends(
+        accessibility: Option<Arc<AccessibilityBackend>>,
+        active_layout: ActiveLayoutSource,
+        settings: &waldo_settings::Settings,
+        pointer: Option<VirtualPointerExecutor>,
+        keyboard: Result<K, KeyboardUnavailable>,
+        clipboard: Option<C>,
+    ) -> Result<Self, waldo_settings::SettingsError> {
+        Ok(Self {
+            niri: NiriActionExecutor,
+            pointer,
+            keyboard: Mutex::new(keyboard),
+            active_layout,
+            paste_chord: settings.clipboard_paste_chord()?,
+            clipboard,
+            accessibility,
+        })
     }
 
     /// Runs `operation` on the keyboard, first retrying initialisation when
     /// the recorded failure said a retry could succeed.
-    fn with_keyboard<T>(
-        &self,
-        operation: impl FnOnce(&VirtualKeyboardExecutor) -> T,
-    ) -> Result<T, KeyboardUnavailable> {
+    fn with_keyboard<T>(&self, operation: impl FnOnce(&K) -> T) -> Result<T, KeyboardUnavailable> {
         let mut keyboard = self
             .keyboard
             .lock()
@@ -57,7 +117,7 @@ impl DesktopActionExecutor {
         if let Err(unavailable) = &*keyboard
             && unavailable.error.retryable
         {
-            *keyboard = VirtualKeyboardExecutor::initialise(Arc::clone(&self.active_layout));
+            *keyboard = K::initialise(Arc::clone(&self.active_layout));
         }
         keyboard.as_ref().map(operation).map_err(Clone::clone)
     }
@@ -152,7 +212,7 @@ impl DesktopActionExecutor {
         }
         let key_result = self.keyboard_execute(
             &Action::KeyChord {
-                keys: vec!["Control".into(), "v".into()],
+                keys: self.paste_chord.clone(),
             },
             cancellation,
         );
@@ -220,7 +280,7 @@ fn automatic_text(
     }
 }
 
-impl ActionExecutor for DesktopActionExecutor {
+impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecutor<C, K> {
     fn execute(
         &self,
         action: &Action,
@@ -310,7 +370,7 @@ impl ActionExecutor for DesktopActionExecutor {
             ActionRoute::Clipboard => self
                 .clipboard
                 .as_ref()
-                .and_then(|clipboard| clipboard.limitation()),
+                .and_then(|clipboard| clipboard.clipboard_limitation()),
             _ => None,
         }
     }
@@ -351,9 +411,9 @@ fn as_clipboard_paste_failure(failure: ActionExecutionFailure) -> ActionExecutio
     }
 }
 
-fn restore_after_failure(
-    clipboard: &ClipboardExecutor,
-    snapshot: waldo_clipboard::ClipboardSnapshot,
+fn restore_after_failure<C: PasteClipboard>(
+    clipboard: &C,
+    snapshot: C::Snapshot,
     failure: ActionExecutionFailure,
 ) -> Result<ActionExecution, ActionExecutionFailure> {
     clipboard.restore_temporary(snapshot).map_err(|error| {
@@ -370,6 +430,125 @@ mod tests {
     use waldo_protocol::{ActionRoute, ErrorCode, ProtocolError};
 
     use super::automatic_text;
+
+    #[derive(Default)]
+    struct TestClipboard;
+
+    impl waldo_action::ActionExecutor for TestClipboard {
+        fn execute(
+            &self,
+            _: &waldo_protocol::Action,
+            _: &waldo_controller::ExecutionToken,
+        ) -> Result<ActionExecution, ActionExecutionFailure> {
+            panic!("clipboard paste must use its transport operations")
+        }
+    }
+
+    impl super::PasteClipboard for TestClipboard {
+        type Snapshot = ();
+        fn snapshot(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+        fn offer_text_once(&self, _: &str) -> Result<(), ActionExecutionFailure> {
+            Ok(())
+        }
+        fn is_empty(&self) -> Result<bool, ProtocolError> {
+            Ok(true)
+        }
+        fn restore_temporary(&self, _: ()) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+        fn cleanup_preservation(&self) {}
+        fn clipboard_limitation(&self) -> Option<String> {
+            None
+        }
+    }
+
+    struct TestKeyboard {
+        observed: std::sync::Arc<std::sync::Mutex<Vec<waldo_protocol::Action>>>,
+        refusal: Option<ActionExecutionFailure>,
+    }
+
+    impl waldo_action::ActionExecutor for TestKeyboard {
+        fn execute(
+            &self,
+            action: &waldo_protocol::Action,
+            _: &waldo_controller::ExecutionToken,
+        ) -> Result<ActionExecution, ActionExecutionFailure> {
+            self.observed.lock().unwrap().push(action.clone());
+            match &self.refusal {
+                Some(refusal) => Err(refusal.clone()),
+                None => Ok(ActionRoute::VirtualKeyboard.into()),
+            }
+        }
+    }
+
+    impl super::PasteKeyboard for TestKeyboard {
+        fn initialise(
+            _: waldo_virtual_keyboard::ActiveLayoutSource,
+        ) -> Result<Self, waldo_virtual_keyboard::KeyboardUnavailable> {
+            panic!("the injected keyboard is already available")
+        }
+    }
+
+    #[test]
+    fn configured_paste_chord_reaches_keyboard_and_refusal_propagates() {
+        use waldo_action::ActionExecutor;
+        let settings = waldo_settings::Settings::from_sources(
+            Some((
+                std::path::Path::new("settings"),
+                "WALDO_CLIPBOARD_PASTE_CHORD=ctrl+v",
+            )),
+            [("WALDO_CLIPBOARD_PASTE_CHORD".into(), "shift+Insert".into())],
+            None,
+        )
+        .unwrap();
+        let mut controller = waldo_controller::Controller::new(std::time::Duration::from_secs(30));
+        let connection = controller.connect(waldo_protocol::ClientId::new("paste-test").unwrap());
+        let authority = controller
+            .begin_execution(connection, std::time::Duration::ZERO)
+            .unwrap();
+        let refusal = ActionExecutionFailure::not_executed(ProtocolError {
+            code: ErrorCode::UnsupportedCapability,
+            message: "key Insert is absent from active layout".into(),
+            retryable: false,
+        });
+        for failure in [None, Some(refusal.clone())] {
+            let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let executor = super::DesktopActionExecutor::with_backends(
+                None,
+                std::sync::Arc::new(|| panic!("the injected keyboard needs no layout discovery")),
+                &settings,
+                None,
+                Ok(TestKeyboard {
+                    observed: observed.clone(),
+                    refusal: failure.clone(),
+                }),
+                Some(TestClipboard),
+            )
+            .unwrap();
+            let result = executor.execute(
+                &waldo_protocol::Action::Text {
+                    text: "paste me".into(),
+                    route: waldo_protocol::TextRoutePreference::ClipboardPaste,
+                },
+                authority.cancellation(),
+            );
+            assert_eq!(
+                *observed.lock().unwrap(),
+                vec![waldo_protocol::Action::KeyChord {
+                    keys: vec!["shift".into(), "Insert".into()]
+                }]
+            );
+            assert_eq!(
+                result,
+                match failure {
+                    Some(error) => Err(error),
+                    None => Ok(ActionRoute::ClipboardPaste.into()),
+                }
+            );
+        }
+    }
 
     #[test]
     fn automatic_never_falls_through_an_indeterminate_route() {

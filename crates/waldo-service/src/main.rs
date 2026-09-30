@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(seconds) => std::time::Duration::from_secs(seconds),
         None => settings.lease_idle_timeout()?,
     };
-    let service = ControllerService::bind(&socket, idle_timeout)?;
+    let service = ControllerService::bind(&socket, idle_timeout, &settings)?;
 
     eprintln!("Waldo controller listening on {}", socket.display());
     let mut terminate = signal(SignalKind::terminate())?;

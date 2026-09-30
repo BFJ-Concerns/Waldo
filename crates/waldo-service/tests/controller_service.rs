@@ -2717,9 +2717,13 @@ fn binding_refuses_a_symlinked_socket_directory() {
     fs::create_dir_all(&real).unwrap();
     symlink(&real, &linked).unwrap();
 
-    let error = ControllerService::bind(linked.join("controller.sock"), Duration::from_secs(30))
-        .err()
-        .expect("a symlinked socket directory must be refused");
+    let error = ControllerService::bind(
+        linked.join("controller.sock"),
+        Duration::from_secs(30),
+        &waldo_settings::Settings::from_sources(None, [], None).unwrap(),
+    )
+    .err()
+    .expect("a symlinked socket directory must be refused");
 
     assert!(error.to_string().contains("not a real directory"));
     let _ = fs::remove_dir_all(root);
@@ -2732,9 +2736,13 @@ fn binding_never_replaces_an_unrelated_file() {
     fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(&path, "operator data").unwrap();
 
-    let error = ControllerService::bind(&path, Duration::from_secs(30))
-        .err()
-        .expect("an unrelated file at the socket path must be refused");
+    let error = ControllerService::bind(
+        &path,
+        Duration::from_secs(30),
+        &waldo_settings::Settings::from_sources(None, [], None).unwrap(),
+    )
+    .err()
+    .expect("an unrelated file at the socket path must be refused");
 
     assert!(
         error
@@ -2752,9 +2760,13 @@ fn binding_does_not_change_an_existing_shared_directory() {
     fs::create_dir_all(parent).unwrap();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let error = ControllerService::bind(&path, Duration::from_secs(30))
-        .err()
-        .expect("an existing shared directory must be refused");
+    let error = ControllerService::bind(
+        &path,
+        Duration::from_secs(30),
+        &waldo_settings::Settings::from_sources(None, [], None).unwrap(),
+    )
+    .err()
+    .expect("an existing shared directory must be refused");
 
     assert!(error.to_string().contains("accessible by another user"));
     assert_eq!(

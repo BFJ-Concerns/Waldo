@@ -46,6 +46,12 @@ pub const LEASE_IDLE_TIMEOUT_SECONDS: SettingSpec = SettingSpec {
     default: Some("30"),
 };
 
+/// Key names dispatched by the clipboard-paste route.
+pub const CLIPBOARD_PASTE_CHORD: SettingSpec = SettingSpec {
+    name: "WALDO_CLIPBOARD_PASTE_CHORD",
+    default: Some("ctrl+v"),
+};
+
 /// Longest edge of images delivered through MCP, in pixels.
 pub const MODEL_IMAGE_MAX_EDGE: SettingSpec = SettingSpec {
     name: "WALDO_MODEL_IMAGE_MAX_EDGE",
@@ -58,6 +64,7 @@ pub const MODEL_IMAGE_MAX_EDGE: SettingSpec = SettingSpec {
 pub const ALL: &[SettingSpec] = &[
     SOCKET_PATH,
     LEASE_IDLE_TIMEOUT_SECONDS,
+    CLIPBOARD_PASTE_CHORD,
     MODEL_IMAGE_MAX_EDGE,
 ];
 
@@ -251,6 +258,31 @@ impl Settings {
             .ok_or(SettingsError::RuntimeDirectoryMissing)
     }
 
+    /// Key names dispatched for clipboard paste. Names are validated against
+    /// the active layout by the keyboard when the chord is executed.
+    pub fn clipboard_paste_chord(&self) -> Result<Vec<String>, SettingsError> {
+        let configured = self.text(CLIPBOARD_PASTE_CHORD)?;
+        let value = configured.map_or_else(
+            || {
+                CLIPBOARD_PASTE_CHORD
+                    .default
+                    .expect("paste chord declares a default")
+            },
+            |(value, _)| value,
+        );
+        let keys: Vec<String> = value.split('+').map(|key| key.trim().to_owned()).collect();
+        if keys.iter().any(String::is_empty) {
+            let (_, source) = configured.expect("the default chord has no empty key");
+            return Err(SettingsError::InvalidValue {
+                name: CLIPBOARD_PASTE_CHORD.name,
+                source: source.clone(),
+                value: value.to_owned(),
+                reason: "expected non-empty key names separated by '+'".into(),
+            });
+        }
+        Ok(keys)
+    }
+
     /// Maximum delivered MCP image edge: a positive whole number of pixels.
     pub fn model_image_max_edge(&self) -> Result<u32, SettingsError> {
         let (value, source) = match self.text(MODEL_IMAGE_MAX_EDGE)? {
@@ -342,6 +374,64 @@ mod tests {
                 .map(|(name, value)| (OsString::from(name), OsString::from(value))),
             Some("/run/user/1000".into()),
         )
+    }
+
+    #[test]
+    fn paste_chord_default() {
+        assert_eq!(
+            settings(None, &[])
+                .unwrap()
+                .clipboard_paste_chord()
+                .unwrap(),
+            ["ctrl", "v"]
+        );
+    }
+
+    #[test]
+    fn paste_chord_resolution_and_whitespace() {
+        let file = Some("WALDO_CLIPBOARD_PASTE_CHORD=shift+Insert\n");
+        assert_eq!(
+            settings(file, &[])
+                .unwrap()
+                .clipboard_paste_chord()
+                .unwrap(),
+            ["shift", "Insert"]
+        );
+        assert_eq!(
+            settings(
+                file,
+                &[("WALDO_CLIPBOARD_PASTE_CHORD", " ctrl + shift + v ")]
+            )
+            .unwrap()
+            .clipboard_paste_chord()
+            .unwrap(),
+            ["ctrl", "shift", "v"]
+        );
+        assert_eq!(
+            settings(None, &[("WALDO_CLIPBOARD_PASTE_CHORD", "unknown-key")])
+                .unwrap()
+                .clipboard_paste_chord()
+                .unwrap(),
+            ["unknown-key"]
+        );
+    }
+
+    #[test]
+    fn paste_chord_rejects_empty_segments() {
+        for value in ["", " ", "+v", "ctrl+", "ctrl++v", "ctrl+ +v"] {
+            let error = settings(None, &[("WALDO_CLIPBOARD_PASTE_CHORD", value)])
+                .unwrap()
+                .clipboard_paste_chord()
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SettingsError::InvalidValue {
+                    name: "WALDO_CLIPBOARD_PASTE_CHORD",
+                    source: Source::Environment,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
