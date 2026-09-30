@@ -7,6 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use waldo_protocol::ClientId;
+use waldo_socket::ControllerClient;
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -38,8 +41,8 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStat
     panic!("waldod did not exit after SIGTERM");
 }
 
-#[test]
-fn sigterm_removes_the_bound_controller_socket() {
+#[tokio::test]
+async fn sigterm_removes_the_bound_controller_socket() {
     let root = std::env::temp_dir().join(format!("waldo-daemon-shutdown-{}", std::process::id()));
     let socket = root.join("waldo/controller.sock");
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -55,13 +58,23 @@ fn sigterm_removes_the_bound_controller_socket() {
             .unwrap(),
     );
     wait_for_socket(&socket, Duration::from_secs(5));
+    // A bound socket precedes backend initialisation and signal registration.
+    // A completed handshake proves the daemon is serving before we stop it.
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        ControllerClient::connect(&socket, ClientId::new("shutdown-test").unwrap()),
+    )
+    .await
+    .expect("waldod did not serve its socket")
+    .expect("waldod handshake failed");
+    drop(client);
 
     let signal_result =
         unsafe { nix::libc::kill(i32::try_from(child.0.id()).unwrap(), nix::libc::SIGTERM) };
     assert_eq!(signal_result, 0);
     let status = wait_for_exit(&mut child.0, Duration::from_secs(5));
 
-    assert!(status.success());
+    assert!(status.success(), "{status}");
     assert!(!socket.exists());
     fs::remove_dir(socket.parent().unwrap()).unwrap();
     fs::remove_dir(&root).unwrap();
