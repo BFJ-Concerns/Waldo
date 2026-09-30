@@ -573,10 +573,10 @@ impl BackendState {
         accessible_id: Option<String>,
     ) -> ElementHandle {
         if let Some(handle) = self.reverse_handles.get(&key) {
-            if let Some(accessible_id) = accessible_id {
-                if let Some(observed) = self.handles.get_mut(handle) {
-                    observed.accessible_id = Some(accessible_id);
-                }
+            if let Some(accessible_id) = accessible_id
+                && let Some(observed) = self.handles.get_mut(handle)
+            {
+                observed.accessible_id = Some(accessible_id);
             }
             return handle.clone();
         }

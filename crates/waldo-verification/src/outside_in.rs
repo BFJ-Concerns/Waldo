@@ -2098,10 +2098,10 @@ fn read_state(path: &Path) -> Result<FixtureState, Box<dyn std::error::Error>> {
 fn wait_for_release(path: &Path) -> Result<FixtureEvent, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if let Some(event) = release_from_complete_jsonl(&contents)? {
-                return Ok(event);
-            }
+        if let Ok(contents) = fs::read_to_string(path)
+            && let Some(event) = release_from_complete_jsonl(&contents)?
+        {
+            return Ok(event);
         }
         thread::sleep(Duration::from_millis(20));
     }

@@ -222,6 +222,9 @@ impl KeyboardState {
                     return Err(error);
                 }
             };
+            // The old tables are the only record of what is held down, so
+            // release everything through them before they are replaced.
+            self.release_held();
             self.device.upload_keymap(&keymap.text)?;
             self.model = KeyboardModel::new(
                 keymap.modifiers_by_keycode.clone(),
@@ -306,11 +309,13 @@ impl KeyboardState {
             .named_keycodes
             .get(&keysym.raw())
             .copied()
-            .ok_or_else(|| {
-                invalid(format!(
+            .ok_or_else(|| ProtocolError {
+                code: ErrorCode::UnsupportedCapability,
+                message: format!(
                     "key {name:?} is absent from the active keyboard layout {:?}",
                     table.name
-                ))
+                ),
+                retryable: false,
             })
     }
 
@@ -358,8 +363,10 @@ impl KeyboardState {
     }
 }
 
-impl Drop for KeyboardState {
-    fn drop(&mut self) {
+impl KeyboardState {
+    /// Releases every key the model records as held and clears modifier
+    /// and lock state on the compositor.
+    fn release_held(&mut self) {
         for keycode in self.model.held_keys() {
             let transitions = self
                 .model
@@ -376,6 +383,12 @@ impl Drop for KeyboardState {
             self.emit(transition);
         }
         let _ = self.device.settle();
+    }
+}
+
+impl Drop for KeyboardState {
+    fn drop(&mut self) {
+        self.release_held();
     }
 }
 

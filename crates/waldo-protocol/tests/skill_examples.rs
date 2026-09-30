@@ -9,7 +9,7 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use serde_json::Value;
 use waldo_protocol::{
-    ActRequest, Action, ObserveRequest, Predicate, QueryRequest, published_schema,
+    ActRequest, Action, ObserveRequest, Predicate, QueryRequest, SourceSelector, published_schema,
 };
 
 fn skill_text() -> String {
@@ -19,10 +19,26 @@ fn skill_text() -> String {
         .unwrap_or_else(|error| panic!("the plugin ships the skill at {}: {error}", path.display()))
 }
 
-/// Every backtick span that holds a JSON object, with its source line.
+/// Every JSON object the skill shows: an inline backtick span, or a fenced
+/// `json` block, each with the line it starts on.
 fn json_examples(text: &str) -> Vec<(usize, String)> {
     let mut examples = Vec::new();
+    let mut fenced: Option<(usize, String)> = None;
     for (index, line) in text.lines().enumerate() {
+        if let Some((start, body)) = fenced.as_mut() {
+            if line.trim_start().starts_with("```") {
+                examples.push((*start, body.clone()));
+                fenced = None;
+            } else {
+                body.push_str(line);
+                body.push('\n');
+            }
+            continue;
+        }
+        if line.trim_start().starts_with("```json") {
+            fenced = Some((index + 1, String::new()));
+            continue;
+        }
         let mut rest = line;
         while let Some(start) = rest.find('`') {
             let after = &rest[start + 1..];
@@ -85,9 +101,16 @@ fn every_json_example_in_the_skill_decodes_as_a_wire_type() {
             }
         };
         let result = match value.get("type").and_then(Value::as_str) {
-            Some(tag) if actions.contains(tag) => serde_json::from_value::<Action>(value)
-                .map(drop)
-                .map_err(|e| e.to_string()),
+            Some(tag) if actions.contains(tag) => {
+                // `window` names both an action and a source selector; an
+                // object that is not the action may be the bare selector.
+                match serde_json::from_value::<Action>(value.clone()) {
+                    Ok(_) => Ok(()),
+                    Err(as_action) => serde_json::from_value::<SourceSelector>(value)
+                        .map(drop)
+                        .map_err(|_| format!("as an action: {as_action}")),
+                }
+            }
             Some(tag) if predicates.contains(tag) => serde_json::from_value::<Predicate>(value)
                 .map(drop)
                 .map_err(|e| e.to_string()),
@@ -125,13 +148,18 @@ fn every_action_variant_has_a_literal_example_in_the_skill() {
     let text = skill_text();
     // A tag counts wherever it appears: an action inside a request's
     // `actions`, a predicate inside a wait or a request's `verification`.
+    // A `source` subtree is a selector, whose `window`/`output` tags must
+    // not be credited as actions.
     fn collect_tags(value: &Value, shown: &mut BTreeSet<String>) {
         match value {
             Value::Object(fields) => {
                 if let Some(tag) = fields.get("type").and_then(Value::as_str) {
                     shown.insert(tag.to_owned());
                 }
-                fields.values().for_each(|field| collect_tags(field, shown));
+                fields
+                    .iter()
+                    .filter(|(name, _)| name.as_str() != "source")
+                    .for_each(|(_, field)| collect_tags(field, shown));
             }
             Value::Array(items) => items.iter().for_each(|item| collect_tags(item, shown)),
             _ => {}

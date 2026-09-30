@@ -157,7 +157,7 @@ mod tests {
                     [1, 2, 3, 4, 5, 6]
                 };
                 let mut bytes = Vec::new();
-                for row in pixels.chunks_exact(3) {
+                for row in pixels.as_chunks::<3>().0 {
                     for pixel in row {
                         bytes.extend(native_pixel(*pixel));
                     }

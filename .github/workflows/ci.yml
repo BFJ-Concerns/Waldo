@@ -19,7 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install the Rust toolchain named by the workspace
+      # The gate runs on current stable, as a contributor's does. The
+      # workspace's rust-version is the declared floor, not what CI tests.
+      - name: Install the stable Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable

@@ -95,6 +95,13 @@ line with `#` comments and no quoting, and is read by every Waldo binary
 however it was launched; a name there that is not a setting is an error.
 Restart `waldod` after changing a value it reads.
 
+Keyboard input uses the keymap the compositor reports, so the layout needs
+no setting. Only when the session exposes no keymap does Waldo fall back to
+the standard XKB environment — `XKB_DEFAULT_LAYOUT`, and optionally
+`XKB_DEFAULT_VARIANT`, `XKB_DEFAULT_MODEL`, `XKB_DEFAULT_OPTIONS` and
+`XKB_DEFAULT_RULES` — in `waldod`'s environment; with neither, Query reports
+the keyboard route unavailable and says why.
+
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `WALDO_SOCKET_PATH` | `$XDG_RUNTIME_DIR/waldo/controller.sock` | The private controller socket `waldod` serves and both bindings connect to. |

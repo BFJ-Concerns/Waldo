@@ -107,7 +107,7 @@ already authorised — so the approval can be obtained before that step runs.
      `{"type":"key","key":"shift","state":"pressed"}` then
      `{"type":"key","key":"shift","state":"released"}` — key names are keysym
      names (`Return`, `Escape`, `F5`, `a`) or the aliases `ctrl`, `shift`,
-     `alt`, `super`, `enter`, `esc`, `backspace`, `tab`, `space`, `delete`,
+     `alt`, `altgr`, `super`, `enter`, `esc`, `backspace`, `tab`, `space`, `delete`,
      the arrows and `home`, `end`, `pageup`, `pagedown`;
    - an accessibility action names `"element"` and nests its operation:
      `{"type":"accessibility","element":"element-9","operation":{"type":"invoke","action":"Click"}}`;
