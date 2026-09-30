@@ -328,6 +328,7 @@ mod tests {
     /// reporting what each non-modifier press would type.
     struct Consumer {
         state: xkb::State,
+        compose: xkb::compose::State,
     }
 
     impl Consumer {
@@ -340,8 +341,15 @@ mod tests {
                 xkb::COMPILE_NO_FLAGS,
             )
             .expect("the uploaded keymap text compiles for the consumer");
+            let table = xkb::compose::Table::new_from_locale(
+                &context,
+                std::ffi::OsStr::new("C.UTF-8"),
+                xkb::compose::COMPILE_NO_FLAGS,
+            )
+            .expect("X11 locale data provides the consumer Compose table");
             Self {
                 state: xkb::State::new(&compiled),
+                compose: xkb::compose::State::new(&table, xkb::compose::STATE_NO_FLAGS),
             }
         }
 
@@ -354,7 +362,18 @@ mod tests {
                         let xkb_keycode =
                             xkb::Keycode::new(keycode + crate::keymap::XKB_EVDEV_OFFSET);
                         if state == InputState::Pressed {
-                            typed.push_str(&self.state.key_get_utf8(xkb_keycode));
+                            self.compose.feed(self.state.key_get_one_sym(xkb_keycode));
+                            match self.compose.status() {
+                                xkb::compose::Status::Nothing => {
+                                    typed.push_str(&self.state.key_get_utf8(xkb_keycode));
+                                }
+                                xkb::compose::Status::Composed => {
+                                    typed.push_str(&self.compose.utf8().unwrap_or_default());
+                                    self.compose.reset();
+                                }
+                                xkb::compose::Status::Cancelled => self.compose.reset(),
+                                xkb::compose::Status::Composing => {}
+                            }
                         }
                         self.state.update_key(
                             xkb_keycode,
@@ -392,7 +411,7 @@ mod tests {
 
     #[test]
     fn every_typeable_character_types_back_to_itself_through_an_xkb_consumer() {
-        for layouts in ["gb", "us", "de", "fr"] {
+        for layouts in ["gb", "us", "de", "fr", "us(intl)"] {
             let keymap = keymap(layouts);
             let table = keymap.group(0).unwrap();
             for (&keysym, sequence) in &table.sequences {
