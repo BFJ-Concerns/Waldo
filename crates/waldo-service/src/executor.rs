@@ -24,6 +24,7 @@ pub(crate) struct DesktopActionExecutor {
     keyboard: Mutex<Result<VirtualKeyboardExecutor, KeyboardUnavailable>>,
     active_layout: ActiveLayoutSource,
     clipboard: Option<ClipboardExecutor>,
+    paste_chord: Vec<String>,
     accessibility: Option<Arc<AccessibilityBackend>>,
 }
 
@@ -31,6 +32,7 @@ impl DesktopActionExecutor {
     pub(crate) fn initialise(
         accessibility: Option<Arc<AccessibilityBackend>>,
         active_layout: ActiveLayoutSource,
+        paste_chord: Vec<String>,
     ) -> Self {
         Self {
             niri: NiriActionExecutor,
@@ -39,6 +41,7 @@ impl DesktopActionExecutor {
                 &active_layout,
             ))),
             active_layout,
+            paste_chord,
             clipboard: ClipboardExecutor::initialise().ok(),
             accessibility,
         }
@@ -150,12 +153,9 @@ impl DesktopActionExecutor {
         if let Err(failure) = clipboard.offer_text_once(text) {
             return restore_after_failure(clipboard, snapshot, failure);
         }
-        let key_result = self.keyboard_execute(
-            &Action::KeyChord {
-                keys: vec!["Control".into(), "v".into()],
-            },
-            cancellation,
-        );
+        let key_result = dispatch_paste_chord(&self.paste_chord, |action| {
+            self.keyboard_execute(action, cancellation)
+        });
         if let Err(failure) = key_result {
             return restore_after_failure(clipboard, snapshot, failure);
         }
@@ -201,6 +201,15 @@ impl DesktopActionExecutor {
         })?;
         Ok(ActionRoute::ClipboardPaste.into())
     }
+}
+
+fn dispatch_paste_chord(
+    keys: &[String],
+    keyboard: impl FnOnce(&Action) -> Result<ActionExecution, ActionExecutionFailure>,
+) -> Result<ActionExecution, ActionExecutionFailure> {
+    keyboard(&Action::KeyChord {
+        keys: keys.to_vec(),
+    })
 }
 
 fn automatic_text(
@@ -370,6 +379,37 @@ mod tests {
     use waldo_protocol::{ActionRoute, ErrorCode, ProtocolError};
 
     use super::automatic_text;
+
+    #[test]
+    fn configured_paste_chord_reaches_keyboard_and_refusal_propagates() {
+        let settings = waldo_settings::Settings::from_sources(
+            Some((
+                std::path::Path::new("settings"),
+                "WALDO_CLIPBOARD_PASTE_CHORD=ctrl+v",
+            )),
+            [("WALDO_CLIPBOARD_PASTE_CHORD".into(), "shift+Insert".into())],
+            None,
+        )
+        .unwrap();
+        let keys = settings.clipboard_paste_chord().unwrap();
+        let observed = std::cell::RefCell::new(None);
+        let refusal = ActionExecutionFailure::not_executed(ProtocolError {
+            code: ErrorCode::UnsupportedCapability,
+            message: "key Insert is absent from active layout".into(),
+            retryable: false,
+        });
+        let result = super::dispatch_paste_chord(&keys, |action| {
+            *observed.borrow_mut() = Some(action.clone());
+            Err(refusal.clone())
+        });
+        assert_eq!(
+            *observed.borrow(),
+            Some(waldo_protocol::Action::KeyChord {
+                keys: vec!["shift".into(), "Insert".into()]
+            })
+        );
+        assert_eq!(result, Err(refusal));
+    }
 
     #[test]
     fn automatic_never_falls_through_an_indeterminate_route() {

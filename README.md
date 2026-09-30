@@ -107,6 +107,8 @@ the keyboard route unavailable and says why.
 | `WALDO_SOCKET_PATH` | `$XDG_RUNTIME_DIR/waldo/controller.sock` | The private controller socket `waldod` serves and both bindings connect to. |
 | `WALDO_LEASE_IDLE_TIMEOUT_SECONDS` | `30` | Seconds without a request or a running batch before a driving lease lapses and held input is released. Whole seconds, at least 1; the timeout cannot be disabled. |
 
+| `WALDO_CLIPBOARD_PASTE_CHORD` | `ctrl+v` | Clipboard-paste key names separated by `+`; whitespace around each name is trimmed and empty names are refused at start-up. Key names use the virtual keyboard vocabulary and are checked against the active layout at paste time; an unavailable key fails without a default-chord fallback. |
+
 Installer settings are read from the environment of the `./install-local`
 invocation only:
 

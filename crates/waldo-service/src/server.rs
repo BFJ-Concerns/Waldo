@@ -138,7 +138,11 @@ pub struct ControllerService {
 
 impl ControllerService {
     /// Binds a private socket after rejecting symlink and ownership hazards.
-    pub fn bind(path: impl AsRef<Path>, idle_timeout: Duration) -> Result<Self, ServiceError> {
+    pub fn bind(
+        path: impl AsRef<Path>,
+        idle_timeout: Duration,
+        paste_chord: Vec<String>,
+    ) -> Result<Self, ServiceError> {
         let inspector: Arc<dyn SessionInspector> = Arc::new(NiriInspector);
         let capturer: Arc<dyn ScreenCapturer> = Arc::new(Screencopy);
         let (accessibility, accessibility_failure) = match AccessibilityBackend::initialise() {
@@ -166,6 +170,7 @@ impl ControllerService {
         let executor: Arc<dyn ActionExecutor> = Arc::new(DesktopActionExecutor::initialise(
             accessibility.as_ref().map(Arc::clone),
             active_layout,
+            paste_chord,
         ));
         Self::bind_with_runtime_backends(
             path,

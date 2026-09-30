@@ -16,7 +16,12 @@ use waldo_socket::ControllerClient;
 async fn empty_clipboard_preservation_returns_through_the_service() {
     let root = std::env::temp_dir().join(format!("waldo-live-clipboard-{}", std::process::id()));
     let socket = root.join("controller.sock");
-    let service = ControllerService::bind(&socket, Duration::from_secs(30)).unwrap();
+    let service = ControllerService::bind(
+        &socket,
+        Duration::from_secs(30),
+        vec!["ctrl".into(), "v".into()],
+    )
+    .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(service.run_until(async {
         let _ = shutdown_rx.await;
