@@ -2,10 +2,153 @@
 set -eEuo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-operator_home="$HOME"
-operator_codex_home="${CODEX_HOME:-$operator_home/.codex}"
-install_root="${WALDO_INSTALL_ROOT:-}"
-install_mode="canonical"
+# These steps can be sourced to inspect configuration and generate a unit
+# without installing binaries or changing a running service.
+resolve_installation() {
+    operator_home="$HOME"
+    operator_codex_home="${CODEX_HOME:-$operator_home/.codex}"
+    install_root="${WALDO_INSTALL_ROOT:-}"
+    install_mode="canonical"
+    marketplace_name="${WALDO_MARKETPLACE_NAME:-personal}"
+    marketplace_owner="${WALDO_MARKETPLACE_OWNER:-BFJ Concerns}"
+
+    if [[ -n "$install_root" ]]; then
+        install_mode="redirected"
+        install_root="$(realpath -m -- "$install_root")"
+        case "$install_root" in
+            /|"$operator_home"|"$repo_root")
+                printf 'WALDO_INSTALL_ROOT must name a dedicated disposable directory.\n' >&2
+                return 1
+                ;;
+        esac
+        install_home="$install_root/home"
+        cargo_root="${WALDO_CARGO_INSTALL_ROOT:-$install_root/cargo}"
+        plugin_home="${WALDO_PLUGIN_HOME:-$install_home/plugins/waldo}"
+        marketplace="${WALDO_MARKETPLACE:-$install_home/.agents/plugins/marketplace.json}"
+        service_file="${WALDO_SERVICE_FILE:-$install_home/.config/systemd/user/waldod.service}"
+        profile_file="${WALDO_PROFILE_FILE:-$install_root/state/waldo/environment.json}"
+        codex_home="${WALDO_CODEX_HOME:-$install_root/codex}"
+        runtime_tag="$(printf '%s' "$install_root" | sha256sum | cut -c1-12)"
+        redirected_runtime="${WALDO_RUNTIME_DIR:-$XDG_RUNTIME_DIR/waldo-install-$runtime_tag}"
+        # The rehearsal default is an explicit override for every child,
+        # including MCP. Canonical resolution is left entirely to Settings.
+        if [[ ! -v WALDO_SOCKET_PATH ]]; then
+            export WALDO_SOCKET_PATH="$redirected_runtime/waldo/controller.sock"
+        fi
+        export XDG_CONFIG_HOME="$install_home/.config"
+    else
+        install_home="$operator_home"
+        cargo_root="${WALDO_CARGO_INSTALL_ROOT:-${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$operator_home/.cargo}}}"
+        plugin_home="${WALDO_PLUGIN_HOME:-$operator_home/plugins/waldo}"
+        marketplace="${WALDO_MARKETPLACE:-$operator_home/.agents/plugins/marketplace.json}"
+        service_file="${WALDO_SERVICE_FILE:-$operator_home/.config/systemd/user/waldod.service}"
+        profile_file="${WALDO_PROFILE_FILE:-${XDG_STATE_HOME:-$operator_home/.local/state}/waldo/environment.json}"
+        codex_home="$operator_codex_home"
+        redirected_runtime=""
+    fi
+    cargo_root="$(realpath -m -- "$cargo_root")"
+    bin_dir="$cargo_root/bin"
+    waldod_bin="$bin_dir/waldod"
+    waldo_bin="$bin_dir/waldo"
+    mcp_bin="$bin_dir/waldo-mcp"
+}
+
+# systemd expands specifiers in these directives. Quote the entire argument
+# and escape input rather than letting paths become unit syntax.
+systemd_argument() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//%/%%}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '"%s"' "$value"
+}
+
+write_service_file() {
+    local line
+    install -d -m 0755 "$(dirname -- "$service_file")"
+    while IFS= read -r line; do
+        if [[ "$line" == ExecStart=* ]]; then
+            printf 'ExecStart='
+            # The executable path does not undergo environment expansion.
+            systemd_argument "$waldod_bin"
+            printf '\n'
+            if [[ -v WALDO_SOCKET_PATH ]]; then
+                printf 'Environment='
+                systemd_argument "WALDO_SOCKET_PATH=$WALDO_SOCKET_PATH"
+                printf '\n'
+            fi
+            if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+                printf 'Environment='
+                systemd_argument "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+                printf '\n'
+            fi
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$repo_root/packaging/waldod.service" >"$service_file"
+    chmod 0644 "$service_file"
+}
+
+write_codex_marketplace() {
+    install -d -m 0755 "$(dirname -- "$marketplace")"
+    local marketplace_tmp
+    marketplace_tmp="$(mktemp)"
+    if [[ -f "$marketplace" ]]; then
+        jq --arg source "$marketplace_source" --arg name "$marketplace_name" --arg owner "$marketplace_owner" \
+            '.name = $name
+            | .owner = {"name":$owner}
+            | .interface = (.interface // {"displayName":"Personal"})
+            | .plugins = ((.plugins // []) | map(select(.name != "waldo")) + [{
+                "name":"waldo",
+                "source":{"source":"local","path":$source},
+                "policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},
+                "category":"Productivity"
+            }])' "$marketplace" >"$marketplace_tmp"
+    else
+        jq -n --arg source "$marketplace_source" --arg name "$marketplace_name" --arg owner "$marketplace_owner" '{
+            "name":$name,
+            "owner":{"name":$owner},
+            "interface":{"displayName":"Personal"},
+            "plugins":[{
+                "name":"waldo",
+                "source":{"source":"local","path":$source},
+                "policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},
+                "category":"Productivity"
+            }]
+        }' >"$marketplace_tmp"
+    fi
+    install -m 0644 "$marketplace_tmp" "$marketplace"
+    rm -f -- "$marketplace_tmp"
+}
+
+run_codex() {
+    if [[ "$install_mode" == redirected ]]; then
+        env HOME="$install_home" CODEX_HOME="$codex_home" PATH="$bin_dir:$PATH" "$@"
+    else
+        env PATH="$bin_dir:$PATH" "$@"
+    fi
+}
+
+wait_for_controller() {
+    local query_destination="$1"
+    for _ in {1..50}; do
+        if "$waldo_bin" query >"$query_destination" 2>/dev/null \
+            && jq -e '.type == "queried"' "$query_destination" >/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    printf 'Waldo controller did not answer the installed CLI query.\n' >&2
+    return 1
+}
+
+# Installation entry point. Sourcing exposes only the resolution/write steps.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
 
 for command in cargo codex git jq realpath rsync sha256sum systemctl; do
     command -v "$command" >/dev/null || {
@@ -18,39 +161,7 @@ if [[ -z "${XDG_RUNTIME_DIR:-}" || -z "${WAYLAND_DISPLAY:-}" || -z "${NIRI_SOCKE
     printf 'Run the installer inside the active Niri graphical session.\n' >&2
     exit 1
 fi
-
-if [[ -n "$install_root" ]]; then
-    install_mode="redirected"
-    install_root="$(realpath -m -- "$install_root")"
-    case "$install_root" in
-        /|"$operator_home"|"$repo_root")
-            printf 'WALDO_INSTALL_ROOT must name a dedicated disposable directory.\n' >&2
-            exit 1
-            ;;
-    esac
-    install_home="$install_root/home"
-    cargo_root="$install_root/cargo"
-    bin_dir="$cargo_root/bin"
-    plugin_home="${WALDO_PLUGIN_HOME:-$install_home/plugins/waldo}"
-    marketplace="${WALDO_MARKETPLACE:-$install_home/.agents/plugins/marketplace.json}"
-    service_file="${WALDO_SERVICE_FILE:-$install_home/.config/systemd/user/waldod.service}"
-    profile_file="${WALDO_PROFILE_FILE:-$install_root/state/waldo/environment.json}"
-    codex_home="${WALDO_CODEX_HOME:-$install_root/codex}"
-    runtime_tag="$(printf '%s' "$install_root" | sha256sum | cut -c1-12)"
-    redirected_runtime="${WALDO_RUNTIME_DIR:-$XDG_RUNTIME_DIR/waldo-install-$runtime_tag}"
-    controller_socket="$redirected_runtime/waldo/controller.sock"
-else
-    install_home="$operator_home"
-    cargo_root=""
-    bin_dir=""
-    plugin_home="${WALDO_PLUGIN_HOME:-$operator_home/plugins/waldo}"
-    marketplace="${WALDO_MARKETPLACE:-$operator_home/.agents/plugins/marketplace.json}"
-    service_file="${WALDO_SERVICE_FILE:-$operator_home/.config/systemd/user/waldod.service}"
-    profile_file="${WALDO_PROFILE_FILE:-${XDG_STATE_HOME:-$operator_home/.local/state}/waldo/environment.json}"
-    codex_home="$operator_codex_home"
-    redirected_runtime=""
-    controller_socket="$XDG_RUNTIME_DIR/waldo/controller.sock"
-fi
+resolve_installation
 
 controller_pid=""
 auth_link=""
@@ -128,9 +239,9 @@ cleanup() {
         fi
     fi
     if [[ "$install_mode" == redirected && -n "$redirected_runtime" ]]; then
-        if [[ -e "$controller_socket" || -L "$controller_socket" ]]; then
+        if [[ -e "$WALDO_SOCKET_PATH" || -L "$WALDO_SOCKET_PATH" ]]; then
             printf 'Redirected Waldo controller left unexpected socket residue at %s.\n' \
-                "$controller_socket" >&2
+                "$WALDO_SOCKET_PATH" >&2
             failed=true
         fi
         for runtime_directory in "$redirected_runtime/waldo" "$redirected_runtime"; do
@@ -165,34 +276,22 @@ trap finish EXIT
 record_unavailable "installation and installed-binding verification have not completed"
 
 failure_stage="binary installation"
-cargo_install=(install --locked --force)
+cargo_install=(install --locked --force --root "$cargo_root")
 if [[ "$install_mode" == redirected ]]; then
     install -d -m 0700 "$install_root" "$install_home" "$cargo_root" "$codex_home" "$redirected_runtime"
-    cargo_install+=(--root "$cargo_root")
 fi
 for package in waldo-service waldo-cli waldo-mcp; do
     cargo "${cargo_install[@]}" --path "$repo_root/crates/$package"
 done
 
-if [[ "$install_mode" == redirected ]]; then
-    waldod_bin="$bin_dir/waldod"
-    waldo_bin="$bin_dir/waldo"
-    mcp_bin="$bin_dir/waldo-mcp"
-else
-    waldod_bin="$(command -v waldod)"
-    waldo_bin="$(command -v waldo)"
-    mcp_bin="$(command -v waldo-mcp)"
-fi
-
 failure_stage="controller service installation"
-install -d -m 0755 "$(dirname -- "$service_file")"
-install -m 0644 "$repo_root/packaging/waldod.service" "$service_file"
+write_service_file
 if [[ "$install_mode" == redirected ]]; then
-    install -d -m 0700 "$redirected_runtime" "$(dirname -- "$controller_socket")"
+    install -d -m 0700 "$redirected_runtime" "$(dirname -- "$WALDO_SOCKET_PATH")"
     service_log="$install_root/waldod.log"
     : >"$service_log"
     chmod 0600 "$service_log"
-    "$waldod_bin" --socket "$controller_socket" >"$service_log" 2>&1 &
+    "$waldod_bin" >"$service_log" 2>&1 &
     controller_pid=$!
 else
     systemctl --user import-environment \
@@ -205,6 +304,11 @@ fi
 failure_stage="plugin installation"
 install -d -m 0755 "$plugin_home"
 rsync -a --delete "$repo_root/plugins/waldo/" "$plugin_home/"
+mcp_manifest_tmp="$(mktemp)"
+jq --arg command "$mcp_bin" '.mcpServers.waldo.command = $command' \
+    "$plugin_home/.mcp.json" >"$mcp_manifest_tmp"
+install -m 0644 "$mcp_manifest_tmp" "$plugin_home/.mcp.json"
+rm -f -- "$mcp_manifest_tmp"
 cachebuster="$(date -u +%Y%m%d%H%M%S)"
 for client in codex claude; do
     plugin_manifest="$plugin_home/.$client-plugin/plugin.json"
@@ -221,45 +325,7 @@ if [[ "$plugin_home" == "$install_home"/* ]]; then
 else
     marketplace_source="$plugin_home"
 fi
-install -d -m 0755 "$(dirname -- "$marketplace")"
-marketplace_tmp="$(mktemp)"
-if [[ -f "$marketplace" ]]; then
-    jq --arg source "$marketplace_source" \
-        '.name = "personal"
-        | .interface = (.interface // {"displayName":"Personal"})
-        | .plugins = ((.plugins // []) | map(select(.name != "waldo")) + [{
-            "name":"waldo",
-            "source":{"source":"local","path":$source},
-            "policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},
-            "category":"Productivity"
-        }])' "$marketplace" >"$marketplace_tmp"
-else
-    jq -n --arg source "$marketplace_source" '{
-        "name":"personal",
-        "interface":{"displayName":"Personal"},
-        "plugins":[{
-            "name":"waldo",
-            "source":{"source":"local","path":$source},
-            "policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},
-            "category":"Productivity"
-        }]
-    }' >"$marketplace_tmp"
-fi
-install -m 0644 "$marketplace_tmp" "$marketplace"
-rm -f -- "$marketplace_tmp"
-
-run_codex() {
-    if [[ "$install_mode" == redirected ]]; then
-        env \
-            HOME="$install_home" \
-            CODEX_HOME="$codex_home" \
-            PATH="$bin_dir:$PATH" \
-            WALDO_SOCKET_PATH="$controller_socket" \
-            "$@"
-    else
-        "$@"
-    fi
-}
+write_codex_marketplace
 
 if [[ "$install_mode" == redirected ]]; then
     auth_source="${WALDO_CODEX_AUTH_SOURCE:-$operator_codex_home/auth.json}"
@@ -274,33 +340,29 @@ if [[ "$install_mode" == redirected ]]; then
     fi
     ln -s -- "$auth_source" "$auth_link"
 fi
-run_codex codex plugin add waldo@personal
+run_codex codex plugin add "waldo@$marketplace_name"
 
 if [[ "$install_mode" == canonical ]] && command -v claude >/dev/null; then
     claude_marketplace_root="$(dirname -- "$plugin_home")"
     claude_marketplace_manifest="$claude_marketplace_root/.claude-plugin/marketplace.json"
     install -d -m 0755 "$(dirname -- "$claude_marketplace_manifest")"
     claude_marketplace_tmp="$(mktemp)"
-    jq -n --arg path "./$(basename -- "$plugin_home")" '{
-        "name":"personal",
-        "owner":{"name":"BFJ Concerns"},
+    jq -n --arg path "./$(basename -- "$plugin_home")" --arg name "$marketplace_name" --arg owner "$marketplace_owner" '{
+        "name":$name,
+        "owner":{"name":$owner},
         "plugins":[{"name":"waldo","source":$path}]
     }' >"$claude_marketplace_tmp"
     install -m 0644 "$claude_marketplace_tmp" "$claude_marketplace_manifest"
     rm -f -- "$claude_marketplace_tmp"
-    claude plugin marketplace update personal 2>/dev/null \
+    claude plugin marketplace update "$marketplace_name" 2>/dev/null \
         || claude plugin marketplace add "$claude_marketplace_root"
-    claude plugin install waldo@personal
-    claude plugin update waldo@personal
+    claude plugin install "waldo@$marketplace_name"
+    claude plugin update "waldo@$marketplace_name"
 fi
 
 failure_stage="controller readiness"
-for _ in {1..50}; do
-    [[ -S "$controller_socket" ]] && break
-    sleep 0.1
-done
-if [[ ! -S "$controller_socket" ]]; then
-    printf 'Waldo controller did not create its private socket at %s.\n' "$controller_socket" >&2
+query_output="$(mktemp)"
+if ! wait_for_controller "$query_output"; then
     if [[ "$install_mode" == canonical ]]; then
         systemctl --user status waldod.service --no-pager >&2 || true
     else
@@ -310,21 +372,15 @@ if [[ ! -S "$controller_socket" ]]; then
 fi
 
 failure_stage="installed CLI query"
-query_output="$(mktemp)"
-if [[ "$install_mode" == redirected ]]; then
-    "$waldo_bin" --socket "$controller_socket" query >"$query_output"
-else
-    "$waldo_bin" query >"$query_output"
-fi
 jq -e '.type == "queried" and (.result.outputs | length) > 0' "$query_output" >/dev/null
 
 failure_stage="installed stock-Codex plugin and first-image proof"
 mapfile -t installed_plugin_manifests < <(
-    find "$codex_home/plugins/cache/personal/waldo" -path '*/.codex-plugin/plugin.json' \
+    find "$codex_home/plugins/cache/$marketplace_name/waldo" -path '*/.codex-plugin/plugin.json' \
         | sort
 )
 if [[ ${#installed_plugin_manifests[@]} -eq 0 ]]; then
-    printf 'Codex installed no waldo plugin beneath %s.\n' "$codex_home/plugins/cache/personal/waldo" >&2
+    printf 'Codex installed no waldo plugin beneath %s.\n' "$codex_home/plugins/cache/$marketplace_name/waldo" >&2
     exit 1
 fi
 installed_plugin_manifest="${installed_plugin_manifests[${#installed_plugin_manifests[@]}-1]}"
