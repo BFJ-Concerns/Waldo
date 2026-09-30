@@ -67,6 +67,7 @@ stage "clippy (warnings denied)" cargo clippy --workspace --all-targets -- -D wa
 stage "systemd-analyze verify" verify_service_file
 if [[ "$check_only" == false ]]; then
     stage "cargo test" cargo test --workspace
+    stage "Python launcher tests" python3 -m unittest discover -s scripts/tests -v
 fi
 
 if [[ ${#failed[@]} -gt 0 ]]; then

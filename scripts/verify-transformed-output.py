@@ -14,8 +14,6 @@ import subprocess
 import tempfile
 import time
 
-from PIL import Image, ImageChops
-
 
 def wait_for(predicate, description):
     deadline = time.monotonic() + 15
@@ -28,6 +26,8 @@ def wait_for(predicate, description):
 
 
 def verify(root, binaries, processes):
+    from PIL import Image, ImageChops
+
     runtime = root / "runtime"
     runtime.mkdir(mode=0o700)
     env = dict(os.environ)
@@ -121,11 +121,15 @@ def verify(root, binaries, processes):
                       "region": "matches grim", "button_events": records}))
 
 
-def main():
+def parse_options(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--scratch-parent", type=Path, default=Path(tempfile.gettempdir()))
-    options = parser.parse_args()
+    return parser, parser.parse_args(argv)
+
+
+def main():
+    parser, options = parse_options()
     for command in ("Xvfb", "niri", "grim", "python3"):
         if not shutil.which(command):
             parser.error(f"missing prerequisite: {command}")

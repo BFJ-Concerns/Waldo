@@ -965,7 +965,10 @@ fn identity_evidence(options: &Options) -> Result<PreflightIdentity, Box<dyn std
     let paths = [
         ("waldo-verification", current_exe),
         ("python", PathBuf::from(python_path)),
-        ("electron", options.electron.clone()),
+        (
+            "electron",
+            program_path(&options.electron, std::env::var_os("PATH").as_deref())?,
+        ),
         (
             "interaction-common",
             options.fixture_directory.join("interaction_common.py"),
@@ -1020,6 +1023,27 @@ fn command_text(command: &mut Command) -> Result<String, Box<dyn std::error::Err
         return Err("command returned an empty identity".into());
     }
     Ok(value)
+}
+
+/// The file a program name runs, found the way `Command` finds it: a name
+/// containing a slash is used as given, and a bare name is searched for as an
+/// executable file in each `PATH` directory in turn.
+fn program_path(
+    program: &Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    if program.components().count() > 1 {
+        return Ok(program.to_owned());
+    }
+    std::env::split_paths(search_path.unwrap_or_default())
+        .map(|directory| directory.join(program))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .ok_or_else(|| format!("{} was not found on PATH", program.display()).into())
 }
 
 fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -1094,6 +1118,43 @@ mod tests {
             scale: 1.0,
             transform: TopologyTransform::Normal,
         }
+    }
+
+    #[test]
+    fn program_path_searches_path_for_bare_names_and_keeps_explicit_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "waldo-program-path-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let empty = root.join("empty");
+        let bin = root.join("bin");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let not_executable = empty.join("electron");
+        fs::write(&not_executable, "").unwrap();
+        let electron = bin.join("electron");
+        fs::write(&electron, "").unwrap();
+        fs::set_permissions(&electron, fs::Permissions::from_mode(0o755)).unwrap();
+        let search = std::env::join_paths([&empty, &bin]).unwrap();
+
+        let found = program_path(Path::new("electron"), Some(&search));
+        let explicit = program_path(Path::new("/opt/electron39/electron"), Some(&search));
+        let missing = program_path(Path::new("electron"), Some(empty.as_os_str()));
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(found.unwrap(), electron);
+        assert_eq!(explicit.unwrap(), Path::new("/opt/electron39/electron"));
+        assert!(
+            missing
+                .unwrap_err()
+                .to_string()
+                .contains("electron was not found on PATH")
+        );
     }
 
     #[test]
