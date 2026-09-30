@@ -45,7 +45,10 @@ fn invoke(arguments: &[&str], umask: &str, output: Option<&Path>) -> Output {
         .arg(env!("CARGO_BIN_EXE_waldo-verification"))
         .args(arguments);
     if let Some(path) = output {
-        command.arg("--output").arg(path);
+        command
+            .current_dir(path.parent().unwrap())
+            .arg("--output")
+            .arg(path.file_name().unwrap());
     }
     let result = command.output().unwrap();
     assert!(
@@ -58,8 +61,11 @@ fn invoke(arguments: &[&str], umask: &str, output: Option<&Path>) -> Output {
 
 fn assert_private_output(arguments: &[&str], expected: &[u8], existing: bool) {
     let scratch = ScratchDirectory::new();
+    let directory = scratch.0.join("output");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
     for umask in ["022", "077"] {
-        let path = scratch.0.join(format!("output-{umask}.json"));
+        let path = directory.join(format!("output-{umask}.json"));
         if existing {
             fs::write(&path, b"stale evidence that must be replaced\n").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
@@ -75,6 +81,11 @@ fn assert_private_output(arguments: &[&str], expected: &[u8], existing: bool) {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
         println!("{}: umask {umask}, mode {mode:04o}", path.display());
         assert_eq!(mode, 0o600, "output must be owner-only under umask {umask}");
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o7777,
+            0o750,
+            "generic output must preserve the containing directory's permissions"
+        );
     }
 }
 
