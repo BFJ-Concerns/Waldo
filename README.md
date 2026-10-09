@@ -413,5 +413,6 @@ you or the agent attempted, what Waldo returned, and the output of
 
 ## Licence
 
-Waldo does not have a licence yet. Until one is chosen, all rights are
-reserved.
+Waldo is free software, licensed under the GNU Affero General Public
+License, version 3 or (at your option) any later version
+(`AGPL-3.0-or-later`). See [`LICENSE`](LICENSE) for the full text.

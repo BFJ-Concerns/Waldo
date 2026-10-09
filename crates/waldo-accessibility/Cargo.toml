@@ -3,6 +3,7 @@ name = "waldo-accessibility"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 atspi-common.workspace = true
