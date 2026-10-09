@@ -1,4 +1,4 @@
-use schemars::{JsonSchema, Schema, schema_for};
+use schemars::{Schema, schema_for};
 use serde::Serialize;
 
 use crate::{ClientMessage, SCHEMA_MAJOR_VERSION, ServerMessage};
@@ -19,9 +19,6 @@ pub fn published_schema() -> PublishedSchema {
         server_messages: schema_for!(ServerMessage),
     }
 }
-
-#[allow(dead_code)]
-fn ensure_wire_types_remain_schema_capable<T: JsonSchema>() {}
 
 #[cfg(test)]
 mod tests {
