@@ -4,8 +4,9 @@ Waldo lets a Claude Code session observe and operate applications on a live
 Niri Wayland desktop: a local controller (`waldod`) serves a private socket,
 and two bindings speak its versioned protocol — the `waldo` CLI for
 full-fidelity reproduction and diagnostics, and `waldo-mcp`, the plugin's MCP
-server, for the agent's normal loop. `README.md` is the operator's guide and
-is kept truthful in the same change as any behaviour it describes.
+server, for the agent's normal loop. `README.md` and the guides under
+`docs/` are the user documentation, kept truthful in the same change as any
+behaviour they describe.
 
 ## The gate
 
@@ -53,8 +54,8 @@ profile, capabilities, outputs and keyboard layout through the controller.
   `waldo-socket` supplies their transport.
 - `waldo-settings` declares every runtime setting once — each value that
   differs between machines or people — while `install-local` reads its own
-  installer settings from its environment. The README's Configuration
-  section names every one of both kinds; a test enforces that.
+  installer settings from its environment. `docs/configuration.md`
+  names every one of both kinds; a test enforces that.
 - `waldo-action` grounds ordered actions. The Niri, screencopy, accessibility,
   clipboard, virtual-pointer and virtual-keyboard crates provide the desktop
   backends.
@@ -68,7 +69,7 @@ scale, transforms, the compositor's keyboard layout, compositor capabilities,
 application state — never from workstation-specific identifiers. Keep paths,
 timings, applications and display layouts out of product logic. When a
 genuine machine difference needs policy, expose it as a discovered capability
-or as a setting declared in `waldo-settings` and documented in the README;
+or as a setting declared in `waldo-settings` and documented in `docs/configuration.md`;
 tuning internals (poll intervals, quiet periods, deadlines, resource caps)
 stay internal.
 
@@ -79,8 +80,7 @@ plugin ships and the MCP server's instructions tell the model to load. A
 change the runtime needs the skill to carry — a new action variant, a
 changed result field, a grounding rule learnt from an agent going wrong —
 updates the skill's literal examples and stated facts here, in the same
-change, and is described in the README's "Guidance for driving agents"
-section. Keep such changes to the examples and facts; propose restructuring
+change, and is described in `docs/agent-guidance.md`. Keep such changes to the examples and facts; propose restructuring
 or rewording the skill in an issue rather than a direct edit. The protocol
 tests decode every JSON example in the skill through the protocol
 crate's wire types and require every action and predicate variant to have

@@ -1,8 +1,9 @@
-//! Every operator setting is named in the README's configuration reference.
+//! Every operator setting is named in the configuration reference,
+//! `docs/configuration.md`.
 //!
 //! The reference is the newcomer's only list of what can be set without a
 //! source edit, so a setting the runtime or the installer reads but the
-//! README does not name is a defect this test catches: declared settings,
+//! reference does not name is a defect this test catches: declared settings,
 //! and every `WALDO_` name the runtime crates, the plugin manifests, or the
 //! installer mention.
 
@@ -15,18 +16,9 @@ fn repository_root() -> &'static Path {
         .expect("the settings crate lives at crates/waldo-settings")
 }
 
-fn readme_configuration_section() -> String {
-    let readme =
-        fs::read_to_string(repository_root().join("README.md")).expect("README.md is readable");
-    let start = readme
-        .find("\n## Configuration\n")
-        .expect("README.md has a '## Configuration' section");
-    let body = &readme[start + 1..];
-    let end = body[3..]
-        .find("\n## ")
-        .map(|offset| offset + 3)
-        .unwrap_or(body.len());
-    body[..end].to_owned()
+fn configuration_reference() -> String {
+    fs::read_to_string(repository_root().join("docs/configuration.md"))
+        .expect("docs/configuration.md is readable")
 }
 
 fn names_in(text: &str) -> BTreeSet<String> {
@@ -103,22 +95,22 @@ fn collect_files(directory: &Path, files: &mut Vec<std::path::PathBuf>) {
 }
 
 #[test]
-fn every_declared_setting_has_a_readme_row() {
-    let section = readme_configuration_section();
+fn every_declared_setting_has_a_reference_row() {
+    let reference = configuration_reference();
     let missing: Vec<_> = waldo_settings::ALL
         .iter()
-        .filter(|spec| !section.contains(&format!("`{}`", spec.name)))
+        .filter(|spec| !reference.contains(&format!("`{}`", spec.name)))
         .map(|spec| spec.name)
         .collect();
     assert!(
         missing.is_empty(),
-        "README.md's Configuration section names no row for {missing:?}"
+        "docs/configuration.md names no row for {missing:?}"
     );
 }
 
 #[test]
 fn every_waldo_name_the_runtime_or_installer_reads_is_documented() {
-    let documented = names_in(&readme_configuration_section());
+    let documented = names_in(&configuration_reference());
     let mut undocumented = BTreeSet::new();
     for file in runtime_sources() {
         let Ok(text) = fs::read_to_string(&file) else {
@@ -135,6 +127,6 @@ fn every_waldo_name_the_runtime_or_installer_reads_is_documented() {
     }
     assert!(
         undocumented.is_empty(),
-        "settings read but absent from README.md's Configuration section: {undocumented:#?}"
+        "settings read but absent from docs/configuration.md: {undocumented:#?}"
     );
 }

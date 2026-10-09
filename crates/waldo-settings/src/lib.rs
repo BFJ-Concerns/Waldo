@@ -3,8 +3,8 @@
 //! Every such value is declared once here as a [`SettingSpec`], read from one
 //! precedence chain — a command-line flag where the binary offers one, then
 //! the process environment, then the settings file, then the declared
-//! default — and named in the README's configuration reference, which a test
-//! in this crate enforces. Tuning internals (poll intervals, quiet periods,
+//! default — and named in the configuration reference,
+//! `docs/configuration.md`, which a test in this crate enforces. Tuning internals (poll intervals, quiet periods,
 //! deadlines, resource caps) are not settings and do not belong here.
 //!
 //! The settings file is `${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`:
@@ -25,7 +25,7 @@ use std::{
 };
 
 /// One operator-settable value: its environment-variable name and the
-/// default the README documents for it (`None` when the default is derived,
+/// default the configuration reference documents for it (`None` when the default is derived,
 /// such as a path beneath a runtime directory).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SettingSpec {
@@ -59,7 +59,7 @@ pub const MODEL_IMAGE_MAX_EDGE: SettingSpec = SettingSpec {
 };
 
 /// Every declared setting. A setting absent from this list is unreadable
-/// through [`Settings`], and a name present here without a README row fails
+/// through [`Settings`], and a name present here without a reference row fails
 /// the documentation test.
 pub const ALL: &[SettingSpec] = &[
     SOCKET_PATH,
