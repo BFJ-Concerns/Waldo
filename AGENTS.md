@@ -33,14 +33,15 @@ desktop. For fast iteration between gate runs, `scripts/gate --check` runs
 every stage but the test suite, and `cargo check --workspace` alone is
 faster still.
 
-Run `./install-local` only when a change is ready to replace the operator's
-live installation: it builds and installs the binaries, enables the user
-service, installs the plugin, proves plugin loading and image delivery, and
-records the environment that proof exercised — outputs, scale, transforms,
-keyboard layout, capabilities — as the installation's profile. It needs the
-active Niri session. `plugins/waldo/` is the plugin source; never patch the
-installed copy. With the service running, `waldo query` shows the current
-profile, capabilities, outputs and keyboard layout through the controller.
+Run `./install-local` only when a change is ready to replace your live
+installation (a rehearsal with `WALDO_INSTALL_ROOT` leaves it alone): it
+builds and installs the binaries, enables the user service, installs the
+plugin, proves plugin loading and image delivery, and records the environment
+that proof exercised — outputs, scale, transforms, keyboard layout,
+capabilities — as the installation's profile. It needs the active Niri
+session. `plugins/waldo/` is the plugin source; never patch the installed
+copy. With the service running, `waldo query` shows the current profile,
+capabilities, outputs and keyboard layout through the controller.
 
 ## Architecture
 
