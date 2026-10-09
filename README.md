@@ -1,105 +1,195 @@
 # Waldo
 
-Waldo lets an agent observe and operate applications on a Niri Wayland
-desktop. A local controller serves the command-line client and the plugin's
-MCP server. The plugin ships the desktop-control skill, which supplies the
-agent's driving guidance; the MCP server's instructions tell the model to
-load it.
+Waldo lets a coding agent see and use the applications on your Niri Wayland
+desktop. With Waldo installed, a Claude Code session can take screenshots of
+your outputs and windows, read the focused application's accessibility tree,
+and drive the pointer, keyboard, clipboard, windows and workspaces — then
+check what actually happened before it carries on.
 
-Waldo is a supervised development tool. Actions affect the foreground desktop;
-one client holds the driving lease at a time. Screenshots and accessibility
-content returned through MCP enter the agent's model conversation.
+> [!WARNING]
+> Waldo is in development and meant for supervised use on a machine you
+> control. Its actions land on your live, foreground desktop, and the
+> screenshots and on-screen text it collects are sent to the agent's model.
+> Do not leave it running unattended or use it on a shared workstation.
 
-## Local installation
+## How it works
 
-From the active Niri graphical session:
+Waldo is a small controller with two clients:
+
+- `waldod` is the controller. It runs as a systemd user service inside your
+  Niri session and serves a private Unix socket.
+- `waldo-mcp` is an MCP server that the Waldo plugin starts for the agent. It
+  exposes four tools: `query`, `observe`, `act` and `stop`.
+- `waldo` is a command-line client for the same protocol, for reproducing what
+  an agent did and diagnosing problems.
+
+The plugin also ships the `desktop-control` skill, which teaches the agent the
+control loop: Query, Observe, one Act batch grounded on that observation,
+inspect the receipts and the returned image, ground the next batch on a fresh
+observation, and Stop when done.
+
+Waldo talks to the desktop through Niri's IPC socket, the wlr screencopy,
+virtual-pointer, virtual-keyboard and data-control Wayland protocols, and the
+AT-SPI accessibility bus. Only one client drives at a time: the first to act
+holds an exclusive driving lease until it stops, disconnects or goes idle.
+
+## Requirements
+
+- A running [Niri](https://github.com/YaLTeR/niri) session managed by a
+  systemd user manager (`systemctl --user` must work), which runs `waldod`.
+- A Rust toolchain with Cargo (Rust 1.88 or later) and the libxkbcommon
+  development headers.
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 2.1.259 or
+  later, installed as `claude` and logged in.
+- Git, jq, realpath, rsync, sha256sum and systemctl on `PATH`.
+
+The OpenAI Codex CLI is optional; see [Codex](#codex).
+
+## Installation
+
+From a terminal inside your Niri session:
 
 ```sh
+git clone https://github.com/BFJ-Concerns/Waldo.git
+cd Waldo
 ./install-local
+```
+
+The installer:
+
+1. builds and installs `waldod`, `waldo` and `waldo-mcp` with `cargo install`
+   (into `~/.cargo/bin` by default);
+2. installs and starts the `waldod` user service;
+3. registers the Waldo plugin with Claude Code through a personal directory
+   marketplace, keeping any other plugins that marketplace lists;
+4. proves the installation with one real headless Claude Code turn; and
+5. records what it found — outputs, scale, transforms, keyboard layout and
+   capabilities — in
+   `${XDG_STATE_HOME:-$HOME/.local/state}/waldo/environment.json`.
+
+The proof turn runs Claude Code from an empty private directory with its
+built-in tools removed, Waldo's read-only `query` and `observe` tools
+pre-approved and permission prompts turned off, so any other tool call is
+denied unless your own Claude Code settings (permission rules, hooks or
+permission mode) allow it. It passes only when the transcript shows the
+plugin loaded from the marketplace, its MCP server connected, and an Observe
+result carrying an image; the model's reply must also report completion,
+but is never taken as evidence of loading or image delivery. Nothing is recorded as installed without that
+proof. This turn sends a real screenshot of one of your outputs to Claude, so
+clear anything sensitive from the screen before you run the installer.
+
+The installed plugin starts `waldo-mcp` by its absolute path, so agent
+sessions need no extra `PATH` setup. To check the controller afterwards with
+the command-line client, which lives in Cargo's bin directory (`~/.cargo/bin`
+unless you configured another; add it to your `PATH` or use the full path):
+
+```sh
 waldo query --include-windows
 ```
 
-The installer builds `waldod`, `waldo` and `waldo-mcp`, enables the user service,
-registers the plugin in Claude Code through a personal marketplace, proves
-the installation through one real headless Claude Code turn, and records the
-discovered environment at
-`${XDG_STATE_HOME:-$HOME/.local/state}/waldo/environment.json`.
-The installed plugin launches `waldo-mcp` by its resolved absolute path under
-the Cargo install root, so later agent sessions need no additional `PATH` setup.
-It requires Cargo, Claude Code (`claude`, logged in), Git, jq, realpath,
-rsync, sha256sum and systemctl on `PATH`.
+Run `./install-local` again to upgrade after pulling new changes.
 
-The proof turn runs Claude Code with the built-in tools removed and only the
-read-only Waldo tools permitted, from an empty private directory; it passes
-only when the transcript shows the plugin loaded from the marketplace, its
-MCP server connected, and one Observe tool result carrying an image content
-block inside the turn. The model's reply is never the evidence. The
-environment file records the proof summary under `installation.agents.claude`
-and nothing is recorded as available without it.
+### Rehearsal installs
 
-Codex support is best-effort. When `codex` is on `PATH` the installer also
-registers the plugin in Codex's marketplace and runs the same proof turn
-there, recording the outcome under `installation.agents.codex`; a Codex
-failure is reported and recorded, never fatal, and an absent Codex is
-recorded as `{"present": false}`.
+Set `WALDO_INSTALL_ROOT` to a disposable directory to rehearse an installation
+without touching your real one. A rehearsal installs into that tree, uses its
+own controller socket, leaves the canonical service and your Claude Code
+configuration alone, loads the candidate plugin for the proof turn only (with
+`claude --plugin-dir`), and removes its temporary controller on exit. The
+private socket is used only when `WALDO_SOCKET_PATH` is not already set: a
+value inherited from your environment is used as given, so unset it first if
+it names your live controller's socket.
 
-`WALDO_INSTALL_ROOT` selects a disposable installation tree and a separate
-controller socket. This mode leaves the canonical service and the operator's
-Claude Code configuration alone: the candidate plugin is loaded for the proof
-turn only, with `claude --plugin-dir`, and the temporary controller is
-removed on exit. The Codex half of a rehearsal links the operator's existing
-Codex login into a private Codex home.
+### Codex
 
-## Controller and tools
+Codex support is best-effort. When `codex` is on `PATH`, the installer also
+registers the plugin in Codex's marketplace and proves it with its own turn:
+`codex exec` in a read-only sandbox must return an Observe result carrying an
+image, and the MCP manifest in the plugin Codex installed must match the
+candidate's. A Codex failure is reported and recorded under
+`installation.agents.codex` in the environment file but never fails the
+installation; when Codex is absent, it is recorded as `{"present": false}`. A
+rehearsal links your existing Codex login into a private Codex home.
 
-`waldod` serves a private Unix socket at
-`$XDG_RUNTIME_DIR/waldo/controller.sock` unless the `WALDO_SOCKET_PATH`
-setting names another (see Configuration). The CLI and `waldod` also accept
-`--socket PATH`. `waldo-mcp` serves MCP over standard input and output.
+## Usage
 
-| MCP tool | Request | Result |
-| --- | --- | --- |
-| `query` | `include_windows` | Outputs, workspaces, focus, keyboard layout, capabilities and lease state |
-| `observe` | `source`, `include_accessibility`, optional `continue_from` | An observation identifier, coordinates, PNG and available accessibility state |
-| `act` | `observation_id`, ordered `actions`, `verification` predicates | Per-action receipts, application outcome and a resulting observation when available |
-| `stop` | Empty object | Cancellation and release of the client's driving lease and held input |
+Start Claude Code and ask for something that needs a desktop application, for
+example:
 
-The CLI publishes the complete shared schema without connecting to a controller:
-
-```sh
-waldo schema
+```text
+Open the Settings window and tell me which display scale is set.
 ```
 
-MCP `tools/list` supplies the input schema for each tool. Actions use a `type`
-tag; the schema is the authoritative list of variants and fields. For example:
+The agent loads the desktop-control skill, queries the desktop, observes it,
+acts in grounded batches, and calls Stop when it has finished. Your usual
+Claude Code permission prompts apply to Waldo's tools.
+
+### Taking back control
+
+Interrupt the agent in Claude Code (Esc) to stop it planning further
+actions. When no batch is running, a driving lease lapses on its own 30
+seconds after the agent's last action (see
+`WALDO_LEASE_IDLE_TIMEOUT_SECONDS`), releasing held input; a batch still
+running keeps its lease. Stop belongs to the
+connection that holds the lease, so a separate `waldo stop` cannot end an
+agent's batch; to end a running batch or stop everything at once, stop the
+controller:
+
+```sh
+systemctl --user stop waldod
+```
+
+It starts again with your next graphical session, or with
+`systemctl --user start waldod`.
+
+### MCP tools
+
+| Tool | Request | Result |
+| --- | --- | --- |
+| `query` | `include_windows` | Outputs, workspaces, focus, keyboard layout, capabilities and lease state |
+| `observe` | `source`, `include_accessibility`, optional `continue_from` | An observation identifier, coordinates, a PNG and any available accessibility state |
+| `act` | `observation_id`, ordered `actions`, `verification` predicates | Per-action receipts, the application outcome and, when available, a resulting observation |
+| `stop` | Empty object | Cancels the client's batch and releases its driving lease and any held input |
+
+An observation source is a whole output, a window, or a region of an output.
+Actions are tagged by `type`, for example:
 
 ```json
 {"type":"pointer_click","position":{"x":226,"y":156},"button":"primary","count":1}
 ```
 
-Positions are desktop-logical coordinates. Output and window identifiers come
-from Query; capability results disclose which capture and action routes are
-available. An observation and its identifier belong to the controller
-connection that requested it. Separate CLI invocations do not share one.
-`continue_from` must also name an observation of exactly the same source.
+MCP `tools/list` gives each tool's input schema. `waldo schema` prints the
+complete versioned protocol schema without connecting to a controller, and is
+the authority on every action and predicate variant.
 
-For a CLI reproduction, `observe.json` can contain:
+### Command-line client
+
+`waldo` speaks the same protocol as the MCP server, with subcommands `schema`,
+`query`, `observe`, `act`, `stop`, `handover` and `send`; run
+`waldo <command> --help` for a command's options. `waldod` serves
+`$XDG_RUNTIME_DIR/waldo/controller.sock` unless the `WALDO_SOCKET_PATH`
+setting names another socket, and both `waldod` and `waldo` accept
+`--socket PATH`.
+
+An observation and its identifier belong to the controller connection that
+requested it, so separate `waldo` invocations do not share one. To replay an
+act document, give `waldo act` an observe document too; it captures fresh
+grounding on the same connection and substitutes that observation's
+identifier before dispatch. With `observe.json` containing:
 
 ```json
 {"source":{"type":"output","output_id":"OUTPUT_NAME"},"include_accessibility":false}
 ```
 
-Replace `OUTPUT_NAME` with the output identifier returned by Query. Given an
-`act.json` with `observation_id`, `actions` and `verification`, this command
-captures fresh grounding on the same connection and replaces the supplied
-observation identifier before dispatch:
+where `OUTPUT_NAME` is an output identifier from `waldo query`, and `act.json`
+holding `observation_id`, `actions` and `verification`, run:
 
 ```sh
 waldo act act.json --observe observe.json
 ```
 
-Explicit lease handover is available through the CLI only. MCP clients finish
-their driving session with Stop.
+Explicit lease handover to another connection is available through the CLI
+only; MCP clients finish their driving session with Stop.
 
 ## Configuration
 
@@ -108,9 +198,19 @@ needs a source edit. A runtime setting is resolved, highest precedence
 first, from a command-line flag where the binary offers one, the process
 environment, the settings file, then its default. The settings file is
 `${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`, one `NAME=VALUE` per
-line with `#` comments and no quoting, and is read by every Waldo binary
-however it was launched; a name there that is not a setting is an error.
+line with `#` comments and no quoting, and is read whenever a Waldo binary
+resolves a setting, however it was launched; a name there that is not a
+setting is an error.
 Restart `waldod` after changing a value it reads.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `WALDO_SOCKET_PATH` | `$XDG_RUNTIME_DIR/waldo/controller.sock` | The private controller socket `waldod` serves and both clients connect to. |
+| `WALDO_LEASE_IDLE_TIMEOUT_SECONDS` | `30` | Seconds after the driver's last action before a driving lease lapses and held input is released. Query and Observe do not count as activity, and a lease is never lapsed while a batch is running. Whole seconds, at least 1; the timeout cannot be disabled. |
+| `WALDO_CLIPBOARD_PASTE_CHORD` | `ctrl+v` | Clipboard-paste key names separated by `+`; whitespace around each name is trimmed and empty names are refused at start-up. Key names use the virtual keyboard vocabulary and are checked against the active layout at paste time; an unavailable key fails without a default-chord fallback. |
+| `WALDO_MODEL_IMAGE_MAX_EDGE` | `2048` | Maximum longest edge in pixels for MCP images. A positive whole number; smaller images are delivered unscaled. Restart the MCP process after changing it. |
+
+### Keyboard layout
 
 Keyboard input uses the keymap the compositor reports, so the layout needs
 no setting. Text includes characters produced by one dead key followed by a
@@ -129,17 +229,12 @@ only where the receiving application composes dead keys. GTK 4 on Wayland
 composes them only with a running input method or
 `GTK_IM_MODULE=gtk-im-context-simple`. Where exact text matters and
 composition is uncertain, use the clipboard-paste route, which delivers
-the string exactly. The automatic route tries clipboard paste before the
-keyboard but falls back to the keyboard when clipboard paste is
-unavailable, so its receipt names the route that actually carried the
-text.
+the string exactly. The automatic route tries accessibility text
+replacement on the focused element first, then clipboard paste, then the
+keyboard, moving on when a route is unavailable, so its receipt names the
+route that actually carried the text.
 
-| Setting | Default | Effect |
-| --- | --- | --- |
-| `WALDO_SOCKET_PATH` | `$XDG_RUNTIME_DIR/waldo/controller.sock` | The private controller socket `waldod` serves and both bindings connect to. |
-| `WALDO_LEASE_IDLE_TIMEOUT_SECONDS` | `30` | Seconds without a request or a running batch before a driving lease lapses and held input is released. Whole seconds, at least 1; the timeout cannot be disabled. |
-| `WALDO_CLIPBOARD_PASTE_CHORD` | `ctrl+v` | Clipboard-paste key names separated by `+`; whitespace around each name is trimmed and empty names are refused at start-up. Key names use the virtual keyboard vocabulary and are checked against the active layout at paste time; an unavailable key fails without a default-chord fallback. |
-| `WALDO_MODEL_IMAGE_MAX_EDGE` | `2048` | Maximum longest edge in pixels for MCP images. A positive whole number; smaller images are delivered unscaled. Restart the MCP process after changing it. |
+### Installer settings
 
 Installer settings are read from the environment of the `./install-local`
 invocation only. The installer passes an explicit Cargo install root: the
@@ -165,7 +260,7 @@ child so they cannot connect to the live controller.
 | `WALDO_MARKETPLACE_OWNER` | `BFJ Concerns` | Owner name written into both marketplace manifests. |
 | `WALDO_PLUGIN_HOME` | `~/plugins/waldo` | Where the plugin source is copied for the agents' marketplaces. Its parent directory is the Claude Code marketplace, whose manifest `<parent>/.claude-plugin/marketplace.json` keeps any other plugins it lists. |
 | `WALDO_MARKETPLACE` | `~/.agents/plugins/marketplace.json` | The Codex marketplace file the plugin is registered in; other plugins it lists are kept. |
-| `WALDO_SERVICE_FILE` | `~/.config/systemd/user/waldod.service` | Where the user service file is written; the unit name stays `waldod.service`. |
+| `WALDO_SERVICE_FILE` | `~/.config/systemd/user/waldod.service` | Where the user service file is written; the unit name stays `waldod.service`, and the installer enables and restarts it by that name, so the file must be in a directory systemd searches for user units. |
 | `WALDO_PROFILE_FILE` | `${XDG_STATE_HOME:-~/.local/state}/waldo/environment.json` | Where the recorded installation environment is written. |
 | `WALDO_CODEX_HOME` | `<install root>/codex` | Rehearsal installs with `codex` present only: the Codex home used for the best-effort Codex proof. |
 | `WALDO_CODEX_AUTH_SOURCE` | `${CODEX_HOME:-~/.codex}/auth.json` | Rehearsal installs with `codex` present only: the existing Codex login linked into that home. |
@@ -190,16 +285,33 @@ logical_x = origin.x + image_x * width / model_image_pixels.width
 logical_y = origin.y + image_y * height / model_image_pixels.height
 ```
 
-MCP returns the PNG as an image content block and marks it
-`delivered_as_content` in the structured observation. Geometry-dependent actions
-cite the observation used for their coordinates. Changed output layout,
-geometry or relevant focus can make that grounding stale.
+Positions in actions are desktop-logical coordinates; output and window
+identifiers come from Query. MCP returns the PNG as an image content block and
+marks it `delivered_as_content` in the structured observation.
+Geometry-dependent actions cite the observation used for their coordinates,
+and `continue_from` must name an observation of exactly the same source.
+Changed output layout, geometry or relevant focus can make that grounding
+stale.
 
 An `executed` receipt confirms dispatch, not application completion.
 `application_outcome` and `completion_evidence` report what post-action evidence
 supports; an inconclusive result can accompany a dispatched action. Batches
 stop at a failed or unverifiable execution boundary and do not roll back
 earlier actions. An indeterminate receipt means an action may have executed.
+
+## Privacy and safety
+
+- Screenshots, accessibility names and values, and clipboard contents that
+  Waldo returns through MCP enter the agent's model conversation. Waldo has
+  no redaction: anything visible on the observed output can be sent.
+- Actions use the real pointer and keyboard on your foreground desktop. Stop
+  cancels the current batch and releases held input; it does not close
+  applications or undo earlier actions.
+- The skill tells the agent to treat on-screen text, accessibility labels,
+  clipboard contents and documents as untrusted evidence, never as
+  instructions.
+- The controller socket is private to your user, and the installation profile
+  is written readable by you only.
 
 ## Scope and limits
 
@@ -208,40 +320,42 @@ through `NIRI_SOCKET` and `WAYLAND_DISPLAY`, and the controller socket under
 `XDG_RUNTIME_DIR`. Query reports which backends are available and, for each
 unavailable one, its `limitation`.
 
-- There is no nested, headless or private desktop capability. No command
-  creates, selects or tears down a compositor session, and no MCP tool takes a
-  session argument. A second controller can serve another session only by
-  starting `waldod` under that session's environment and routing clients to
-  its socket with `--socket` or `WALDO_SOCKET_PATH`.
-  `scripts/verify-transformed-output.py` wires a disposable nested Niri this
-  way for one regression fixture; it is a test harness, not a supported
-  session lifecycle, and agent guidance must not assume or promise one.
+- There is no nested, headless or private desktop. No command creates,
+  selects or tears down a compositor session, and no MCP tool takes a session
+  argument. A second controller can serve another session only by starting
+  `waldod` under that session's environment and pointing clients at its socket
+  with `--socket` or `WALDO_SOCKET_PATH`.
+  `scripts/verify-transformed-output.py` sets up a disposable nested Niri this
+  way for one regression test; it is a test harness, not a supported session
+  lifecycle.
 - Operation is foreground-only and single-driver. One connection holds the
-  driving lease; actions land on the foreground desktop. Background
-  application actions, private desktops, independent seats and simultaneous
-  user and agent work are outside the current contract.
-- Explicit lease handover exists in the CLI only.
-- Waldo is a supervised development tool for the operator's own unshared
-  machine. It is not fit for unattended operation, a shared workstation or
-  general distribution.
+  driving lease, and pointer, keyboard and clipboard input land on the
+  foreground desktop; only window and workspace operations can target an
+  unfocused window by its ID. Background application input, private desktops,
+  independent seats and simultaneous user and agent work are not supported.
+- Niri is the only supported compositor, and Claude Code the only fully
+  supported agent.
+- Waldo is a supervised development tool for your own machine. It is not fit
+  for unattended operation or a shared workstation, and no packaged releases
+  exist.
 
-## Guidance the agent skill must carry
+## Guidance for driving agents
 
-The desktop-control skill in `plugins/waldo/skills/desktop-control/` steers
-agents. This section lists what the runtime needs an agent to be walked
-through, drawn from where agents have gone wrong against it. The wording is
-the skill's; the
-facts are the runtime's, and the protocol tests hold the skill's JSON
-examples to the schema.
+The desktop-control skill in `plugins/waldo/skills/desktop-control/` carries
+what an agent needs to drive Waldo well, and anyone adapting Waldo to
+another agent should carry the same facts. The protocol tests hold the
+skill's JSON examples to the schema.
 
 - **The control loop.** Query, then Observe, then one coherent Act batch that
   cites the observation it was planned from, then inspect every receipt and
-  the returned image, then Observe again before replanning, then Stop when the
-  desktop work is finished, abandoned or handed back to the operator.
+  the returned image, then ground the next batch on fresh evidence — the
+  settled observation Act returned when it shows the needed source, otherwise
+  a new Observe — then Stop when the
+  desktop work is finished, abandoned or handed back to the user.
 - **Exact action shapes.** Agents invent variants and fields: a `focus_window`
   action, a generic `pointer` action with a nested operation, `target`,
-  `handle` or `condition` fields. The skill must carry literal JSON examples
-  of the tagged variants, and `waldo schema` is the authority when an example
+  `handle` or `condition` fields. The skill carries literal JSON examples of
+  the tagged variants, and `waldo schema` is the authority when an example
   and a guess disagree.
 - **Coordinate conversion.** The linear image-to-logical formula above, with
   no undeclared display or preview scale and no second rotation or reflection
@@ -273,5 +387,31 @@ examples to the schema.
   had open stays the user's: it is neither replaced nor closed. Agents sharing
   one desktop serialise driving; there is one driver at a time.
 - **Defect reporting.** A problem attributable to Waldo itself is reported
-  with what was attempted, what Waldo returned and why the fault is Waldo's,
-  on the public issue tracker: <https://github.com/BFJ-Concerns/Waldo/issues>.
+  with what was attempted, what Waldo returned and why the fault is Waldo's.
+
+## Building and testing
+
+`cargo build --workspace` builds everything. `scripts/gate` runs the checks
+CI runs on every push and pull request: `cargo fmt --check`, `cargo check`,
+Clippy with warnings denied, `systemd-analyze --user verify` on the service
+file, `cargo test --workspace`, and the Python tests under `scripts/tests`.
+Run it inside a Niri session: tests that need a live desktop return early
+without one, and cargo counts them as passed, so a run elsewhere (CI
+included) has not exercised them. Four clipboard tests are ignored by
+default because they take over the live clipboard; run them inside the
+session with `cargo test --workspace -- --ignored`. Those and the
+verification fixtures also need Python 3 with PyGObject and GTK 4. `scripts/gate --check`
+runs every stage except the tests. `AGENTS.md` describes the crate layout for
+contributors.
+
+## Reporting problems
+
+Report bugs and other problems on the
+[issue tracker](https://github.com/BFJ-Concerns/Waldo/issues). Include what
+you or the agent attempted, what Waldo returned, and the output of
+`waldo query`.
+
+## Licence
+
+Waldo does not have a licence yet. Until one is chosen, all rights are
+reserved.
