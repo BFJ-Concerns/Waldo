@@ -14,11 +14,16 @@ Clippy with warnings denied, `systemd-analyze --user verify` on the service
 file, `cargo test --workspace`, and the Python launcher tests under
 `scripts/tests`. CI runs exactly that command on every push
 and pull request, and every pull request — documentation included — is
-expected to pass it. Run it inside the Niri session so the live-session
-tests (screencopy, Niri IPC, virtual input, clipboard, AT-SPI) execute rather
-than skip — a skip is reported as not run, never as a pass. Those tests start
-their own controllers on private sockets and open their own fixture windows
-on the live desktop; they do not touch an installed service or its lease.
+expected to pass it. Run it inside the Niri session: the live-session
+tests (screencopy, Niri IPC, virtual input, AT-SPI) return early when
+`NIRI_SOCKET`, `WAYLAND_DISPLAY` or the session bus is absent, and cargo
+counts that early return as a pass, so a run outside the session — CI's
+included — has not exercised them. Four clipboard tests are `#[ignore]`d
+because they take over the live clipboard; run them inside the session with
+`cargo test --workspace -- --ignored` (their fixture needs Python 3 with
+PyGObject and GTK 4). Live tests start their own
+controllers on private sockets and open their own fixture windows on the
+live desktop; they do not touch an installed service or its lease.
 For fast iteration between gate runs, `scripts/gate --check` runs every stage
 but the test suite, and `cargo check --workspace` alone is faster still.
 
@@ -41,9 +46,10 @@ profile, capabilities, outputs and keyboard layout through the controller.
   the private controller socket.
 - `waldo-cli` and `waldo-mcp` are bindings over the same controller protocol;
   `waldo-socket` supplies their transport.
-- `waldo-settings` declares every operator setting once — each value that
-  differs between machines or people — and the README's Configuration section
-  names each one; a test enforces that.
+- `waldo-settings` declares every runtime setting once — each value that
+  differs between machines or people — while `install-local` reads its own
+  installer settings from its environment. The README's Configuration
+  section names every one of both kinds; a test enforces that.
 - `waldo-action` grounds ordered actions. The Niri, screencopy, accessibility,
   clipboard, virtual-pointer and virtual-keyboard crates provide the desktop
   backends.
@@ -64,15 +70,17 @@ stay internal.
 ## The desktop-control skill
 
 `plugins/waldo/skills/desktop-control/SKILL.md` is the driving guidance the
-plugin ships and the MCP server's instructions tell the model to load. A change
-the runtime needs the skill to carry — a new action variant, a changed
-result field, a grounding rule learnt from an agent going wrong — updates
-the skill's literal examples and stated facts here, in the same change, and
-is described in the README's "Guidance the agent skill must carry" section.
-The protocol tests decode every
-JSON example in the skill through the protocol crate's wire types and
-require every action and predicate variant to have one, so a runtime change
-that outgrows the skill fails the gate until the skill catches up.
+plugin ships and the MCP server's instructions tell the model to load. A
+change the runtime needs the skill to carry — a new action variant, a
+changed result field, a grounding rule learnt from an agent going wrong —
+updates the skill's literal examples and stated facts here, in the same
+change, and is described in the README's "Guidance for driving agents"
+section. Keep such changes to the examples and facts; propose restructuring
+or rewording the skill in an issue rather than a direct edit. The protocol
+tests decode every JSON example in the skill through the protocol
+crate's wire types and require every action and predicate variant to have
+one, so a runtime change that outgrows the skill fails the gate until the
+skill catches up.
 
 Defects in Waldo are reported on the public issue tracker named in the
 README.
