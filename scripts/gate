@@ -44,20 +44,27 @@ stage() {
 }
 
 verify_service_file() {
-    # systemd-analyze needs a runtime directory even to verify a unit file
-    # offline; give it a private one when the environment has none.
+    # The unit is a template: install-local replaces its ExecStart with the
+    # installed waldod. systemd-analyze refuses an ExecStart that is not
+    # executable, so verify against a private home holding a stub at the
+    # template's path; the check then covers the unit, not whether Waldo
+    # happens to be installed. systemd-analyze also needs a runtime
+    # directory; give it a private one when the environment has none.
+    local scratch
+    scratch="$(mktemp -d)"
+    install -d "$scratch/home/.cargo/bin"
+    printf '#!/bin/sh\n' >"$scratch/home/.cargo/bin/waldod"
+    chmod 0755 "$scratch/home/.cargo/bin/waldod"
     local runtime="${XDG_RUNTIME_DIR:-}"
-    local scratch=""
     if [[ -z "$runtime" || ! -d "$runtime" ]]; then
-        scratch="$(mktemp -d)"
-        runtime="$scratch"
+        runtime="$scratch/runtime"
+        install -d -m 0700 "$runtime"
     fi
     local status=0
-    XDG_RUNTIME_DIR="$runtime" systemd-analyze --user --man=no --generators=no \
+    HOME="$scratch/home" XDG_RUNTIME_DIR="$runtime" \
+        systemd-analyze --user --man=no --generators=no \
         verify packaging/waldod.service || status=$?
-    if [[ -n "$scratch" ]]; then
-        rm -rf -- "$scratch"
-    fi
+    rm -rf -- "$scratch"
     return "$status"
 }
 
