@@ -73,10 +73,11 @@ pre-approved and permission prompts turned off, so any other tool call is
 denied unless your own Claude Code settings (permission rules, hooks or
 permission mode) allow it. It passes only when the transcript shows the
 plugin loaded from the marketplace, its MCP server connected, and an Observe
-result carrying an image; the model's reply must also report completion,
-but is never taken as evidence of loading or image delivery. Nothing is recorded as installed without that
-proof. This turn sends a real screenshot of one of your outputs to Claude, so
-clear anything sensitive from the screen before you run the installer.
+result carrying an image; the model's reply must also report completion, but
+is never taken as evidence of loading or image delivery. Nothing is recorded
+as installed without that proof. This turn sends a real screenshot of one of
+your outputs to Claude, so clear anything sensitive from the screen before
+you run the installer.
 
 The installed plugin starts `waldo-mcp` by its absolute path, so agent
 sessions need no extra `PATH` setup. To check the controller afterwards with
@@ -395,14 +396,20 @@ skill's JSON examples to the schema.
 CI runs on every push and pull request: `cargo fmt --check`, `cargo check`,
 Clippy with warnings denied, `systemd-analyze --user verify` on the service
 file, `cargo test --workspace`, and the Python tests under `scripts/tests`.
-Run it inside a Niri session: tests that need a live desktop return early
-without one, and cargo counts them as passed, so a run elsewhere (CI
-included) has not exercised them. Four clipboard tests are ignored by
-default because they take over the live clipboard; run them inside the
-session with `cargo test --workspace -- --ignored`. Those and the
-verification fixtures also need Python 3 with PyGObject and GTK 4. `scripts/gate --check`
-runs every stage except the tests. `AGENTS.md` describes the crate layout for
-contributors.
+Most tests that need a live desktop return early, and count as passed, when
+the session variables they check (`NIRI_SOCKET`, `WAYLAND_DISPLAY` or the
+D-Bus session bus) are missing, so a run where those are missing, as on CI,
+has not exercised them; run the gate inside a Niri session. Four clipboard
+tests need the live clipboard and are ignored by default instead, and fail
+rather than pass without a session; run them inside the session, with an
+empty clipboard, using `cargo test --workspace -- --ignored`, since some
+publish to the clipboard and replace its owner. The ordered-publication test
+among them returns early, and passes, unless the clipboard is empty, and one
+launches a GTK fixture that needs Python 3 with PyGObject and GTK 4. The
+fixtures of the outside-in verification tool (`waldo-verification`) need
+further toolkits: GTK 4, Qt through PySide6, wxPython and Electron.
+`scripts/gate --check` runs every stage except the tests. `AGENTS.md`
+describes the crate layout for contributors.
 
 ## Reporting problems
 

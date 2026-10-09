@@ -12,20 +12,25 @@ is kept truthful in the same change as any behaviour it describes.
 `scripts/gate` is the repository's quality gate: formatting, `cargo check`,
 Clippy with warnings denied, `systemd-analyze --user verify` on the service
 file, `cargo test --workspace`, and the Python launcher tests under
-`scripts/tests`. CI runs exactly that command on every push
+`scripts/tests`. CI runs it as `scripts/gate --all`, which runs every stage
+and reports every failure rather than stopping at the first, on every push
 and pull request, and every pull request — documentation included — is
-expected to pass it. Run it inside the Niri session: the live-session
-tests (screencopy, Niri IPC, virtual input, AT-SPI) return early when
-`NIRI_SOCKET`, `WAYLAND_DISPLAY` or the session bus is absent, and cargo
-counts that early return as a pass, so a run outside the session — CI's
-included — has not exercised them. Four clipboard tests are `#[ignore]`d
-because they take over the live clipboard; run them inside the session with
-`cargo test --workspace -- --ignored` (their fixture needs Python 3 with
-PyGObject and GTK 4). Live tests start their own
-controllers on private sockets and open their own fixture windows on the
-live desktop; they do not touch an installed service or its lease.
-For fast iteration between gate runs, `scripts/gate --check` runs every stage
-but the test suite, and `cargo check --workspace` alone is faster still.
+expected to pass it. The guarded live-session tests return early, and count
+as passed, when the session variables they check are missing —
+`NIRI_SOCKET`, `WAYLAND_DISPLAY` or the D-Bus session bus, depending on the
+test — so a run where those are missing, as on CI, does not exercise them;
+run the gate inside the Niri session. Four clipboard tests need the live
+clipboard and are `#[ignore]`d instead of guarded, so they fail rather than
+pass without the session; run them inside the session, with an empty
+clipboard, using `cargo test --workspace -- --ignored`, since some publish
+to the clipboard and replace its owner. One of them launches a GTK fixture
+that needs Python 3 with PyGObject and GTK 4, and the ordered-publication
+test returns early, and passes, unless the clipboard is empty. Live tests
+never touch an installed service or its lease; those that need a controller
+or a fixture window start their own, on private sockets and on the live
+desktop. For fast iteration between gate runs, `scripts/gate --check` runs
+every stage but the test suite, and `cargo check --workspace` alone is
+faster still.
 
 Run `./install-local` only when a change is ready to replace the operator's
 live installation: it builds and installs the binaries, enables the user
