@@ -60,8 +60,8 @@ The installer:
 1. builds and installs `waldod`, `waldo` and `waldo-mcp` with `cargo install`
    (into `~/.cargo/bin` by default);
 2. installs and starts the `waldod` user service;
-3. registers the Waldo plugin with Claude Code through a personal directory
-   marketplace, keeping any other plugins that marketplace lists;
+3. copies the plugin to `~/.local/share/waldo/plugins/waldo` and registers it
+   with Claude Code through a directory marketplace there;
 4. proves the installation with one real headless Claude Code turn; and
 5. records what it found — outputs, scale, transforms, keyboard layout and
    capabilities — in
@@ -246,9 +246,10 @@ proof clients regardless of the caller's `PATH`.
 
 The controller, readiness query and plugin proof honour `WALDO_SOCKET_PATH`,
 then the runtime settings file, then the runtime default. An environment
-socket override is written into the installed service; without one, the
-service resolves its socket through the settings file and default. A custom
-`XDG_CONFIG_HOME` is carried into the service and MCP proof too. Rehearsals
+socket override is written into the installed service and the installed
+plugin's MCP server entries; without one, both resolve the socket through the
+settings file and default. A custom `XDG_CONFIG_HOME` is carried into the
+service and the MCP server entries too. Rehearsals
 use `<install root>/home/.config` as their config home and, when no socket
 override is set, export a private socket beneath `WALDO_RUNTIME_DIR` to every
 child so they cannot connect to the live controller.
@@ -257,9 +258,9 @@ child so they cannot connect to the live controller.
 | --- | --- | --- |
 | `WALDO_INSTALL_ROOT` | unset | Names a disposable installation tree for a rehearsal install that leaves the canonical service alone; the settings below default beneath it. |
 | `WALDO_CARGO_INSTALL_ROOT` | `${CARGO_INSTALL_ROOT:-${CARGO_HOME:-~/.cargo}}` | Cargo install root; binaries land in `<root>/bin`. Rehearsal default: `<install root>/cargo`. Relative paths are resolved from the invocation directory. |
-| `WALDO_MARKETPLACE_NAME` | `personal` | Marketplace name used in both manifests, plugin registration and the Codex cache lookup. Registration refuses a Claude Code marketplace of this name that lives elsewhere. |
-| `WALDO_MARKETPLACE_OWNER` | `BFJ Concerns` | Owner name written into both marketplace manifests. |
-| `WALDO_PLUGIN_HOME` | `~/plugins/waldo` | Where the plugin source is copied for the agents' marketplaces. Its parent directory is the Claude Code marketplace, whose manifest `<parent>/.claude-plugin/marketplace.json` keeps any other plugins it lists. |
+| `WALDO_MARKETPLACE_NAME` | `waldo` | Name given to a marketplace manifest the installer creates. An existing manifest keeps its own name and owner, and the plugin is registered under that name. Registration refuses a Claude Code marketplace of the same name that lives elsewhere. |
+| `WALDO_MARKETPLACE_OWNER` | your login name | Owner name given to a marketplace manifest the installer creates. |
+| `WALDO_PLUGIN_HOME` | `${XDG_DATA_HOME:-~/.local/share}/waldo/plugins/waldo` | Where the plugin source is copied for the agents' marketplaces. Each install replaces the directory's contents, so it must be absent, empty or an earlier Waldo plugin copy, and outside the checkout. Its parent directory is the Claude Code marketplace, whose manifest `<parent>/.claude-plugin/marketplace.json` keeps any other plugins it lists. |
 | `WALDO_MARKETPLACE` | `~/.agents/plugins/marketplace.json` | The Codex marketplace file the plugin is registered in; other plugins it lists are kept. |
 | `WALDO_SERVICE_FILE` | `~/.config/systemd/user/waldod.service` | Where the user service file is written; the unit name stays `waldod.service`, and the installer enables and restarts it by that name, so the file must be in a directory systemd searches for user units. |
 | `WALDO_PROFILE_FILE` | `${XDG_STATE_HOME:-~/.local/state}/waldo/environment.json` | Where the recorded installation environment is written. |

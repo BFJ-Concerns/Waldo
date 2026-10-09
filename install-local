@@ -10,8 +10,8 @@ resolve_installation() {
     operator_codex_home="${CODEX_HOME:-$operator_home/.codex}"
     install_root="${WALDO_INSTALL_ROOT:-}"
     install_mode="canonical"
-    marketplace_name="${WALDO_MARKETPLACE_NAME:-personal}"
-    marketplace_owner="${WALDO_MARKETPLACE_OWNER:-BFJ Concerns}"
+    marketplace_name="${WALDO_MARKETPLACE_NAME:-waldo}"
+    marketplace_owner="${WALDO_MARKETPLACE_OWNER:-$(id -un)}"
 
     if [[ -n "$install_root" ]]; then
         install_mode="redirected"
@@ -24,7 +24,7 @@ resolve_installation() {
         esac
         install_home="$install_root/home"
         cargo_root="${WALDO_CARGO_INSTALL_ROOT:-$install_root/cargo}"
-        plugin_home="${WALDO_PLUGIN_HOME:-$install_home/plugins/waldo}"
+        plugin_home="${WALDO_PLUGIN_HOME:-$install_home/.local/share/waldo/plugins/waldo}"
         marketplace="${WALDO_MARKETPLACE:-$install_home/.agents/plugins/marketplace.json}"
         service_file="${WALDO_SERVICE_FILE:-$install_home/.config/systemd/user/waldod.service}"
         profile_file="${WALDO_PROFILE_FILE:-$install_root/state/waldo/environment.json}"
@@ -40,7 +40,7 @@ resolve_installation() {
     else
         install_home="$operator_home"
         cargo_root="${WALDO_CARGO_INSTALL_ROOT:-${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$operator_home/.cargo}}}"
-        plugin_home="${WALDO_PLUGIN_HOME:-$operator_home/plugins/waldo}"
+        plugin_home="${WALDO_PLUGIN_HOME:-${XDG_DATA_HOME:-$operator_home/.local/share}/waldo/plugins/waldo}"
         marketplace="${WALDO_MARKETPLACE:-$operator_home/.agents/plugins/marketplace.json}"
         service_file="${WALDO_SERVICE_FILE:-$operator_home/.config/systemd/user/waldod.service}"
         profile_file="${WALDO_PROFILE_FILE:-${XDG_STATE_HOME:-$operator_home/.local/state}/waldo/environment.json}"
@@ -56,6 +56,41 @@ resolve_installation() {
     # the manifest and the plugin directories it lists.
     claude_marketplace_root="$(realpath -m -- "$(dirname -- "$plugin_home")")"
     claude_marketplace="$claude_marketplace_root/.claude-plugin/marketplace.json"
+    # A marketplace that already exists keeps its own name, which is the
+    # name its plugins are installed under.
+    claude_marketplace_name="$(existing_marketplace_name "$claude_marketplace")"
+    codex_marketplace_name="$(existing_marketplace_name "$marketplace")"
+}
+
+existing_marketplace_name() {
+    local name=""
+    if [[ -f "$1" ]]; then
+        name="$(jq -r '.name | strings' "$1" 2>/dev/null)" || name=""
+    fi
+    printf '%s\n' "${name:-$marketplace_name}"
+}
+
+# The plugin copy replaces its destination's contents, so the destination
+# must be Waldo's alone: absent, empty, or an earlier copy of the Waldo
+# plugin. The home directory, the checkout and anything containing either
+# are refused before anything is installed.
+check_plugin_home() {
+    local target home checkout
+    target="$(realpath -m -- "$plugin_home")"
+    home="$(realpath -m -- "$operator_home")"
+    checkout="$(realpath -m -- "$repo_root")"
+    if [[ "$target" == / || "$home/" == "$target"/* || "$checkout/" == "$target"/* \
+        || "$target" == "$checkout"/* ]]; then
+        printf 'WALDO_PLUGIN_HOME must name a directory for the Waldo plugin alone, outside the checkout and not containing it or your home directory: %s\n' \
+            "$plugin_home" >&2
+        return 1
+    fi
+    if [[ -d "$target" && -n "$(ls -A -- "$target")" ]] \
+        && ! jq -e '.name == "waldo"' "$target/.claude-plugin/plugin.json" >/dev/null 2>&1; then
+        printf 'WALDO_PLUGIN_HOME holds files that are not a Waldo plugin copy, and installing would replace them: %s\n' \
+            "$plugin_home" >&2
+        return 1
+    fi
 }
 
 # Claude Code is the supported agent and is required. Codex registration and
@@ -114,12 +149,19 @@ write_service_file() {
 # setup, and its plugin manifests carry a fresh build tag so each agent
 # installs the new copy rather than a cached one.
 install_plugin_copy() {
-    local manifest manifest_tmp cachebuster client
+    local manifest manifest_tmp cachebuster client server_env
+    check_plugin_home
     install -d -m 0755 "$plugin_home"
     rsync -a --delete "$repo_root/plugins/waldo/" "$plugin_home/"
+    # The service is given the same overrides, so agent sessions launched
+    # without them still reach the controller this installation serves.
+    server_env="$(jq -n '$ENV | {WALDO_SOCKET_PATH, XDG_CONFIG_HOME}
+        | with_entries(select(.value != null and .value != ""))')"
     for manifest in .mcp.json .mcp.claude.json; do
         manifest_tmp="$(mktemp)"
-        jq --arg command "$mcp_bin" '.mcpServers.waldo.command = $command' \
+        jq --arg command "$mcp_bin" --argjson env "$server_env" \
+            '.mcpServers.waldo.command = $command
+            | if $env == {} then . else .mcpServers.waldo.env = $env end' \
             "$plugin_home/$manifest" >"$manifest_tmp"
         install -m 0644 "$manifest_tmp" "$plugin_home/$manifest"
         rm -f -- "$manifest_tmp"
@@ -136,26 +178,27 @@ install_plugin_copy() {
     done
 }
 
-# A marketplace manifest is shared with other plugins. Merge into it: the
-# name, owner and waldo entry are Waldo's to set; every other entry and key
-# survives. The optional third argument is an agent-specific jq filter
+# A marketplace manifest is shared with other plugins. Merge into it: only
+# the waldo entry is Waldo's to set, and every other entry and key survives,
+# the marketplace's name and owner included. A manifest the writer creates
+# takes the configured name and owner. The third argument is the
+# marketplace's name; the optional fourth is an agent-specific jq filter
 # applied to the merged manifest. Success means the merge succeeded, and a
 # failed merge leaves the manifest untouched: the writer may run where
 # errexit is suspended, so it guards its own steps.
 write_marketplace() {
-    local manifest="$1" entry="$2" extra_filter="${3:-.}"
+    local manifest="$1" entry="$2" name="$3" extra_filter="${4:-.}"
     local manifest_tmp filter
     install -d -m 0755 "$(dirname -- "$manifest")" || return 1
     manifest_tmp="$(mktemp)" || return 1
-    filter='.name = $name
-        | .owner = {"name": $owner}
+    filter='(if $created then .name = $name | .owner = {"name": $owner} else .name //= $name end)
         | .plugins = ((.plugins // []) | map(select(.name != "waldo")) + [$entry])
         | '"$extra_filter"
     if [[ -f "$manifest" ]]; then
-        jq --arg name "$marketplace_name" --arg owner "$marketplace_owner" \
+        jq --arg name "$name" --arg owner "$marketplace_owner" --argjson created false \
             --argjson entry "$entry" "$filter" "$manifest" >"$manifest_tmp"
     else
-        jq -n --arg name "$marketplace_name" --arg owner "$marketplace_owner" \
+        jq -n --arg name "$name" --arg owner "$marketplace_owner" --argjson created true \
             --argjson entry "$entry" "$filter" >"$manifest_tmp"
     fi || {
         rm -f -- "$manifest_tmp"
@@ -181,14 +224,14 @@ write_codex_marketplace() {
         "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
         "category": "Productivity"
     }')" || return 1
-    write_marketplace "$marketplace" "$entry" \
+    write_marketplace "$marketplace" "$entry" "$codex_marketplace_name" \
         '.interface = (.interface // {"displayName": "Personal"})'
 }
 
 write_claude_marketplace() {
     local entry
     entry="$(jq -n --arg source "./$(basename -- "$plugin_home")" '{"name": "waldo", "source": $source}')" || return 1
-    write_marketplace "$claude_marketplace" "$entry"
+    write_marketplace "$claude_marketplace" "$entry" "$claude_marketplace_name"
 }
 
 # Codex keeps its login under CODEX_HOME, so a rehearsal redirects its home
@@ -346,6 +389,7 @@ if [[ -z "${XDG_RUNTIME_DIR:-}" || -z "${WAYLAND_DISPLAY:-}" || -z "${NIRI_SOCKE
     exit 1
 fi
 resolve_installation
+check_plugin_home
 
 controller_pid=""
 auth_link=""
@@ -492,20 +536,21 @@ install_plugin_copy
 # one-session --plugin-dir load below.
 failure_stage="Claude Code plugin registration"
 if [[ "$install_mode" == canonical ]]; then
-    write_claude_marketplace
     registered_root="$(claude plugin marketplace list --json \
-        | jq -r --arg name "$marketplace_name" '.[] | select(.name == $name) | .installLocation // empty')"
+        | jq -r --arg name "$claude_marketplace_name" '.[] | select(.name == $name) | .installLocation // empty')"
+    if [[ -n "$registered_root" && "$(realpath -m -- "$registered_root")" != "$claude_marketplace_root" ]]; then
+        printf 'Claude Code already has a marketplace named %s at %s; set WALDO_MARKETPLACE_NAME to another name or WALDO_PLUGIN_HOME beneath that root.\n' \
+            "$claude_marketplace_name" "$registered_root" >&2
+        exit 1
+    fi
+    write_claude_marketplace
     if [[ -z "$registered_root" ]]; then
         claude plugin marketplace add "$claude_marketplace_root"
-    elif [[ "$(realpath -m -- "$registered_root")" != "$claude_marketplace_root" ]]; then
-        printf 'Claude Code already has a marketplace named %s at %s; set WALDO_MARKETPLACE_NAME to another name or WALDO_PLUGIN_HOME beneath that root.\n' \
-            "$marketplace_name" "$registered_root" >&2
-        exit 1
     else
-        claude plugin marketplace update "$marketplace_name"
+        claude plugin marketplace update "$claude_marketplace_name"
     fi
-    claude plugin install "waldo@$marketplace_name"
-    claude plugin update "waldo@$marketplace_name"
+    claude plugin install "waldo@$claude_marketplace_name"
+    claude plugin update "waldo@$claude_marketplace_name"
 fi
 
 failure_stage="controller readiness"
@@ -530,7 +575,7 @@ chmod 0700 "$proof_dir"
 # only the two read-only Waldo tools permitted; anything else is denied.
 install -d -m 0700 "$proof_dir/cwd"
 if [[ "$install_mode" == canonical ]]; then
-    claude_plugin_source="waldo@$marketplace_name"
+    claude_plugin_source="waldo@$claude_marketplace_name"
     claude_session=(--setting-sources user)
 else
     claude_plugin_source="waldo@inline"
@@ -584,17 +629,17 @@ codex_registration_and_proof() {
         codex_diagnostic="could not write the Codex marketplace $marketplace"
         return 1
     }
-    run_codex codex plugin add "waldo@$marketplace_name" || {
-        codex_diagnostic="codex plugin add waldo@$marketplace_name failed"
+    run_codex codex plugin add "waldo@$codex_marketplace_name" || {
+        codex_diagnostic="codex plugin add waldo@$codex_marketplace_name failed"
         return 1
     }
     local manifests
     mapfile -t manifests < <(
-        find "$codex_home/plugins/cache/$marketplace_name/waldo" -path '*/.codex-plugin/plugin.json' 2>/dev/null \
+        find "$codex_home/plugins/cache/$codex_marketplace_name/waldo" -path '*/.codex-plugin/plugin.json' 2>/dev/null \
             | sort
     )
     if [[ ${#manifests[@]} -eq 0 ]]; then
-        codex_diagnostic="Codex installed no waldo plugin beneath $codex_home/plugins/cache/$marketplace_name/waldo"
+        codex_diagnostic="Codex installed no waldo plugin beneath $codex_home/plugins/cache/$codex_marketplace_name/waldo"
         return 1
     fi
     installed_codex_manifest="${manifests[${#manifests[@]}-1]}"

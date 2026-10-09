@@ -72,7 +72,7 @@ class InstallerTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith("WALDO_") and key not in
-                    ("CARGO_HOME", "CARGO_INSTALL_ROOT", "CODEX_HOME", "XDG_CONFIG_HOME")}
+                    ("CARGO_HOME", "CARGO_INSTALL_ROOT", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME")}
         self.env.update(HOME=str(self.root / "home"),
                         XDG_RUNTIME_DIR=str(self.root / "runtime"),
                         TMPDIR=str(self.root))
@@ -194,21 +194,33 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(socket.parent.parent.name.startswith("waldo-install-"), socket)
         self.assertEqual(socket.relative_to(socket.parent.parent), Path("waldo/controller.sock"))
 
-    def test_codex_marketplace_uses_configured_name_and_owner_for_both_writer_branches(self):
+    def test_codex_marketplace_takes_configured_identity_only_when_created(self):
         marketplace = self.root / "marketplace.json"
-        for existing in (False, True):
-            with self.subTest(existing=existing):
-                if existing:
-                    marketplace.write_text('{"name":"old","plugins":[]}')
-                self.successful_steps('resolve_installation\nwrite_codex_marketplace',
-                                      WALDO_MARKETPLACE=str(marketplace),
-                                      WALDO_MARKETPLACE_NAME="workshop",
-                                      WALDO_MARKETPLACE_OWNER='Workshop "Owner"')
-                manifest = json.loads(marketplace.read_text())
-                self.assertEqual(manifest["name"], "workshop")
-                self.assertEqual(manifest["owner"]["name"], 'Workshop "Owner"')
-                self.assertEqual(manifest["interface"], {"displayName": "Personal"})
-                self.assertEqual(manifest["plugins"][0]["source"]["path"], "./plugins/waldo")
+        configured = dict(WALDO_MARKETPLACE=str(marketplace), WALDO_MARKETPLACE_NAME="workshop",
+                          WALDO_MARKETPLACE_OWNER='Workshop "Owner"')
+        self.successful_steps('resolve_installation\nwrite_codex_marketplace', **configured)
+        manifest = json.loads(marketplace.read_text())
+        self.assertEqual(manifest["name"], "workshop")
+        self.assertEqual(manifest["owner"], {"name": 'Workshop "Owner"'})
+        self.assertEqual(manifest["interface"], {"displayName": "Personal"})
+        self.assertEqual(manifest["plugins"][0]["source"]["path"], "./.local/share/waldo/plugins/waldo")
+
+        marketplace.write_text('{"name":"old","owner":{"name":"Old Owner","email":"old@example.org"},"plugins":[]}')
+        output = self.successful_steps('resolve_installation\nwrite_codex_marketplace\n'
+                                       'printf "%s\\n" "$codex_marketplace_name"', **configured)
+        self.assertEqual(output.strip(), "old")
+        manifest = json.loads(marketplace.read_text())
+        self.assertEqual(manifest["name"], "old")
+        self.assertEqual(manifest["owner"], {"name": "Old Owner", "email": "old@example.org"})
+
+    def test_created_marketplace_defaults_to_waldo_owned_by_the_installing_user(self):
+        marketplace = self.root / "marketplace.json"
+        self.successful_steps('resolve_installation\nwrite_codex_marketplace',
+                              WALDO_MARKETPLACE=str(marketplace))
+        manifest = json.loads(marketplace.read_text())
+        self.assertEqual(manifest["name"], "waldo")
+        self.assertEqual(manifest["owner"], {"name": subprocess.run(
+            ["id", "-un"], text=True, capture_output=True, check=True).stdout.strip()})
 
     def test_claude_marketplace_keeps_other_plugins_and_replaces_waldo(self):
         plugin_home = self.root / "plugins/waldo"
@@ -222,8 +234,8 @@ class InstallerTests(unittest.TestCase):
                               WALDO_PLUGIN_HOME=str(plugin_home),
                               WALDO_MARKETPLACE_NAME="workshop", WALDO_MARKETPLACE_OWNER="Workshop Owner")
         manifest = json.loads(marketplace.read_text())
-        self.assertEqual(manifest["name"], "workshop")
-        self.assertEqual(manifest["owner"], {"name": "Workshop Owner"})
+        self.assertEqual(manifest["name"], "old")
+        self.assertEqual(manifest["owner"], {"name": "Old Owner"})
         self.assertEqual(manifest["metadata"], {"description": "kept"})
         self.assertEqual(manifest["plugins"], [other, {"name": "waldo", "source": "./waldo"}])
 
@@ -247,22 +259,60 @@ class InstallerTests(unittest.TestCase):
                               'printf "%s\\n" "$claude_marketplace_root"',
                               WALDO_PLUGIN_HOME=str(plugin_home))
         manifest = json.loads((self.root / "elsewhere/.claude-plugin/marketplace.json").read_text())
-        self.assertEqual(manifest["name"], "personal")
+        self.assertEqual(manifest["name"], "waldo")
         self.assertEqual(manifest["plugins"], [{"name": "waldo", "source": "./waldo-candidate"}])
+
+    def test_plugin_home_must_be_waldos_alone(self):
+        home = Path(self.env["HOME"])
+        unrelated = self.root / "unrelated"
+        unrelated.mkdir()
+        (unrelated / "keep.txt").write_text("not Waldo's")
+        for label, destination in (("root", "/"), ("home", home), ("above home", home.parent),
+                                   ("checkout", REPO), ("inside checkout", REPO / "plugins/waldo"),
+                                   ("above checkout", REPO.parent), ("unrelated files", unrelated)):
+            with self.subTest(destination=label):
+                result = self.steps('resolve_installation\ninstall_plugin_copy',
+                                    WALDO_PLUGIN_HOME=str(destination))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("WALDO_PLUGIN_HOME", result.stderr)
+        self.assertEqual((unrelated / "keep.txt").read_text(), "not Waldo's")
+        self.assertEqual(sorted(path.name for path in unrelated.iterdir()), ["keep.txt"])
+
+    def test_plugin_copy_replaces_an_earlier_copy(self):
+        plugin_home = self.root / "plugins/waldo"
+        self.successful_steps('resolve_installation\ninstall_plugin_copy',
+                              WALDO_PLUGIN_HOME=str(plugin_home))
+        (plugin_home / "stale.txt").write_text("from an older copy")
+        self.successful_steps('resolve_installation\ninstall_plugin_copy',
+                              WALDO_PLUGIN_HOME=str(plugin_home))
+        self.assertFalse((plugin_home / "stale.txt").exists())
+
+    def test_canonical_plugin_copy_lives_in_the_data_directory_without_overrides(self):
+        plugin_home = Path(self.env["HOME"]) / ".local/share/waldo/plugins/waldo"
+        self.successful_steps('resolve_installation\ninstall_plugin_copy')
+        for name in (".mcp.json", ".mcp.claude.json"):
+            with self.subTest(manifest=name):
+                server = json.loads((plugin_home / name).read_text())["mcpServers"]["waldo"]
+                self.assertNotIn("env", server)
 
     def test_plugin_copy_names_the_resolved_binary_in_both_mcp_manifests(self):
         sources = {name: (REPO / "plugins/waldo" / name).read_bytes() for name in (".mcp.json", ".mcp.claude.json")}
         destination = self.root / 'cargo root " $place'
         install_root = self.root / "rehearsal"
-        plugin_home = install_root / "home/plugins/waldo"
+        plugin_home = install_root / "home/.local/share/waldo/plugins/waldo"
+        socket = str(self.root / "custom/controller.sock")
         self.successful_steps('resolve_installation\ninstall_plugin_copy',
                               WALDO_INSTALL_ROOT=str(install_root),
-                              WALDO_CARGO_INSTALL_ROOT=str(destination))
+                              WALDO_CARGO_INSTALL_ROOT=str(destination),
+                              WALDO_SOCKET_PATH=socket)
         for name, original in sources.items():
             with self.subTest(manifest=name):
                 installed = json.loads((plugin_home / name).read_text())
                 expected = json.loads(original)
                 expected["mcpServers"]["waldo"]["command"] = str(destination / "bin/waldo-mcp")
+                # The overrides the service receives travel with the server.
+                expected["mcpServers"]["waldo"]["env"] = {
+                    "WALDO_SOCKET_PATH": socket, "XDG_CONFIG_HOME": str(install_root / "home/.config")}
                 self.assertEqual(installed, expected)
                 self.assertEqual((REPO / "plugins/waldo" / name).read_bytes(), original)
         for client in ("claude", "codex"):
