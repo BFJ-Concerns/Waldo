@@ -1,14 +1,14 @@
 {
   "name": "waldo",
   "version": "0.1.0",
-  "description": "Observe and control the operator's live Niri desktop from Codex.",
+  "description": "Observe and control your live Niri desktop from Codex.",
   "author": {
     "name": "BFJ Concerns"
   },
   "interface": {
     "displayName": "Waldo",
     "shortDescription": "Control the live Niri desktop from Codex.",
-    "longDescription": "Waldo gives Codex observation-grounded control of applications on the operator's live Niri Wayland desktop.",
+    "longDescription": "Waldo gives Codex observation-grounded control of applications on your live Niri Wayland desktop.",
     "developerName": "BFJ Concerns",
     "category": "Productivity",
     "capabilities": ["Read", "Write", "Interactive"],
