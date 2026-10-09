@@ -8,6 +8,8 @@ your outputs and windows, read the focused application's accessibility tree,
 and drive the pointer, keyboard, clipboard, windows and workspaces — then
 check what actually happened before it carries on.
 
+![Claude Code asks Waldo to rename a folder in the Files app, then confirms the new name on screen and on disk](docs/images/demo.gif)
+
 > [!WARNING]
 > Waldo is in development and meant for supervised use on a machine you
 > control. Its actions land on your live, foreground desktop, and the
