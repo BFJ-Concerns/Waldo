@@ -283,7 +283,7 @@ fn final_campaign_requires_v2_consumers_and_reasons_for_every_non_pass() {
 #[test]
 fn private_roots_are_fresh_owner_only_atomic_and_payload_scannable() {
     let parent = std::env::temp_dir().join(format!(
-        "waldo-estate-test-{}-{}",
+        "waldo-private-root-test-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -327,7 +327,7 @@ fn private_roots_are_fresh_owner_only_atomic_and_payload_scannable() {
 #[test]
 fn scratch_root_cleans_up_on_drop() {
     let path = {
-        let scratch = PrivateRoot::create_scratch("waldo-estate-test").unwrap();
+        let scratch = PrivateRoot::create_scratch("waldo-private-root-test").unwrap();
         scratch
             .write_json("nested/value.json", &serde_json::json!({"ok": true}))
             .unwrap();
@@ -341,7 +341,7 @@ fn retained_root_rejects_a_symbolic_link_parent() {
     use std::os::unix::fs::symlink;
 
     let parent = std::env::temp_dir().join(format!(
-        "waldo-estate-symlink-test-{}-{}",
+        "waldo-private-root-symlink-test-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

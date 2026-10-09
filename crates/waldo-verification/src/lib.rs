@@ -1,8 +1,8 @@
 //! Deterministic fixtures and evidence records for Waldo's consumer journeys.
 
 mod conformance;
-mod estate;
 mod fixture;
+mod private_root;
 mod run;
 mod topology;
 
@@ -14,9 +14,11 @@ pub use conformance::{
     MatrixCellAdmission, PrimitiveOutcome, ScenarioPrimitiveReadiness, ScenarioReadinessRecord,
     complete_fixture_events,
 };
-pub use estate::{EstateError, PrivacyLeak, PrivacyScan, PrivateRoot, scan_private_root};
 pub use fixture::{
     BoundaryTargets, FixturePoint, FixtureRect, SeededSequence, TargetGrid, TargetGridError,
+};
+pub use private_root::{
+    PrivacyLeak, PrivacyScan, PrivateRoot, PrivateRootError, scan_private_root,
 };
 pub use run::{
     BinaryIdentity, CellOutcome, CellResult, CleanupCheck, CleanupOutcome, EvidenceArtifact,

@@ -49,7 +49,7 @@ fn runtime_sources() -> Vec<std::path::PathBuf> {
     let crates = repository_root().join("crates");
     for entry in fs::read_dir(&crates).expect("crates/ is readable") {
         let path = entry.expect("crate entry").path();
-        // The verification estate is test harness, not the shipped runtime;
+        // The verification crate is a test harness, not the shipped runtime;
         // its prerequisite flags are documented with the conformance suite.
         // This crate's own source is covered by the declared list above, and
         // its unit tests deliberately spell settings wrongly.
