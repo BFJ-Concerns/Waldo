@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Wayland virtual-keyboard input that types with the compositor's keymap."
 
 [dependencies]
 nix.workspace = true

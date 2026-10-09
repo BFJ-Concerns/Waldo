@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Waldo's controller sessions and exclusive driving lease."
 
 [dependencies]
 waldo-protocol = { path = "../waldo-protocol" }

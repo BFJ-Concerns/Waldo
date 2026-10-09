@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "AT-SPI accessibility observation and element actions for Waldo."
 
 [dependencies]
 atspi-common.workspace = true
