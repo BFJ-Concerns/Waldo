@@ -5,6 +5,7 @@
   "author": {
     "name": "BFJ Concerns"
   },
+  "license": "AGPL-3.0-or-later",
   "interface": {
     "displayName": "Waldo",
     "shortDescription": "Control the live Niri desktop from Codex.",
