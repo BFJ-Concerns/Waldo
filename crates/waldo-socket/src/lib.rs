@@ -14,8 +14,7 @@ use tokio::{
     sync::{Mutex, mpsc, oneshot},
 };
 use waldo_protocol::{
-    Capabilities, ClientId, ClientMessage, ConnectionId, RequestId, SCHEMA_MAJOR_VERSION,
-    ServerMessage,
+    ClientId, ClientMessage, ConnectionId, RequestId, SCHEMA_MAJOR_VERSION, ServerMessage,
 };
 use waldo_settings::{Settings, SettingsError};
 
@@ -35,6 +34,9 @@ pub enum TransportError {
     },
     ConnectionClosed,
     Handshake(String),
+    /// An established connection failed; every request on it, queued or
+    /// later, fails with this reason.
+    ConnectionFailed(String),
     ResponseMismatch {
         expected: RequestId,
         received: Option<RequestId>,
@@ -46,7 +48,13 @@ impl fmt::Display for TransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "controller socket I/O failed: {error}"),
-            Self::Json(error) => write!(formatter, "controller message is invalid JSON: {error}"),
+            Self::Json(error) => match error.classify() {
+                serde_json::error::Category::Data => write!(
+                    formatter,
+                    "controller message does not match the protocol schema: {error}"
+                ),
+                _ => write!(formatter, "controller message is invalid JSON: {error}"),
+            },
             Self::FrameTooLarge { size, maximum } => {
                 write!(
                     formatter,
@@ -55,6 +63,9 @@ impl fmt::Display for TransportError {
             }
             Self::ConnectionClosed => formatter.write_str("controller socket closed"),
             Self::Handshake(message) => write!(formatter, "controller handshake failed: {message}"),
+            Self::ConnectionFailed(message) => {
+                write!(formatter, "controller connection failed: {message}")
+            }
             Self::ResponseMismatch { expected, received } => write!(
                 formatter,
                 "controller response id {received:?} does not match request {}",
@@ -161,71 +172,81 @@ where
 pub struct ControllerClient {
     stream: UnixStream,
     connection_id: ConnectionId,
-    capabilities: Capabilities,
 }
+
+type ResponseSender = oneshot::Sender<Result<ServerMessage, TransportError>>;
 
 struct PendingRequest {
     message: ClientMessage,
-    response: oneshot::Sender<Result<ServerMessage, String>>,
+    response: ResponseSender,
 }
 
-type PendingResponses =
-    std::sync::Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<ServerMessage, String>>>>>;
+/// What both pipelined workers share: the callers awaiting a response, and
+/// the failure that ended the connection, once one has.
+#[derive(Default)]
+struct ConnectionState {
+    pending: HashMap<RequestId, ResponseSender>,
+    failure: Option<String>,
+}
+
+type SharedConnection = std::sync::Arc<Mutex<ConnectionState>>;
+
+impl ConnectionState {
+    /// Records the first failure and answers every waiting caller with it.
+    fn fail(&mut self, reason: String) {
+        let reason = self.failure.get_or_insert(reason).clone();
+        for (_, sender) in self.pending.drain() {
+            let _ = sender.send(Err(TransportError::ConnectionFailed(reason.clone())));
+        }
+    }
+}
 
 /// A cloneable controller connection which safely pipelines requests.
 ///
 /// This is required by bindings whose Stop request must be able to overtake a
-/// long-running Act request on the same lease-owning connection.
+/// long-running Act request on the same lease-owning connection. Once the
+/// connection fails, every queued and later request fails with that reason.
 #[derive(Clone)]
 pub struct PipelinedControllerClient {
     requests: mpsc::Sender<PendingRequest>,
-    connection_id: ConnectionId,
-    capabilities: Capabilities,
+    connection: SharedConnection,
 }
 
 impl PipelinedControllerClient {
     pub async fn connect(path: &Path, client_id: ClientId) -> Result<Self, TransportError> {
-        let client = ControllerClient::connect(path, client_id).await?;
-        let ControllerClient {
-            stream,
-            connection_id,
-            capabilities,
-        } = client;
+        let ControllerClient { stream, .. } = ControllerClient::connect(path, client_id).await?;
         let (reader, writer) = stream.into_split();
-        let pending = std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let connection = SharedConnection::default();
         let (request_tx, request_rx) = mpsc::channel(16);
 
-        tokio::spawn(write_requests(writer, request_rx, pending.clone()));
-        tokio::spawn(read_responses(reader, pending));
+        tokio::spawn(write_requests(writer, request_rx, connection.clone()));
+        tokio::spawn(read_responses(reader, connection.clone()));
 
         Ok(Self {
             requests: request_tx,
-            connection_id,
-            capabilities,
+            connection,
         })
-    }
-
-    pub const fn connection_id(&self) -> ConnectionId {
-        self.connection_id
-    }
-
-    pub const fn capabilities(&self) -> &Capabilities {
-        &self.capabilities
     }
 
     pub async fn request(&self, message: ClientMessage) -> Result<ServerMessage, TransportError> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.requests
+        let sent = self
+            .requests
             .send(PendingRequest {
                 message,
                 response: response_tx,
             })
-            .await
-            .map_err(|_| TransportError::ConnectionClosed)?;
-        match response_rx.await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => Err(TransportError::Handshake(error)),
-            Err(_) => Err(TransportError::ConnectionClosed),
+            .await;
+        match (sent, response_rx.await) {
+            (Ok(()), Ok(response)) => response,
+            _ => Err(self.recorded_failure().await),
+        }
+    }
+
+    async fn recorded_failure(&self) -> TransportError {
+        match &self.connection.lock().await.failure {
+            Some(reason) => TransportError::ConnectionFailed(reason.clone()),
+            None => TransportError::ConnectionClosed,
         }
     }
 }
@@ -233,43 +254,71 @@ impl PipelinedControllerClient {
 async fn write_requests(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     mut requests: mpsc::Receiver<PendingRequest>,
-    pending: PendingResponses,
+    connection: SharedConnection,
 ) {
     while let Some(request) = requests.recv().await {
         let request_id = request.message.request_id();
-        pending.lock().await.insert(request_id, request.response);
+        {
+            let mut state = connection.lock().await;
+            if let Some(reason) = &state.failure {
+                let reason = TransportError::ConnectionFailed(reason.clone());
+                let _ = request.response.send(Err(reason));
+                continue;
+            }
+            match state.pending.entry(request_id) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    let _ = request
+                        .response
+                        .send(Err(TransportError::ConnectionFailed(format!(
+                            "request id {} is already awaiting a response on this connection",
+                            request_id.get()
+                        ))));
+                    continue;
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(request.response);
+                }
+            }
+        }
         if let Err(error) = write_message(&mut writer, &request.message).await {
-            fail_pending(&pending, error.to_string()).await;
-            return;
+            connection.lock().await.fail(error.to_string());
         }
     }
 }
 
-async fn read_responses(mut reader: tokio::net::unix::OwnedReadHalf, pending: PendingResponses) {
+async fn read_responses(mut reader: tokio::net::unix::OwnedReadHalf, connection: SharedConnection) {
     loop {
-        match read_message::<_, ServerMessage>(&mut reader).await {
-            Ok(response) => {
-                let Some(request_id) = response.request_id() else {
-                    continue;
-                };
-                if let Some(sender) = pending.lock().await.remove(&request_id) {
-                    let _ = sender.send(Ok(response));
-                }
-            }
+        let response = match read_message::<_, ServerMessage>(&mut reader).await {
+            Ok(response) => response,
             Err(error) => {
-                fail_pending(&pending, error.to_string()).await;
+                connection.lock().await.fail(error.to_string());
+                return;
+            }
+        };
+        let mut state = connection.lock().await;
+        let sender = response
+            .request_id()
+            .and_then(|request_id| state.pending.remove(&request_id));
+        match sender {
+            Some(sender) => {
+                let _ = sender.send(Ok(response));
+            }
+            None => {
+                // A response nobody awaits means the two ends no longer agree
+                // on the conversation, so nothing later can be trusted.
+                let reason = match response {
+                    ServerMessage::Error { error, .. } => {
+                        format!("controller reported a connection error: {}", error.message)
+                    }
+                    other => format!(
+                        "controller answered request id {:?}, which no request is awaiting",
+                        other.request_id().map(RequestId::get)
+                    ),
+                };
+                state.fail(reason);
                 return;
             }
         }
-    }
-}
-
-async fn fail_pending(
-    pending: &Mutex<HashMap<RequestId, oneshot::Sender<Result<ServerMessage, String>>>>,
-    error: String,
-) {
-    for (_, sender) in pending.lock().await.drain() {
-        let _ = sender.send(Err(error.clone()));
     }
 }
 
@@ -291,11 +340,10 @@ impl ControllerClient {
             ServerMessage::Connected {
                 request_id: received,
                 connection_id,
-                capabilities,
+                ..
             } if received == request_id => Ok(Self {
                 stream,
                 connection_id,
-                capabilities,
             }),
             ServerMessage::Error { error, .. } => Err(TransportError::Handshake(error.message)),
             other => Err(TransportError::Handshake(format!(
@@ -306,10 +354,6 @@ impl ControllerClient {
 
     pub const fn connection_id(&self) -> ConnectionId {
         self.connection_id
-    }
-
-    pub const fn capabilities(&self) -> &Capabilities {
-        &self.capabilities
     }
 
     pub async fn request(
@@ -381,6 +425,115 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, TransportError::ConnectionClosed));
+    }
+
+    /// A controller that completes the handshake, records each request it
+    /// reads, and answers with whatever `respond` returns for it.
+    async fn scripted_controller(
+        respond: impl Fn(&super::ClientMessage) -> Option<super::ServerMessage> + Send + 'static,
+    ) -> std::path::PathBuf {
+        use waldo_protocol::{Capabilities, ConnectionId, ServerMessage};
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let directory = std::env::temp_dir().join(format!(
+            "waldo-socket-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("controller.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let hello: super::ClientMessage = read_message(&mut stream).await.unwrap();
+            write_message(
+                &mut stream,
+                &ServerMessage::Connected {
+                    request_id: hello.request_id(),
+                    connection_id: ConnectionId::new(1),
+                    capabilities: Capabilities::unavailable(),
+                },
+            )
+            .await
+            .unwrap();
+            while let Ok(request) = read_message::<_, super::ClientMessage>(&mut stream).await {
+                if let Some(response) = respond(&request) {
+                    write_message(&mut stream, &response).await.unwrap();
+                }
+            }
+        });
+        path
+    }
+
+    fn query(id: u64) -> super::ClientMessage {
+        super::ClientMessage::Query {
+            request_id: waldo_protocol::RequestId::new(id),
+            request: waldo_protocol::QueryRequest::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stray_response_fails_waiting_and_later_requests_with_its_reason() {
+        let path = scripted_controller(|_| {
+            Some(waldo_protocol::ServerMessage::Error {
+                request_id: None,
+                error: waldo_protocol::ProtocolError {
+                    code: waldo_protocol::ErrorCode::Internal,
+                    message: "controller lost track of the connection".into(),
+                    retryable: false,
+                },
+            })
+        })
+        .await;
+        let client = super::PipelinedControllerClient::connect(
+            &path,
+            waldo_protocol::ClientId::new("stray-response-test").unwrap(),
+        )
+        .await
+        .unwrap();
+        let deadline = std::time::Duration::from_secs(5);
+
+        for id in [2, 3] {
+            let error = tokio::time::timeout(deadline, client.request(query(id)))
+                .await
+                .expect("a request on a failed connection must not wait forever")
+                .unwrap_err();
+            let TransportError::ConnectionFailed(reason) = error else {
+                panic!("request {id} failed without the connection's reason: {error}")
+            };
+            assert!(reason.contains("lost track of the connection"), "{reason}");
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_in_flight_request_id_is_refused() {
+        // The controller never answers, so the first request stays in flight.
+        let path = scripted_controller(|_| None).await;
+        let client = super::PipelinedControllerClient::connect(
+            &path,
+            waldo_protocol::ClientId::new("duplicate-id-test").unwrap(),
+        )
+        .await
+        .unwrap();
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.request(query(2)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let error =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.request(query(2)))
+                .await
+                .expect("a duplicate request must be refused at once")
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains("already awaiting a response"),
+            "{error}"
+        );
+        assert!(!first.is_finished());
+        first.abort();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
