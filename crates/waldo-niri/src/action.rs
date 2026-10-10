@@ -12,7 +12,8 @@ use waldo_protocol::{
     Action, ActionRoute, ErrorCode, ProtocolError, WindowOperation, WorkspaceOperation,
 };
 
-/// Executes the subset of Waldo actions which Niri can target by window ID.
+/// Executes the Waldo actions Niri can target positively: window actions by
+/// window ID and workspace actions by workspace ID.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NiriActionExecutor;
 
