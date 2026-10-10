@@ -1,26 +1,38 @@
-use std::io::Cursor;
+use std::{io::Cursor, num::NonZeroU32};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::{GenericImageView, ImageFormat, imageops::FilterType};
 use serde_json::{Value, json};
-use waldo_protocol::{ErrorCode, Observation, PixelSize, ProtocolError, ServerMessage};
+use waldo_protocol::{ErrorCode, Observation, PixelSize, ProtocolError, ServerMessage, StopReason};
 
 use crate::tools::ToolResult;
 
-pub(crate) fn tool_response(mut response: ServerMessage, max_edge: u32) -> Value {
+/// Renders a controller response as an MCP tool result. `isError` is set for
+/// a protocol error, a batch that did not complete, and an observation image
+/// that could not be presented; an inconclusive application outcome on a
+/// completed batch is not an error.
+pub(crate) fn tool_response(mut response: ServerMessage, max_edge: NonZeroU32) -> Value {
     if let ServerMessage::Error { error, .. } = &response {
         return tool_failure(error.clone());
     }
 
-    if let Err(error) = present_response_images(&mut response, max_edge) {
-        return tool_failure(ProtocolError {
+    let batch_failed = matches!(
+        &response,
+        ServerMessage::Acted { result, .. } if result.stop_reason != StopReason::Completed
+    );
+    let presentation = present_response_images(&mut response, max_edge);
+    let mut response = serde_json::to_value(response).expect("controller responses serialise");
+    if let Err(error) = &presentation {
+        // The receipts stay: the actions they report ran whether or not the
+        // resulting image can be shown, and repeating them is not safe.
+        withhold_image(&mut response);
+        response["presentation_error"] = serde_json::to_value(ProtocolError {
             code: ErrorCode::Internal,
             message: format!("image presentation failed: {error}"),
-            retryable: true,
-        });
+            retryable: false,
+        })
+        .expect("protocol errors serialise");
     }
-
-    let response = serde_json::to_value(response).expect("controller responses serialise");
     let (structured, image) = separate_image(response);
     let mut content = vec![json!({
         "type": "text",
@@ -32,12 +44,34 @@ pub(crate) fn tool_response(mut response: ServerMessage, max_edge: u32) -> Value
     serde_json::to_value(ToolResult {
         content,
         structured_content: Some(structured),
-        is_error: false,
+        is_error: batch_failed || presentation.is_err(),
     })
     .expect("tool result serialises")
 }
 
-fn present_response_images(response: &mut ServerMessage, max_edge: u32) -> Result<(), String> {
+/// Removes an observation image that could not be presented, so neither the
+/// structured result nor the content carries it.
+fn withhold_image(response: &mut Value) {
+    let observation = if response.get("observation").is_some() {
+        response.get_mut("observation")
+    } else {
+        response
+            .get_mut("result")
+            .and_then(|result| result.get_mut("observation"))
+    };
+    if let Some(image) = observation
+        .and_then(|observation| observation.get_mut("image"))
+        .and_then(Value::as_object_mut)
+    {
+        image.remove("data_base64");
+        image.insert("withheld".into(), Value::Bool(true));
+    }
+}
+
+fn present_response_images(
+    response: &mut ServerMessage,
+    max_edge: NonZeroU32,
+) -> Result<(), String> {
     let observation = match response {
         ServerMessage::Observed { observation, .. } => Some(observation),
         ServerMessage::Acted { result, .. } => result.observation.as_mut(),
@@ -49,10 +83,11 @@ fn present_response_images(response: &mut ServerMessage, max_edge: u32) -> Resul
     Ok(())
 }
 
-fn present_observation_image(observation: &mut Observation, max_edge: u32) -> Result<(), String> {
-    if max_edge == 0 {
-        return Err("model image edge limit must be greater than zero".into());
-    }
+fn present_observation_image(
+    observation: &mut Observation,
+    max_edge: NonZeroU32,
+) -> Result<(), String> {
+    let max_edge = max_edge.get();
     if observation.image.mime_type != "image/png" {
         return Err(format!(
             "unsupported observation image type {}",
@@ -200,6 +235,89 @@ mod tests {
         assert_eq!(result["structuredContent"]["error"]["retryable"], false);
     }
 
+    fn acted(stop_reason: &str, observation: serde_json::Value) -> waldo_protocol::ServerMessage {
+        serde_json::from_value(json!({
+            "type": "acted",
+            "request_id": 3,
+            "result": {
+                "driving_session": 1,
+                "receipts": [{"index": 0, "status": "failed", "route": null, "error": null}],
+                "first_not_executed": null,
+                "stop_reason": stop_reason,
+                "observation": observation,
+                "completion_error": null,
+                "verification": [],
+                "application_outcome": "inconclusive",
+                "completion_evidence": {
+                    "frame_state": "unchanged",
+                    "settle_deadline_reached": false,
+                    "verification_agreement": "not_evaluated"
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_batch_that_did_not_complete_is_a_tool_error() {
+        let edge = std::num::NonZeroU32::new(64).unwrap();
+
+        let failed = super::tool_response(acted("execution_failed", json!(null)), edge);
+        let completed = super::tool_response(acted("completed", json!(null)), edge);
+
+        assert_eq!(failed["isError"], true);
+        assert_eq!(
+            failed["structuredContent"]["result"]["receipts"][0]["status"],
+            "failed"
+        );
+        assert!(completed.get("isError").is_none());
+    }
+
+    #[test]
+    fn an_unpresentable_image_keeps_the_receipts_and_withholds_only_the_image() {
+        let observation = json!({
+            "id": 7,
+            "captured_at_unix_ms": 1,
+            "source": {"type": "output", "output_id": "fixture"},
+            "stable_output_id": "fixture",
+            "capture": {"route": "full_output", "output_local_bounds": null},
+            "image": {"mime_type": "image/png", "data_base64": BASE64.encode("not a png")},
+            "coordinates": {
+                "source_pixels": {"width": 10, "height": 6},
+                "model_image_pixels": {"width": 10, "height": 6},
+                "logical_bounds": {"origin": {"x": 0.0, "y": 0.0}, "width": 10.0, "height": 6.0},
+                "scale": 1.0,
+                "transform": "normal"
+            },
+            "cursor": null,
+            "focus": {"window_id": null, "element": null},
+            "accessibility": [],
+            "accessibility_available": false
+        });
+
+        let result = super::tool_response(
+            acted("completed", observation),
+            std::num::NonZeroU32::new(64).unwrap(),
+        );
+
+        assert_eq!(result["isError"], true);
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["result"]["receipts"][0]["index"], 0);
+        assert_eq!(structured["presentation_error"]["retryable"], false);
+        assert_eq!(
+            structured["result"]["observation"]["image"]["withheld"],
+            true
+        );
+        assert!(structured.to_string().find("data_base64").is_none());
+        assert!(
+            result["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|content| content["type"] == "text")
+        );
+    }
+
     #[test]
     fn model_image_metadata_matches_the_final_resized_png() {
         let source = ImageBuffer::from_fn(10, 6, |x, y| {
@@ -253,7 +371,7 @@ mod tests {
             continuation: None,
         };
 
-        present_observation_image(&mut observation, 5).unwrap();
+        present_observation_image(&mut observation, std::num::NonZeroU32::new(5).unwrap()).unwrap();
 
         let delivered = BASE64.decode(&observation.image.data_base64).unwrap();
         let decoded = image::load_from_memory_with_format(&delivered, ImageFormat::Png).unwrap();

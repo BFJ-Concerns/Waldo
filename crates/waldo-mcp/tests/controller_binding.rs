@@ -243,7 +243,7 @@ async fn invalid_tool_arguments_are_structured_and_do_not_touch_controller_state
 
     let (mut client_writer, server_reader) = tokio::io::duplex(64 * 1024);
     let (server_writer, client_reader) = tokio::io::duplex(128 * 1024);
-    let server = McpServer::new(path.clone()).unwrap();
+    let server = McpServer::new(path.clone());
     let mcp_task = tokio::spawn(async move { server.run(server_reader, server_writer).await });
     let mut client_reader = BufReader::new(client_reader).lines();
 
@@ -347,7 +347,7 @@ async fn stop_overtakes_and_quiesces_an_active_mcp_act() {
 
     let (mut client_writer, server_reader) = tokio::io::duplex(64 * 1024);
     let (server_writer, client_reader) = tokio::io::duplex(512 * 1024);
-    let server = McpServer::new(path.clone()).unwrap();
+    let server = McpServer::new(path.clone());
     let mcp_task = tokio::spawn(async move { server.run(server_reader, server_writer).await });
     let mut client_reader = BufReader::new(client_reader).lines();
 
@@ -492,7 +492,7 @@ async fn resized_model_grid_maps_to_the_exact_final_pointer_consumer() {
     }));
     let (mut client_writer, server_reader) = tokio::io::duplex(64 * 1024);
     let (server_writer, client_reader) = tokio::io::duplex(2 * 1024 * 1024);
-    let server = McpServer::new(path.clone()).unwrap();
+    let server = McpServer::new(path.clone());
     let mcp_task = tokio::spawn(async move { server.run(server_reader, server_writer).await });
     let mut client_reader = BufReader::new(client_reader).lines();
 

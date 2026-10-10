@@ -1,4 +1,5 @@
 use std::{
+    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -25,14 +26,14 @@ use crate::{
 #[derive(Clone)]
 pub struct McpServer {
     socket: Arc<PathBuf>,
-    model_image_max_edge: u32,
+    model_image_max_edge: NonZeroU32,
     client_id: ClientId,
     controller: Arc<Mutex<Option<PipelinedControllerClient>>>,
     next_request_id: Arc<AtomicU64>,
 }
 
 impl McpServer {
-    pub fn new(socket: impl Into<PathBuf>) -> Result<Self, McpError> {
+    pub fn new(socket: impl Into<PathBuf>) -> Self {
         let default = waldo_settings::Settings::from_sources(None, [], None)
             .expect("empty settings sources are valid")
             .model_image_max_edge()
@@ -43,17 +44,17 @@ impl McpServer {
     /// Uses the operator-resolved limit for MCP image presentation.
     pub fn with_image_max_edge(
         socket: impl Into<PathBuf>,
-        model_image_max_edge: u32,
-    ) -> Result<Self, McpError> {
+        model_image_max_edge: NonZeroU32,
+    ) -> Self {
         let client_id = ClientId::new(format!("waldo-mcp-{}", std::process::id()))
-            .map_err(|_| McpError::InvalidClientId)?;
-        Ok(Self {
+            .expect("a prefixed process id is never blank");
+        Self {
             socket: Arc::new(socket.into()),
             model_image_max_edge,
             client_id,
             controller: Arc::new(Mutex::new(None)),
             next_request_id: Arc::new(AtomicU64::new(2)),
-        })
+        }
     }
 
     /// Serves newline-delimited JSON-RPC until the client closes stdin.
@@ -216,7 +217,7 @@ mod tests {
     async fn stdio_negotiates_and_lists_tools_without_a_controller() {
         let (mut client_write, server_read) = tokio::io::duplex(16 * 1024);
         let (server_write, mut client_read) = tokio::io::duplex(128 * 1024);
-        let server = McpServer::new("/controller-is-not-needed").unwrap();
+        let server = McpServer::new("/controller-is-not-needed");
         let task = tokio::spawn(async move { server.run(server_read, server_write).await });
 
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -251,7 +252,7 @@ mod tests {
     async fn stdio_rejects_a_request_that_is_not_json_rpc_2() {
         let (mut client_write, server_read) = tokio::io::duplex(16 * 1024);
         let (server_write, mut client_read) = tokio::io::duplex(16 * 1024);
-        let server = McpServer::new("/controller-is-not-needed").unwrap();
+        let server = McpServer::new("/controller-is-not-needed");
         let task = tokio::spawn(async move { server.run(server_read, server_write).await });
 
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

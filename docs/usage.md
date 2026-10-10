@@ -13,6 +13,12 @@ client and the results they return. The
 | `act` | `observation_id`, ordered `actions`, `verification` predicates | Per-action receipts, the application outcome and, when available, a resulting observation. Verification is judged on that resulting observation, so a predicate it cannot measure — an element predicate without accessibility, a frame comparison against another source — is refused before any action |
 | `stop` | Empty object | Cancels the client's batch and releases its driving lease and any held input; `cleanup_limitation` says what cleanup could not restore, such as a preserved clipboard |
 
+A tool result is an error (`isError`) when the controller refused the
+request, when an `act` batch did not complete — its receipts are still in the
+result — or when its observation image could not be presented, in which case
+`presentation_error` says why and the image is withheld. A completed batch
+with an inconclusive application outcome is not an error.
+
 An observation source is a whole output, a window, or a region of an output.
 Actions are tagged by `type`, for example:
 

@@ -269,7 +269,7 @@ impl McpClient {
     async fn start(path: PathBuf) -> Self {
         let (input, server_reader) = tokio::io::duplex(64 * 1024);
         let (server_writer, output) = tokio::io::duplex(2 * 1024 * 1024);
-        let server = McpServer::new(path).unwrap();
+        let server = McpServer::new(path);
         let task = tokio::spawn(async move { server.run(server_reader, server_writer).await });
         let mut client = Self {
             input,

@@ -23,6 +23,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fmt, fs, io,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -302,7 +303,7 @@ impl Settings {
     }
 
     /// Maximum delivered MCP image edge: a positive whole number of pixels.
-    pub fn model_image_max_edge(&self) -> Result<u32, SettingsError> {
+    pub fn model_image_max_edge(&self) -> Result<NonZeroU32, SettingsError> {
         let (value, source) = match self.text(MODEL_IMAGE_MAX_EDGE)? {
             Some((value, source)) => (value, source),
             None => {
@@ -314,9 +315,8 @@ impl Settings {
             }
         };
         value
-            .parse::<u32>()
+            .parse::<NonZeroU32>()
             .ok()
-            .filter(|edge| *edge > 0)
             .ok_or_else(|| SettingsError::InvalidValue {
                 name: MODEL_IMAGE_MAX_EDGE.name,
                 source: source.clone(),
@@ -502,7 +502,11 @@ mod tests {
     #[test]
     fn model_image_edge_defaults_to_2048() {
         assert_eq!(
-            settings(None, &[]).unwrap().model_image_max_edge().unwrap(),
+            settings(None, &[])
+                .unwrap()
+                .model_image_max_edge()
+                .unwrap()
+                .get(),
             2048
         );
     }
@@ -514,14 +518,16 @@ mod tests {
             settings(Some(file), &[])
                 .unwrap()
                 .model_image_max_edge()
-                .unwrap(),
+                .unwrap()
+                .get(),
             640
         );
         assert_eq!(
             settings(Some(file), &[("WALDO_MODEL_IMAGE_MAX_EDGE", "1280")])
                 .unwrap()
                 .model_image_max_edge()
-                .unwrap(),
+                .unwrap()
+                .get(),
             1280
         );
     }

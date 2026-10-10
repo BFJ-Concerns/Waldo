@@ -7,7 +7,6 @@ pub enum McpError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Controller(TransportError),
-    InvalidClientId,
 }
 
 impl fmt::Display for McpError {
@@ -16,7 +15,6 @@ impl fmt::Display for McpError {
             Self::Io(error) => write!(formatter, "MCP stdio failed: {error}"),
             Self::Json(error) => write!(formatter, "MCP message is invalid JSON: {error}"),
             Self::Controller(error) => write!(formatter, "Waldo controller failed: {error}"),
-            Self::InvalidClientId => formatter.write_str("the MCP client identity is invalid"),
         }
     }
 }
@@ -27,7 +25,6 @@ impl Error for McpError {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Controller(error) => Some(error),
-            Self::InvalidClientId => None,
         }
     }
 }
