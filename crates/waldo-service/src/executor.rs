@@ -331,7 +331,6 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
 
     fn supports(&self, route: ActionRoute) -> bool {
         match route {
-            ActionRoute::NiriIpc => self.niri.supports(route),
             ActionRoute::VirtualPointer => self
                 .pointer
                 .as_ref()
@@ -343,13 +342,6 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
                 .clipboard
                 .as_ref()
                 .is_ok_and(|clipboard| clipboard.supports(route)),
-            ActionRoute::ClipboardPaste => {
-                self.clipboard.is_ok() && self.with_keyboard(|_| ()).is_ok()
-            }
-            ActionRoute::Accessibility => self
-                .accessibility
-                .as_ref()
-                .is_some_and(|accessibility| accessibility.supports(route)),
             _ => false,
         }
     }

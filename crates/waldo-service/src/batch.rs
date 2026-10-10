@@ -296,19 +296,6 @@ impl ActionExecutor for BatchActionExecutor {
             }
         }
     }
-
-    fn supports(&self, route: ActionRoute) -> bool {
-        matches!(route, ActionRoute::ControllerWait | ActionRoute::Screencopy)
-            || self.desktop.supports(route)
-    }
-
-    fn limitation(&self, route: ActionRoute) -> Option<String> {
-        self.desktop.limitation(route)
-    }
-
-    fn release_all(&self) {
-        self.desktop.release_all();
-    }
 }
 
 fn action_requires_stable_grounding(action: &Action) -> bool {
