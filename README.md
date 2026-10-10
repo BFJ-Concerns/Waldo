@@ -152,8 +152,9 @@ installer's.
 
 ## Limitations
 
-- Niri is the only supported compositor, and Claude Code the only fully
-  supported agent; Codex support is best-effort.
+- Niri is the only supported compositor so far (see [Roadmap](#roadmap)),
+  and Claude Code the only fully supported agent; Codex support is
+  best-effort.
 - Waldo drives your live session in the foreground, with one driver at a
   time. It cannot create a nested, headless or private desktop, or send
   input to an application in the background.
@@ -162,6 +163,18 @@ installer's.
   releases yet.
 
 [Scope and limits](docs/usage.md#scope-and-limits) has the details.
+
+## Roadmap
+
+Waldo is meant for the Linux desktop as a whole, not for one compositor.
+Niri is where it starts, because no existing tool let a coding agent work on
+a Niri desktop.
+
+Most of what Waldo relies on is not specific to Niri. Screen capture,
+virtual input and the clipboard use the wlr Wayland protocols, which other
+compositors implement too, and accessibility goes through AT-SPI, which
+works across desktops. Niri's IPC supplies the desktop model: outputs,
+windows, workspaces and the keyboard layout.
 
 ## Development
 
