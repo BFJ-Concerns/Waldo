@@ -18,7 +18,8 @@ pub use fixture::{
     BoundaryTargets, FixturePoint, FixtureRect, SeededSequence, TargetGrid, TargetGridError,
 };
 pub use private_root::{
-    PrivacyLeak, PrivacyScan, PrivateRoot, PrivateRootError, scan_private_root,
+    PrivacyLeak, PrivacyScan, PrivateRoot, PrivateRootError, publish_private_json,
+    scan_private_root,
 };
 pub use run::{
     BinaryIdentity, CellOutcome, CellResult, CleanupCheck, CleanupOutcome, EvidenceArtifact,

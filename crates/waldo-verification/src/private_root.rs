@@ -36,6 +36,46 @@ pub struct PrivacyScan {
     pub leaks: Vec<PrivacyLeak>,
 }
 
+/// Publishes `value` as owner-only JSON at `path` atomically: written to
+/// a private temporary file beside it, synced, then renamed into place, so
+/// a reader sees the old contents or the new, never part of either.
+pub fn publish_private_json(path: &Path, value: &impl Serialize) -> Result<(), PrivateRootError> {
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| PrivateRootError(format!("failed to serialise evidence: {error}")))?;
+    bytes.push(b'\n');
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| PrivateRootError(format!("system clock error: {error}")))?
+            .as_nanos()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|error| {
+            PrivateRootError(format!("failed to create {}: {error}", temporary.display()))
+        })?;
+    file.write_all(&bytes).map_err(|error| {
+        PrivateRootError(format!("failed to write {}: {error}", temporary.display()))
+    })?;
+    file.sync_all().map_err(|error| {
+        PrivateRootError(format!("failed to sync {}: {error}", temporary.display()))
+    })?;
+    fs::rename(&temporary, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        PrivateRootError(format!(
+            "failed to publish {} atomically: {error}",
+            path.display()
+        ))
+    })?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| PrivateRootError(format!("failed to protect {}: {error}", path.display())))
+}
+
 pub fn scan_private_root(
     root: &Path,
     payloads: &[(&str, &[u8])],
@@ -167,41 +207,7 @@ impl PrivateRoot {
         })?;
         protect_directory_chain(&self.path, parent)?;
 
-        let mut bytes = serde_json::to_vec_pretty(value)
-            .map_err(|error| PrivateRootError(format!("failed to serialise evidence: {error}")))?;
-        bytes.push(b'\n');
-        let temporary = path.with_extension(format!(
-            "tmp-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| PrivateRootError(format!("system clock error: {error}")))?
-                .as_nanos()
-        ));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
-            .map_err(|error| {
-                PrivateRootError(format!("failed to create {}: {error}", temporary.display()))
-            })?;
-        file.write_all(&bytes).map_err(|error| {
-            PrivateRootError(format!("failed to write {}: {error}", temporary.display()))
-        })?;
-        file.sync_all().map_err(|error| {
-            PrivateRootError(format!("failed to sync {}: {error}", temporary.display()))
-        })?;
-        fs::rename(&temporary, &path).map_err(|error| {
-            let _ = fs::remove_file(&temporary);
-            PrivateRootError(format!(
-                "failed to publish {} atomically: {error}",
-                path.display()
-            ))
-        })?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-            PrivateRootError(format!("failed to protect {}: {error}", path.display()))
-        })?;
+        publish_private_json(&path, value)?;
         Ok(path)
     }
 
