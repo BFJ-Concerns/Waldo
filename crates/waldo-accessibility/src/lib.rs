@@ -397,13 +397,8 @@ impl AccessibilityBackend {
         )?;
         let accessible =
             proxy(&connection, &key, ACCESSIBLE).map_err(ActionExecutionFailure::not_executed)?;
-        accessible
-            .call::<_, _, String>("GetRoleName", &())
-            .map_err(|_| {
-                ActionExecutionFailure::not_executed(stale_target(
-                    "accessibility element no longer resolves",
-                ))
-            })?;
+        confirm_resolved(accessible.call::<_, _, String>("GetRoleName", &()))
+            .map_err(ActionExecutionFailure::not_executed)?;
         let interfaces: InterfaceSet = accessible.call("GetInterfaces", &()).map_err(|error| {
             ActionExecutionFailure::not_executed(backend_failure(
                 format!("read accessibility interfaces before action: {error}"),
@@ -506,9 +501,7 @@ impl AccessibilityBackend {
                     ));
                 }
                 // Later text entry types into the element focus moved to.
-                if let Ok(mut state) = self.state.lock() {
-                    state.focused = Some(element.clone());
-                }
+                focus_cache(self.state.lock())?.focused = Some(element.clone());
             }
             AccessibilityOperation::Select => {
                 let parent: ObjectRefOwned = accessible
@@ -775,21 +768,16 @@ fn select_window_root(
 
     match candidates.len() {
         0 => Ok(None),
-        // The process's only accessible window is taken unless both what is
-        // known of it contradicts the observed window: a title that differs
-        // from the supplied one and a size that differs from the frame. It
-        // may be another window of the process than the one observed.
+        // The process's only accessible window is taken unless its title
+        // contradicts the supplied one: a matching size would have selected
+        // it above, so nothing else identifies it, and it may be another
+        // window of the process than the one observed.
         1 => {
             let (_, node) = &candidates[0];
             let title_differs = window_title
                 .zip(node.name.as_deref())
                 .is_some_and(|(wanted, actual)| wanted != actual);
-            let size_differs = node
-                .bounds
-                .is_some_and(|bounds| !sizes_near(bounds, visible_bounds, 8.0));
-            Ok((!(title_differs && size_differs))
-                .then(|| candidates.pop())
-                .flatten())
+            Ok((!title_differs).then(|| candidates.pop()).flatten())
         }
         _ => Err(ambiguous_target(
             "multiple AT-SPI windows remain for the focused process".into(),
@@ -1213,6 +1201,30 @@ fn action_error(operation: &str, error: zbus::Error) -> ActionExecutionFailure {
     )
 }
 
+/// The last read before acting on a resolved element: only an object that
+/// has gone makes the target stale; any other failure is the backend's.
+fn confirm_resolved<T>(result: Result<T, zbus::Error>) -> Result<(), ProtocolError> {
+    match required(result, "confirm accessibility element before action") {
+        Ok(_) => Ok(()),
+        Err(ReadError::Gone) => Err(stale_target("accessibility element no longer resolves")),
+        Err(ReadError::Failed(error)) => Err(error),
+    }
+}
+
+/// The focus cache after AT-SPI has already moved focus, so a failure to
+/// record it leaves the action's outcome indeterminate.
+fn focus_cache<T>(lock: std::sync::LockResult<T>) -> Result<T, ActionExecutionFailure> {
+    lock.map_err(|_| {
+        ActionExecutionFailure::indeterminate(
+            ActionRoute::Accessibility,
+            backend_failure(
+                "focus moved, but the accessibility focus cache is poisoned so later text entry cannot target it".to_owned(),
+                false,
+            ),
+        )
+    })
+}
+
 fn stale_target(message: &str) -> ProtocolError {
     ProtocolError {
         code: ErrorCode::StaleAccessibilityTarget,
@@ -1308,6 +1320,67 @@ mod tests {
 
         assert!(contradicted.is_none());
         assert!(unconfirmed.is_some());
+    }
+
+    #[test]
+    fn a_sole_window_with_a_contradictory_title_is_not_taken_on_geometry_alone() {
+        let frame = LogicalRect {
+            origin: LogicalPoint { x: 0.0, y: 0.0 },
+            width: 800.0,
+            height: 600.0,
+        };
+        let unsized_window = || {
+            let (key, mut node) = candidate("/2", "Preferences", frame);
+            node.bounds = None;
+            vec![(key, node)]
+        };
+
+        let contradicted = select_window_root(unsized_window(), Some("Editor"), frame).unwrap();
+        let untitled_request = select_window_root(unsized_window(), None, frame).unwrap();
+
+        assert!(contradicted.is_none());
+        assert!(untitled_request.is_some());
+    }
+
+    #[test]
+    fn only_a_gone_object_makes_the_final_resolution_read_stale() {
+        let gone: Result<(), zbus::Error> = Err(zbus::Error::FDO(Box::new(
+            zbus::fdo::Error::UnknownObject("gone".into()),
+        )));
+        let failed: Result<(), zbus::Error> = Err(zbus::Error::FDO(Box::new(
+            zbus::fdo::Error::Timeout("application did not answer".into()),
+        )));
+
+        assert_eq!(
+            super::confirm_resolved(gone).unwrap_err().code,
+            waldo_protocol::ErrorCode::StaleAccessibilityTarget
+        );
+        let error = super::confirm_resolved(failed).unwrap_err();
+        assert_eq!(error.code, waldo_protocol::ErrorCode::BackendFailure);
+        assert!(
+            error.message.contains("application did not answer"),
+            "{}",
+            error.message
+        );
+        assert!(super::confirm_resolved(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn a_poisoned_focus_cache_after_focus_moved_is_indeterminate() {
+        let cache = std::sync::Mutex::new(());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = cache.lock().unwrap();
+            panic!("poison the cache");
+        });
+
+        match super::focus_cache(cache.lock()) {
+            Err(waldo_action::ActionExecutionFailure::Indeterminate { route, error }) => {
+                assert_eq!(route, waldo_protocol::ActionRoute::Accessibility);
+                assert_eq!(error.code, waldo_protocol::ErrorCode::BackendFailure);
+            }
+            Err(other) => panic!("focus already moved, so the failure is indeterminate: {other:?}"),
+            Ok(_) => panic!("a poisoned cache must be reported"),
+        }
     }
 
     #[test]
