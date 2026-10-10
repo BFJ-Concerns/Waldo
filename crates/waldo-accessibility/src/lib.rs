@@ -30,6 +30,9 @@ const VALUE: &str = "org.a11y.atspi.Value";
 pub struct AccessibilitySnapshot {
     pub nodes: Vec<AccessibilityNode>,
     pub focused: Option<ElementHandle>,
+    /// False when the walk stopped at the node budget, so an element absent
+    /// from `nodes` may still exist and `focused` may be unknown.
+    pub complete: bool,
 }
 
 /// Shared AT-SPI authority whose handles remain opaque outside the process.
@@ -133,6 +136,7 @@ impl AccessibilityBackend {
             return Ok(AccessibilitySnapshot {
                 nodes: Vec::new(),
                 focused: None,
+                complete: true,
             });
         }
 
@@ -154,6 +158,7 @@ impl AccessibilityBackend {
                     return Ok(AccessibilitySnapshot {
                         nodes: Vec::new(),
                         focused: None,
+                        complete: true,
                     });
                 }
             };
@@ -165,8 +170,10 @@ impl AccessibilityBackend {
         let mut queue = VecDeque::from([(root, Some(root_node), true)]);
         let mut nodes = Vec::new();
         let mut focused = None;
+        let mut complete = true;
         while let Some((key, prefetched, is_root)) = queue.pop_front() {
             if nodes.len() >= MAX_NODES {
+                complete = false;
                 break;
             }
             let raw = match prefetched {
@@ -220,7 +227,11 @@ impl AccessibilityBackend {
         }
 
         state.focused = focused.clone();
-        Ok(AccessibilitySnapshot { nodes, focused })
+        Ok(AccessibilitySnapshot {
+            nodes,
+            focused,
+            complete,
+        })
     }
 
     /// Checks whether a previously issued opaque handle still resolves to

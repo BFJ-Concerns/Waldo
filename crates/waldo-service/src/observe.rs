@@ -87,6 +87,9 @@ pub(crate) struct CapturedObservation {
     pub(crate) observation: Observation,
     pub(crate) frame_fingerprint: u64,
     pub(crate) application_frame_fingerprint: u64,
+    /// Whether the accessibility snapshot covered the whole window tree;
+    /// false when it was cut short or no snapshot was taken.
+    pub(crate) accessibility_complete: bool,
 }
 
 pub(crate) async fn capture_observation(
@@ -142,49 +145,60 @@ pub(crate) async fn capture_observation(
         height: capture.height,
     };
 
-    let (accessibility, focused_element, accessibility_available, accessibility_limitation) =
-        if include_accessibility {
-            match (&state.accessibility, focused_window_state) {
-                (Some(backend), Some(window)) if window.pid.is_some() => {
-                    let backend = std::sync::Arc::clone(backend);
-                    let pid = window.pid.expect("guarded by is_some");
-                    let window_id = window.id;
-                    let application_id = window.application_id;
-                    let window_title = window.title;
-                    match tokio::task::spawn_blocking(move || {
-                        backend.snapshot(
-                            pid,
-                            window_id,
-                            application_id,
-                            window_title,
-                            logical_bounds,
+    let (
+        accessibility,
+        focused_element,
+        accessibility_available,
+        accessibility_complete,
+        accessibility_limitation,
+    ) = if include_accessibility {
+        match (&state.accessibility, focused_window_state) {
+            (Some(backend), Some(window)) if window.pid.is_some() => {
+                let backend = std::sync::Arc::clone(backend);
+                let pid = window.pid.expect("guarded by is_some");
+                let window_id = window.id;
+                let application_id = window.application_id;
+                let window_title = window.title;
+                match tokio::task::spawn_blocking(move || {
+                    backend.snapshot(pid, window_id, application_id, window_title, logical_bounds)
+                })
+                .await
+                {
+                    Ok(Ok(snapshot)) => {
+                        let limitation =
+                            (!snapshot.complete).then(|| INCOMPLETE_TREE_LIMITATION.to_owned());
+                        (
+                            snapshot.nodes,
+                            snapshot.focused,
+                            true,
+                            snapshot.complete,
+                            limitation,
                         )
-                    })
-                    .await
-                    {
-                        Ok(Ok(snapshot)) => (snapshot.nodes, snapshot.focused, true, None),
-                        Ok(Err(error)) if error.code == ErrorCode::AmbiguousTarget => {
-                            return Err(error);
-                        }
-                        Ok(Err(error)) => (
-                            Vec::new(),
-                            None,
-                            false,
-                            Some(format!("accessibility snapshot failed: {}", error.message)),
-                        ),
-                        Err(error) => (
-                            Vec::new(),
-                            None,
-                            false,
-                            Some(format!("accessibility snapshot task failed: {error}")),
-                        ),
                     }
+                    Ok(Err(error)) if error.code == ErrorCode::AmbiguousTarget => {
+                        return Err(error);
+                    }
+                    Ok(Err(error)) => (
+                        Vec::new(),
+                        None,
+                        false,
+                        false,
+                        Some(format!("accessibility snapshot failed: {}", error.message)),
+                    ),
+                    Err(error) => (
+                        Vec::new(),
+                        None,
+                        false,
+                        false,
+                        Some(format!("accessibility snapshot task failed: {error}")),
+                    ),
                 }
-                _ => (Vec::new(), None, false, None),
             }
-        } else {
-            (Vec::new(), None, false, None)
-        };
+            _ => (Vec::new(), None, false, false, None),
+        }
+    } else {
+        (Vec::new(), None, false, false, None)
+    };
 
     let observation = Observation {
         id: observation_id,
@@ -216,8 +230,12 @@ pub(crate) async fn capture_observation(
         observation,
         frame_fingerprint,
         application_frame_fingerprint,
+        accessibility_complete,
     })
 }
+
+/// Tells the agent that elements missing from a cut-short tree may exist.
+const INCOMPLETE_TREE_LIMITATION: &str = "the accessibility tree was too large to read whole; elements and focus beyond the nodes listed were not inspected";
 
 pub(crate) struct CapturedFrame {
     pub(crate) focused_window: Option<WindowId>,
