@@ -37,6 +37,24 @@ virtual-pointer, virtual-keyboard and data-control Wayland protocols, and the
 AT-SPI accessibility bus. Only one client drives at a time: the first to act
 holds an exclusive driving lease until it stops, disconnects or goes idle.
 
+### Design
+
+- **Actions are grounded.** Every Act batch names the observation it was
+  planned from, and before each action Waldo checks the live desktop
+  against it. If the output geometry, the focused window or the target has
+  changed, the action is refused rather than landing somewhere else.
+- **Results are evidence, not assumptions.** A receipt says whether an
+  action was dispatched, which is not the same as the application acting on
+  it. After visual actions, Waldo samples frames until the output settles
+  and returns that observation, so the agent checks what actually happened.
+- **One protocol, two clients.** The CLI and the MCP server speak one
+  versioned wire schema, which `waldo schema` prints. The tests decode
+  every JSON example in the shipped skill against it, so the agent's
+  instructions cannot drift from the code.
+- **Tested from the outside in.** Beyond unit and live-session tests,
+  `waldo-verification` drives the real binaries against disposable GTK, Qt
+  and Electron applications and checks what each application received.
+
 ## Requirements
 
 - A running [Niri](https://github.com/YaLTeR/niri) session managed by a
