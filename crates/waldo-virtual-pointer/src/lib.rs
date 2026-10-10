@@ -11,7 +11,7 @@ use waldo_protocol::{
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle,
-    globals::{GlobalListContents, registry_queue_init},
+    globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
         wl_output,
         wl_pointer::{Axis, ButtonState},
@@ -29,6 +29,14 @@ const BTN_MIDDLE: u32 = 0x112;
 const BTN_SIDE: u32 = 0x113;
 const BTN_EXTRA: u32 = 0x114;
 const PATH_STEP: Duration = Duration::from_millis(8);
+/// Longest drag accepted. A drag's path is prepared before dispatch, one
+/// point per step, so the bound keeps a long duration from exhausting memory.
+const MAX_DRAG_DURATION_MS: u32 = 60_000;
+/// Largest magnitude a Wayland fixed-point (signed 24.8) argument carries.
+const MAX_FIXED_MAGNITUDE: f64 = 8_388_607.0;
+/// The first wl_output version that reports output names, which every
+/// output lookup here depends on.
+const OUTPUT_NAME_VERSION: u32 = 4;
 
 /// Executes Waldo pointer actions through the compositor's virtual-pointer protocol.
 pub struct VirtualPointerExecutor {
@@ -97,6 +105,7 @@ impl ActionExecutor for VirtualPointerExecutor {
 
 struct PointerState {
     connection: Connection,
+    globals: GlobalList,
     queue: EventQueue<WaylandState>,
     manager: ZwlrVirtualPointerManagerV1,
     pointer: ZwlrVirtualPointerV1,
@@ -112,24 +121,43 @@ impl PointerState {
         let (globals, mut queue) = registry_queue_init::<WaylandState>(&connection)
             .map_err(|error| backend_failure(format!("read Wayland globals: {error}"), true))?;
         let qh = queue.handle();
+        // Version 2 is the first that can bind a pointer to an output.
         let manager: ZwlrVirtualPointerManagerV1 =
-            globals.bind(&qh, 1..=2, ()).map_err(|error| {
-                backend_failure(format!("bind virtual-pointer manager: {error}"), false)
+            globals.bind(&qh, 2..=2, ()).map_err(|error| {
+                backend_failure(
+                    format!("bind virtual-pointer manager version 2: {error}"),
+                    false,
+                )
             })?;
         let mut wayland_state = WaylandState::default();
+        let mut too_old = None;
         globals.contents().with_list(|list| {
             for global in list.iter().filter(|global| global.interface == "wl_output") {
+                if global.version < OUTPUT_NAME_VERSION {
+                    too_old = Some(global.version);
+                    continue;
+                }
                 let output = globals.registry().bind::<wl_output::WlOutput, _, _>(
                     global.name,
-                    global.version.min(4),
+                    OUTPUT_NAME_VERSION,
                     &qh,
                     (),
                 );
-                wayland_state
-                    .outputs
-                    .push(OutputRecord { output, name: None });
+                wayland_state.outputs.push(OutputRecord {
+                    output,
+                    global: global.name,
+                    name: None,
+                });
             }
         });
+        if let Some(version) = too_old {
+            return Err(backend_failure(
+                format!(
+                    "the compositor offers wl_output version {version}; the virtual pointer needs version {OUTPUT_NAME_VERSION} for output names"
+                ),
+                false,
+            ));
+        }
         queue.roundtrip(&mut wayland_state).map_err(|error| {
             backend_failure(format!("read Wayland output names: {error}"), true)
         })?;
@@ -139,6 +167,7 @@ impl PointerState {
             .map_err(|error| backend_failure(format!("create virtual pointer: {error}"), true))?;
         Ok(Self {
             connection,
+            globals,
             queue,
             manager,
             pointer,
@@ -228,18 +257,29 @@ impl PointerState {
             return Ok(());
         }
 
-        let live = DesktopGeometry::inspect().map_err(ActionExecutionFailure::not_executed)?;
-        let known_names = self
+        // While a button is held the device and its outputs are kept, so
+        // compare the registry's output globals, which an output removed and
+        // re-added under the same name does not keep.
+        self.queue
+            .roundtrip(&mut WaylandState::default())
+            .map_err(|error| {
+                ActionExecutionFailure::indeterminate(
+                    ActionRoute::VirtualPointer,
+                    backend_failure(format!("read Wayland output changes: {error}"), true),
+                )
+            })?;
+        let known = self
             .outputs
             .iter()
-            .filter_map(|output| output.name.clone())
+            .map(|output| output.global)
             .collect::<BTreeSet<_>>();
-        let live_names = live
-            .outputs
-            .iter()
-            .map(|output| output.name.clone())
-            .collect::<BTreeSet<_>>();
-        if known_names == live_names {
+        let live = self.globals.contents().with_list(|list| {
+            list.iter()
+                .filter(|global| global.interface == "wl_output")
+                .map(|global| global.name)
+                .collect::<BTreeSet<_>>()
+        });
+        if known == live {
             return Ok(());
         }
 
@@ -384,8 +424,8 @@ impl PreparedAction {
                 Ok(Self::MoveAbsolute(point))
             }
             Action::PointerMoveRelative { delta } => {
-                finite(delta.x, "relative pointer x")?;
-                finite(delta.y, "relative pointer y")?;
+                wire_fixed(delta.x, "relative pointer x")?;
+                wire_fixed(delta.y, "relative pointer y")?;
                 Ok(Self::MoveRelative {
                     x: delta.x,
                     y: delta.y,
@@ -416,6 +456,11 @@ impl PreparedAction {
                 button,
                 duration_ms,
             } => {
+                if *duration_ms > MAX_DRAG_DURATION_MS {
+                    return Err(invalid(
+                        "pointer drag duration must be at most 60000 milliseconds",
+                    ));
+                }
                 let geometry = DesktopGeometry::inspect()?;
                 let steps = (u64::from(*duration_ms).div_ceil(PATH_STEP.as_millis() as u64)).max(1)
                     as usize;
@@ -455,8 +500,8 @@ impl PreparedAction {
                 })
             }
             Action::Scroll { delta } => {
-                finite(delta.x, "horizontal scroll")?;
-                finite(delta.y, "vertical scroll")?;
+                wire_fixed(delta.x, "horizontal scroll")?;
+                wire_fixed(delta.y, "vertical scroll")?;
                 Ok(Self::Scroll {
                     x: delta.x,
                     y: delta.y,
@@ -531,6 +576,9 @@ struct WaylandState {
 
 struct OutputRecord {
     output: wl_output::WlOutput,
+    /// The registry global the output was bound from; a re-added output gets
+    /// a new one even when its name is unchanged.
+    global: u32,
     name: Option<String>,
 }
 
@@ -637,6 +685,18 @@ fn finite(value: f64, name: &str) -> Result<(), ProtocolError> {
     }
 }
 
+/// Refuses a value a Wayland fixed-point argument cannot carry, which
+/// would otherwise be sent as a different, saturated value.
+fn wire_fixed(value: f64, name: &str) -> Result<(), ProtocolError> {
+    finite(value, name)?;
+    if value.abs() > MAX_FIXED_MAGNITUDE {
+        return Err(invalid(format!(
+            "{name} must be within ±{MAX_FIXED_MAGNITUDE} logical pixels"
+        )));
+    }
+    Ok(())
+}
+
 fn button_code(button: PointerButton) -> u32 {
     match button {
         PointerButton::Primary => BTN_LEFT,
@@ -721,6 +781,38 @@ mod tests {
     use waldo_protocol::{
         LogicalPoint, LogicalRect, OutputId, OutputState, OutputTransform, PointerButton,
     };
+
+    #[test]
+    fn motion_and_scroll_beyond_the_fixed_point_range_are_refused() {
+        use waldo_protocol::{Action, LogicalDelta};
+
+        let relative = |x| Action::PointerMoveRelative {
+            delta: LogicalDelta { x, y: 0.0 },
+        };
+        let scroll = |y| Action::Scroll {
+            delta: LogicalDelta { x: 0.0, y },
+        };
+
+        assert!(super::PreparedAction::from_action(&relative(8_388_607.0)).is_ok());
+        assert!(super::PreparedAction::from_action(&relative(1e100)).is_err());
+        assert!(super::PreparedAction::from_action(&scroll(-1e100)).is_err());
+        assert!(super::PreparedAction::from_action(&scroll(f64::NAN)).is_err());
+    }
+
+    #[test]
+    fn an_overlong_drag_is_refused_before_its_path_is_prepared() {
+        let drag = waldo_protocol::Action::PointerDrag {
+            from: LogicalPoint { x: 0.0, y: 0.0 },
+            to: LogicalPoint { x: 10.0, y: 10.0 },
+            button: PointerButton::Primary,
+            duration_ms: u32::MAX,
+        };
+
+        let Err(error) = super::PreparedAction::from_action(&drag) else {
+            panic!("an overlong drag was prepared")
+        };
+        assert!(error.message.contains("duration"), "{}", error.message);
+    }
 
     #[test]
     fn absolute_points_undo_the_output_transform_before_dispatch() {
