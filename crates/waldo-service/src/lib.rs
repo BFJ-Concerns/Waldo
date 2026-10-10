@@ -12,4 +12,3 @@ mod verification;
 
 pub use error::ServiceError;
 pub use server::ControllerService;
-pub use waldo_socket::default_socket_path;
