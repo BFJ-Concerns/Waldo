@@ -6,6 +6,7 @@
 
 mod action;
 mod capability;
+mod diagnostic;
 mod error;
 mod geometry;
 mod identifiers;
@@ -16,6 +17,7 @@ mod selector;
 
 pub use action::*;
 pub use capability::*;
+pub use diagnostic::*;
 pub use error::*;
 pub use geometry::*;
 pub use identifiers::*;

@@ -12,7 +12,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use waldo_protocol::{
     ActRequest, ClientId, ClientMessage, ConnectionId, ErrorCode, HandoverRequest, ObserveRequest,
-    ProtocolError, QueryRequest, RequestId, ServerMessage, StopRequest, published_schema,
+    ProtocolError, QueryRequest, RequestId, ServerMessage, StopRequest, decode_error_detail,
+    published_schema,
 };
 use waldo_socket::{PipelinedControllerClient, TransportError, default_socket_path};
 
@@ -290,9 +291,8 @@ fn request_document<T: DeserializeOwned>(
     }
 }
 
-/// Says where and why a request document failed to parse. String values
-/// the parser quotes are elided, since documents can carry clipboard data
-/// or text the operator would not want repeated in a diagnostic.
+/// Says whether a request document is malformed JSON or the wrong shape,
+/// and where.
 fn document_diagnostic(error: &serde_json::Error) -> String {
     let kind = match error.classify() {
         serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
@@ -302,19 +302,7 @@ fn document_diagnostic(error: &serde_json::Error) -> String {
             "request document does not match the protocol schema"
         }
     };
-    let mut reason = String::new();
-    let mut quoted = false;
-    for character in error.to_string().chars() {
-        if character == '"' {
-            if !quoted {
-                reason.push_str("\"…\"");
-            }
-            quoted = !quoted;
-        } else if !quoted {
-            reason.push(character);
-        }
-    }
-    format!("{kind}: {reason}")
+    format!("{kind}: {}", decode_error_detail(error))
 }
 
 /// Composes an Act response with the request that followed it. A transport
@@ -436,16 +424,17 @@ mod tests {
     }
 
     #[test]
-    fn document_diagnostics_locate_the_fault_without_repeating_values() {
-        let error = serde_json::from_str::<waldo_protocol::ActRequest>(
-            r#"{"observation_id": "secret text", "actions": [], "verification": []}"#,
-        )
-        .unwrap_err();
-        let diagnostic = super::document_diagnostic(&error);
+    fn document_diagnostics_say_whether_json_or_shape_failed() {
+        let syntax = serde_json::from_str::<waldo_protocol::ActRequest>("{").unwrap_err();
+        let shape = serde_json::from_str::<waldo_protocol::ActRequest>("{}").unwrap_err();
 
-        assert!(diagnostic.starts_with("request document does not match the protocol schema"));
-        assert!(diagnostic.contains("line 1"), "{diagnostic}");
-        assert!(!diagnostic.contains("secret"), "{diagnostic}");
+        assert!(
+            super::document_diagnostic(&syntax).starts_with("request document is not valid JSON")
+        );
+        assert!(
+            super::document_diagnostic(&shape)
+                .starts_with("request document does not match the protocol schema")
+        );
     }
 
     #[test]

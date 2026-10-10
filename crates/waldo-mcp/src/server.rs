@@ -19,7 +19,7 @@ use waldo_socket::PipelinedControllerClient;
 use crate::{
     McpError,
     result::{tool_failure, tool_response},
-    tools::{CallToolParams, JsonRpcMessage, decode, initialize, rpc_error, tools},
+    tools::{CallToolParams, JsonRpcMessage, decode, initialize, parse_message, rpc_error, tools},
 };
 
 /// One MCP process and its persistent connection to the session controller.
@@ -71,17 +71,12 @@ impl McpServer {
         while input_open || !requests.is_empty() {
             tokio::select! {
                 line = lines.next_line(), if input_open => match line? {
-                    Some(line) => match serde_json::from_str::<JsonRpcMessage>(&line) {
+                    Some(line) => match parse_message(&line) {
                         Ok(message) => {
                             let server = self.clone();
                             requests.spawn(async move { server.handle(message).await });
                         }
-                        Err(error) => {
-                            write_response(
-                                &mut writer,
-                                &rpc_error(Value::Null, -32700, error.to_string()),
-                            ).await?;
-                        }
+                        Err(response) => write_response(&mut writer, &response).await?,
                     },
                     None => input_open = false,
                 },
@@ -99,9 +94,6 @@ impl McpServer {
 
     async fn handle(&self, message: JsonRpcMessage) -> Option<Value> {
         let id = message.id?;
-        if message.jsonrpc != "2.0" {
-            return Some(rpc_error(id, -32600, "jsonrpc must be \"2.0\""));
-        }
         let result = match message.method.as_str() {
             "initialize" => initialize(message.params),
             "ping" => Ok(json!({})),
@@ -190,9 +182,12 @@ fn decode_tool_arguments<T: serde::de::DeserializeOwned>(
     value: Value,
     schema: &str,
 ) -> Result<T, waldo_protocol::ProtocolError> {
-    decode(value).map_err(|_| waldo_protocol::ProtocolError {
+    serde_json::from_value(value).map_err(|error| waldo_protocol::ProtocolError {
         code: waldo_protocol::ErrorCode::InvalidRequest,
-        message: format!("tool arguments do not match the {schema} schema"),
+        message: format!(
+            "tool arguments do not match the {schema} schema: {}",
+            waldo_protocol::decode_error_detail(&error)
+        ),
         retryable: false,
     })
 }
@@ -245,6 +240,35 @@ mod tests {
 
         assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 4);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdio_refuses_invalid_request_envelopes_with_a_null_or_valid_id() {
+        let (mut client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, mut client_read) = tokio::io::duplex(16 * 1024);
+        let server = McpServer::new("/controller-is-not-needed");
+        let task = tokio::spawn(async move { server.run(server_read, server_write).await });
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":true,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":{\"x\":1},\"method\":\"ping\"}\n{}\nnot json\n",
+            )
+            .await
+            .unwrap();
+        drop(client_write);
+
+        let mut lines = BufReader::new(&mut client_read).lines();
+        let mut codes = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let response: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], Value::Null, "{response}");
+            assert!(response.get("result").is_none(), "{response}");
+            codes.push(response["error"]["code"].as_i64().unwrap());
+        }
+
+        assert_eq!(codes, [-32600, -32600, -32600, -32700]);
         task.await.unwrap().unwrap();
     }
 
