@@ -64,7 +64,11 @@ verify_service_file() {
     HOME="$scratch/home" XDG_RUNTIME_DIR="$runtime" \
         systemd-analyze --user --man=no --generators=no \
         verify packaging/waldod.service || status=$?
-    rm -rf -- "$scratch"
+    # A failed clean-up fails the stage too, keeping any earlier status.
+    if ! rm -rf -- "$scratch"; then
+        printf 'could not remove the service check scratch directory %s\n' "$scratch" >&2
+        [[ "$status" -ne 0 ]] || status=1
+    fi
     return "$status"
 }
 
