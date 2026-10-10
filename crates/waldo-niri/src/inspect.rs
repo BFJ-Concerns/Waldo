@@ -214,8 +214,8 @@ fn discovered_capabilities(version: &str, protocols: &[ProtocolAdvertisement]) -
 
     Capabilities {
         screencopy: pending("zwlr_screencopy_manager_v1", "capture backend"),
-        virtual_pointer: pending("zwlr_virtual_pointer_manager_v1", "pointer behaviour gate"),
-        virtual_keyboard: pending("zwp_virtual_keyboard_manager_v1", "keyboard behaviour gate"),
+        virtual_pointer: pending("zwlr_virtual_pointer_manager_v1", "pointer backend"),
+        virtual_keyboard: pending("zwp_virtual_keyboard_manager_v1", "keyboard backend"),
         niri_ipc: BackendCapability {
             available: true,
             version: Some(version.to_owned()),

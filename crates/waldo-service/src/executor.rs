@@ -58,14 +58,16 @@ impl PasteKeyboard for VirtualKeyboardExecutor {
 /// Routes each action to the one live backend which owns its semantics.
 pub(crate) struct DesktopActionExecutor<C = ClipboardExecutor, K = VirtualKeyboardExecutor> {
     niri: NiriActionExecutor,
-    pointer: Option<VirtualPointerExecutor>,
+    /// The pointer, or why it failed to initialise.
+    pointer: Result<VirtualPointerExecutor, ProtocolError>,
     /// The keyboard, or why there is none. A retryable failure (Niri not
     /// answering at start-up, say) is retried on the next use, so a
     /// transient fault at daemon start does not disable the route for the
     /// daemon's life.
     keyboard: Mutex<Result<K, KeyboardUnavailable>>,
     active_layout: ActiveLayoutSource,
-    clipboard: Option<C>,
+    /// The clipboard, or why it failed to initialise.
+    clipboard: Result<C, ProtocolError>,
     paste_chord: Vec<String>,
     accessibility: Option<Arc<AccessibilityBackend>>,
 }
@@ -80,9 +82,9 @@ impl DesktopActionExecutor {
             accessibility,
             Arc::clone(&active_layout),
             settings,
-            VirtualPointerExecutor::initialise().ok(),
+            VirtualPointerExecutor::initialise(),
             VirtualKeyboardExecutor::initialise(active_layout),
-            ClipboardExecutor::initialise().ok(),
+            ClipboardExecutor::initialise(),
         )
     }
 }
@@ -92,9 +94,9 @@ impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
         accessibility: Option<Arc<AccessibilityBackend>>,
         active_layout: ActiveLayoutSource,
         settings: &waldo_settings::Settings,
-        pointer: Option<VirtualPointerExecutor>,
+        pointer: Result<VirtualPointerExecutor, ProtocolError>,
         keyboard: Result<K, KeyboardUnavailable>,
-        clipboard: Option<C>,
+        clipboard: Result<C, ProtocolError>,
     ) -> Result<Self, waldo_settings::SettingsError> {
         Ok(Self {
             niri: NiriActionExecutor,
@@ -197,7 +199,7 @@ impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
         let clipboard = self
             .clipboard
             .as_ref()
-            .ok_or_else(|| unsupported("Wayland clipboard paste is unavailable"))?;
+            .map_err(|error| unavailable_backend("clipboard", error))?;
         self.with_keyboard(|_| ()).map_err(|unavailable| {
             unsupported(&format!(
                 "clipboard paste needs the virtual keyboard: {}",
@@ -296,13 +298,7 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
             | Action::Scroll { .. } => self
                 .pointer
                 .as_ref()
-                .ok_or_else(|| {
-                    ActionExecutionFailure::not_executed(ProtocolError {
-                        code: ErrorCode::UnsupportedCapability,
-                        message: "Wayland virtual-pointer backend is unavailable".into(),
-                        retryable: true,
-                    })
-                })?
+                .map_err(|error| unavailable_backend("virtual-pointer", error))?
                 .execute(action, cancellation),
             Action::Key { .. } | Action::KeyChord { .. } => {
                 self.keyboard_execute(action, cancellation)
@@ -316,13 +312,7 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
             | Action::ClipboardKeep { .. } => self
                 .clipboard
                 .as_ref()
-                .ok_or_else(|| {
-                    ActionExecutionFailure::not_executed(ProtocolError {
-                        code: ErrorCode::UnsupportedCapability,
-                        message: "Wayland clipboard backend is unavailable".into(),
-                        retryable: true,
-                    })
-                })?
+                .map_err(|error| unavailable_backend("clipboard", error))?
                 .execute(action, cancellation),
             Action::Accessibility { .. } => self
                 .accessibility
@@ -345,16 +335,16 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
             ActionRoute::VirtualPointer => self
                 .pointer
                 .as_ref()
-                .is_some_and(|pointer| pointer.supports(route)),
+                .is_ok_and(|pointer| pointer.supports(route)),
             ActionRoute::VirtualKeyboard => self
                 .with_keyboard(|keyboard| keyboard.supports(route))
                 .unwrap_or(false),
             ActionRoute::Clipboard => self
                 .clipboard
                 .as_ref()
-                .is_some_and(|clipboard| clipboard.supports(route)),
+                .is_ok_and(|clipboard| clipboard.supports(route)),
             ActionRoute::ClipboardPaste => {
-                self.clipboard.is_some() && self.with_keyboard(|_| ()).is_ok()
+                self.clipboard.is_ok() && self.with_keyboard(|_| ()).is_ok()
             }
             ActionRoute::Accessibility => self
                 .accessibility
@@ -366,17 +356,22 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
 
     fn limitation(&self, route: ActionRoute) -> Option<String> {
         match route {
-            ActionRoute::VirtualKeyboard => self.keyboard_limitation(),
-            ActionRoute::Clipboard => self
-                .clipboard
+            ActionRoute::VirtualPointer => self
+                .pointer
                 .as_ref()
-                .and_then(|clipboard| clipboard.clipboard_limitation()),
+                .err()
+                .map(|error| initialisation_failed("virtual-pointer", error)),
+            ActionRoute::VirtualKeyboard => self.keyboard_limitation(),
+            ActionRoute::Clipboard => match &self.clipboard {
+                Ok(clipboard) => clipboard.clipboard_limitation(),
+                Err(error) => Some(initialisation_failed("clipboard", error)),
+            },
             _ => None,
         }
     }
 
     fn release_all(&self) {
-        if let Some(pointer) = &self.pointer {
+        if let Ok(pointer) = &self.pointer {
             pointer.release_all();
         }
         if let Ok(keyboard) = &*self
@@ -386,10 +381,27 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
         {
             keyboard.release_all();
         }
-        if let Some(clipboard) = &self.clipboard {
+        if let Ok(clipboard) = &self.clipboard {
             clipboard.cleanup_preservation();
         }
     }
+}
+
+fn initialisation_failed(backend: &str, error: &ProtocolError) -> String {
+    format!(
+        "Wayland {backend} backend initialisation failed: {}",
+        error.message
+    )
+}
+
+/// A backend that failed to initialise stays unavailable until `waldod`
+/// restarts, so repeating the action cannot succeed.
+fn unavailable_backend(backend: &str, error: &ProtocolError) -> ActionExecutionFailure {
+    ActionExecutionFailure::not_executed(ProtocolError {
+        code: ErrorCode::UnsupportedCapability,
+        message: initialisation_failed(backend, error),
+        retryable: false,
+    })
 }
 
 fn unsupported(message: &str) -> ActionExecutionFailure {
@@ -519,12 +531,16 @@ mod tests {
                 None,
                 std::sync::Arc::new(|| panic!("the injected keyboard needs no layout discovery")),
                 &settings,
-                None,
+                Err(ProtocolError {
+                    code: ErrorCode::BackendFailure,
+                    message: "the paste test needs no pointer".into(),
+                    retryable: false,
+                }),
                 Ok(TestKeyboard {
                     observed: observed.clone(),
                     refusal: failure.clone(),
                 }),
-                Some(TestClipboard),
+                Ok(TestClipboard),
             )
             .unwrap();
             let result = executor.execute(

@@ -319,14 +319,17 @@ pub(crate) fn enable_action_capabilities(
     capabilities: &mut Capabilities,
     executor: &dyn ActionExecutor,
 ) {
-    if executor.supports(waldo_protocol::ActionRoute::VirtualPointer)
-        && capabilities.virtual_pointer.version.is_some()
-    {
-        capabilities.virtual_pointer.available = true;
-        capabilities.virtual_pointer.limitation = Some(
-            "cross-output drag is refused before dispatch; ordinary cross-output motion is supported"
-                .into(),
-        );
+    if capabilities.virtual_pointer.version.is_some() {
+        if let Some(limitation) = executor.limitation(waldo_protocol::ActionRoute::VirtualPointer) {
+            capabilities.virtual_pointer.available = false;
+            capabilities.virtual_pointer.limitation = Some(limitation);
+        } else if executor.supports(waldo_protocol::ActionRoute::VirtualPointer) {
+            capabilities.virtual_pointer.available = true;
+            capabilities.virtual_pointer.limitation = Some(
+                "cross-output drag is refused before dispatch; ordinary cross-output motion is supported"
+                    .into(),
+            );
+        }
     }
     if capabilities.virtual_keyboard.version.is_some() {
         if let Some(limitation) = executor.limitation(waldo_protocol::ActionRoute::VirtualKeyboard)
@@ -338,13 +341,11 @@ pub(crate) fn enable_action_capabilities(
             capabilities.virtual_keyboard.limitation = None;
         }
     }
-    if executor.supports(waldo_protocol::ActionRoute::Clipboard)
-        && capabilities.clipboard.version.is_some()
-    {
+    if capabilities.clipboard.version.is_some() {
         if let Some(limitation) = executor.limitation(waldo_protocol::ActionRoute::Clipboard) {
             capabilities.clipboard.available = false;
             capabilities.clipboard.limitation = Some(limitation);
-        } else {
+        } else if executor.supports(waldo_protocol::ActionRoute::Clipboard) {
             capabilities.clipboard.available = true;
             capabilities.clipboard.limitation = None;
         }
@@ -660,6 +661,47 @@ mod tests {
         assert_eq!(
             capabilities.clipboard.limitation.as_deref(),
             Some("clipboard mutation blocked by unresolved restoration")
+        );
+    }
+
+    struct FailedBackends;
+
+    impl ActionExecutor for FailedBackends {
+        fn execute(
+            &self,
+            _action: &Action,
+            _cancellation: &ExecutionToken,
+        ) -> Result<ActionExecution, ActionExecutionFailure> {
+            unreachable!("capability test does not execute actions")
+        }
+
+        fn supports(&self, _route: ActionRoute) -> bool {
+            false
+        }
+
+        fn limitation(&self, route: ActionRoute) -> Option<String> {
+            matches!(route, ActionRoute::VirtualPointer | ActionRoute::Clipboard)
+                .then(|| format!("{route:?} initialisation failed: compositor went away"))
+        }
+    }
+
+    #[test]
+    fn query_names_why_an_advertised_backend_failed_to_initialise() {
+        let mut capabilities = Capabilities::unavailable();
+        capabilities.virtual_pointer.version = Some("runtime-discovered".into());
+        capabilities.clipboard.version = Some("runtime-discovered".into());
+
+        enable_action_capabilities(&mut capabilities, &FailedBackends);
+
+        assert!(!capabilities.virtual_pointer.available);
+        assert_eq!(
+            capabilities.virtual_pointer.limitation.as_deref(),
+            Some("VirtualPointer initialisation failed: compositor went away")
+        );
+        assert!(!capabilities.clipboard.available);
+        assert_eq!(
+            capabilities.clipboard.limitation.as_deref(),
+            Some("Clipboard initialisation failed: compositor went away")
         );
     }
 }
