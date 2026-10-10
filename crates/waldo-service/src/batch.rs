@@ -189,7 +189,7 @@ impl BatchActionExecutor {
             })
         })?;
         validate_grounding(
-            Some(&current_grounding),
+            &current_grounding,
             &snapshot.outputs,
             &snapshot.windows,
             &snapshot.workspaces,

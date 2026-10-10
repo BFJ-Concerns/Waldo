@@ -130,14 +130,7 @@ pub fn execute_batch(
     for (index, action) in actions.iter().enumerate() {
         if cancellation.is_cancelled() {
             first_not_executed = Some(index);
-            receipts.extend((index..actions.len()).map(|index| ActionReceipt {
-                index,
-                status: ReceiptStatus::NotExecuted,
-                route: None,
-                error: None,
-                predicate_result: None,
-                output: None,
-            }));
+            receipts.extend(unattempted_tail(index, actions.len()));
             break;
         }
         match executor.execute(action, cancellation) {
@@ -168,14 +161,7 @@ pub fn execute_batch(
                     error: Some(error),
                     output: None,
                 });
-                receipts.extend((index + 1..actions.len()).map(|index| ActionReceipt {
-                    index,
-                    status: ReceiptStatus::NotExecuted,
-                    route: None,
-                    error: None,
-                    predicate_result: None,
-                    output: None,
-                }));
+                receipts.extend(unattempted_tail(index + 1, actions.len()));
                 break;
             }
         }
@@ -237,7 +223,7 @@ impl GroundingFailure {
             Self::UnknownObservation => "the cited observation is no longer retained",
             Self::TargetLost => "an observed action target or destination is no longer available",
             Self::GeometryChanged => {
-                "the observed output geometry or coordinate transform has changed"
+                "the observed window's bounds or output, or its output's geometry or coordinate transform, have changed"
             }
             Self::FocusChanged => "foreground focus changed after the cited observation",
             Self::CrossOutputDragUnsupported => {
@@ -247,7 +233,7 @@ impl GroundingFailure {
                 "the action requires a cursor position, but the cited observation and preceding executed actions provide none"
             }
             Self::TargetOutsideObservation => {
-                "an absolute pointer target lies outside the pixels in the cited observation"
+                "a pointer position the action requires lies outside the pixels in the cited observation"
             }
         };
         ProtocolError {
@@ -258,16 +244,28 @@ impl GroundingFailure {
     }
 }
 
+/// Receipts for the actions from `from` onwards that a stopped batch never
+/// attempted.
+fn unattempted_tail(from: usize, len: usize) -> impl Iterator<Item = ActionReceipt> {
+    (from..len).map(|index| ActionReceipt {
+        index,
+        status: ReceiptStatus::NotExecuted,
+        route: None,
+        error: None,
+        predicate_result: None,
+        output: None,
+    })
+}
+
 /// Revalidates facts that can redirect an otherwise valid action.
 pub fn validate_grounding(
-    recorded: Option<&ObservationGrounding>,
+    recorded: &ObservationGrounding,
     outputs: &[OutputState],
     windows: &[WindowState],
     workspaces: &[WorkspaceState],
     focused_window: Option<&WindowId>,
     actions: &[Action],
 ) -> Result<(), GroundingFailure> {
-    let recorded = recorded.ok_or(GroundingFailure::UnknownObservation)?;
     let output = outputs
         .iter()
         .find(|output| output.id == recorded.output_id)
@@ -575,13 +573,41 @@ mod tests {
     }
 
     #[test]
-    fn missing_observations_and_outputs_fail_distinctly() {
-        assert_eq!(
-            validate_grounding(None, &[output()], &[], &[], None, &[]),
-            Err(GroundingFailure::UnknownObservation)
+    fn grounding_refusals_name_what_actually_changed() {
+        let geometry = GroundingFailure::GeometryChanged.protocol_error();
+        assert!(geometry.message.contains("window"), "{}", geometry.message);
+        assert!(geometry.message.contains("output"), "{}", geometry.message);
+        assert!(geometry.retryable);
+
+        let outside = GroundingFailure::TargetOutsideObservation.protocol_error();
+        assert!(
+            outside.message.contains("pointer position"),
+            "{}",
+            outside.message
         );
+        assert!(!outside.message.contains("absolute"), "{}", outside.message);
+        assert!(outside.retryable);
+    }
+
+    #[test]
+    fn the_unattempted_tail_covers_exactly_the_remaining_actions() {
+        let tail: Vec<_> = super::unattempted_tail(2, 5).collect();
         assert_eq!(
-            validate_grounding(Some(&grounding()), &[], &[], &[], None, &[]),
+            tail.iter().map(|receipt| receipt.index).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        assert!(tail.iter().all(|receipt| {
+            receipt.status == ReceiptStatus::NotExecuted
+                && receipt.route.is_none()
+                && receipt.error.is_none()
+        }));
+        assert_eq!(super::unattempted_tail(5, 5).count(), 0);
+    }
+
+    #[test]
+    fn a_missing_output_is_a_lost_target() {
+        assert_eq!(
+            validate_grounding(&grounding(), &[], &[], &[], None, &[]),
             Err(GroundingFailure::TargetLost)
         );
     }
@@ -592,14 +618,14 @@ mod tests {
         let mut moved = output();
         moved.logical_bounds.origin.x = 1920.0;
         assert_eq!(
-            validate_grounding(Some(&recorded), &[moved], &[], &[], None, &[]),
+            validate_grounding(&recorded, &[moved], &[], &[], None, &[]),
             Err(GroundingFailure::GeometryChanged)
         );
 
         let mut rescaled = output();
         rescaled.scale = 2.0;
         assert_eq!(
-            validate_grounding(Some(&recorded), &[rescaled], &[], &[], None, &[]),
+            validate_grounding(&recorded, &[rescaled], &[], &[], None, &[]),
             Err(GroundingFailure::GeometryChanged)
         );
     }
@@ -625,7 +651,7 @@ mod tests {
         };
 
         let failure = validate_grounding(
-            Some(&recorded),
+            &recorded,
             &[output(), second_output],
             &[],
             &[],
@@ -654,7 +680,7 @@ mod tests {
 
         assert_eq!(
             validate_grounding(
-                Some(&grounding()),
+                &grounding(),
                 &[output()],
                 &[],
                 &[],
@@ -674,7 +700,7 @@ mod tests {
 
         assert_eq!(
             validate_grounding(
-                Some(&grounding()),
+                &grounding(),
                 &[output()],
                 &[window("17")],
                 &[],
@@ -693,7 +719,7 @@ mod tests {
         };
 
         assert_eq!(
-            validate_grounding(Some(&grounding()), &[output()], &[], &[], None, &[action]),
+            validate_grounding(&grounding(), &[output()], &[], &[], None, &[action]),
             Err(GroundingFailure::TargetLost)
         );
     }
@@ -710,7 +736,7 @@ mod tests {
 
         assert_eq!(
             validate_grounding(
-                Some(&recorded),
+                &recorded,
                 &[output()],
                 &[current.clone()],
                 &[],
@@ -723,7 +749,7 @@ mod tests {
         current.logical_bounds.as_mut().unwrap().origin.x += 1.0;
         assert_eq!(
             validate_grounding(
-                Some(&recorded),
+                &recorded,
                 &[output()],
                 &[current],
                 &[],
@@ -743,7 +769,7 @@ mod tests {
 
         assert_eq!(
             validate_grounding(
-                Some(&grounding()),
+                &grounding(),
                 &[output()],
                 &[],
                 &[workspace("research")],
@@ -771,7 +797,7 @@ mod tests {
 
         assert_eq!(
             validate_grounding(
-                Some(&grounding()),
+                &grounding(),
                 &[output()],
                 &[window("17")],
                 &[workspace("research")],
@@ -782,7 +808,7 @@ mod tests {
         );
         assert_eq!(
             validate_grounding(
-                Some(&grounding()),
+                &grounding(),
                 &[output()],
                 &[window("17")],
                 &[workspace("research")],
@@ -881,7 +907,7 @@ mod tests {
 
         assert_eq!(
             validate_grounding(
-                Some(&grounding()),
+                &grounding(),
                 &[output()],
                 &[],
                 &[],
@@ -902,7 +928,7 @@ mod tests {
 
         assert_eq!(
             validate_grounding(
-                Some(&grounding()),
+                &grounding(),
                 &[output()],
                 &[],
                 &[],
@@ -926,7 +952,7 @@ mod tests {
 
         assert_eq!(
             validate_grounding(
-                Some(&grounding()),
+                &grounding(),
                 &[output()],
                 &[],
                 &[],
@@ -954,7 +980,7 @@ mod tests {
 
         assert_eq!(
             validate_grounding(
-                Some(&grounding()),
+                &grounding(),
                 &[output()],
                 &[],
                 &[],

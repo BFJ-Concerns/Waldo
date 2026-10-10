@@ -124,7 +124,7 @@ pub(crate) async fn act(
             .inspect(include_windows)
             .map_err(|error| ProtocolError::backend_failure(error.to_string(), true))?;
         validate_grounding(
-            Some(&validation_grounding),
+            &validation_grounding,
             &snapshot.outputs,
             &snapshot.windows,
             &snapshot.workspaces,
