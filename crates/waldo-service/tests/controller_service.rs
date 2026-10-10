@@ -2646,6 +2646,85 @@ async fn act_refuses_verification_it_cannot_measure_before_any_action() {
 }
 
 #[tokio::test]
+async fn a_pointer_path_waits_for_and_verifies_its_resulting_frame() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(SettlingFrameCapturer {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(RecordingPointerExecutor {
+            actions: Arc::new(Mutex::new(Vec::new())),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client =
+        ControllerClient::connect(&path, ClientId::new("pointer-path-frame-test").unwrap())
+            .await
+            .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let before = observation.image.data_base64;
+
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: vec![Action::PointerPath {
+                    points: vec![
+                        LogicalPoint { x: 10.0, y: 10.0 },
+                        LogicalPoint { x: 40.0, y: 30.0 },
+                    ],
+                    duration_ms: 0,
+                }],
+                verification: vec![Predicate::FrameChanged {
+                    from: observation.id,
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Acted { result, .. } = acted else {
+        panic!("action did not return a result")
+    };
+    assert_eq!(result.verification, vec![true], "{result:?}");
+    let settled = result.observation.unwrap();
+    assert_eq!(
+        result.completion_evidence.frame_state,
+        ApplicationFrameState::Settled
+    );
+    assert!(!result.completion_evidence.settle_deadline_reached);
+    assert_ne!(settled.image.data_base64, before);
+    assert!(settled.captured_at_unix_ms >= 4);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
 async fn act_waits_past_transient_changes_for_a_quiet_post_action_frame() {
     let path = test_socket();
     let service = ControllerService::bind_with_all_backends(

@@ -354,23 +354,33 @@ fn application_outcome(
     }
 }
 
+/// Whether an action drives the pointer, and so depends on visual
+/// coordinates and moves the cursor.
+fn is_pointer_action(action: &waldo_protocol::Action) -> bool {
+    matches!(
+        action,
+        waldo_protocol::Action::PointerMoveAbsolute { .. }
+            | waldo_protocol::Action::PointerMoveRelative { .. }
+            | waldo_protocol::Action::PointerButton { .. }
+            | waldo_protocol::Action::PointerClick { .. }
+            | waldo_protocol::Action::PointerDrag { .. }
+            | waldo_protocol::Action::PointerPath { .. }
+            | waldo_protocol::Action::Scroll { .. }
+    )
+}
+
 fn actions_expect_visual_change(actions: &[waldo_protocol::Action]) -> bool {
     actions.iter().any(|action| {
-        matches!(
-            action,
-            waldo_protocol::Action::PointerMoveAbsolute { .. }
-                | waldo_protocol::Action::PointerMoveRelative { .. }
-                | waldo_protocol::Action::PointerButton { .. }
-                | waldo_protocol::Action::PointerClick { .. }
-                | waldo_protocol::Action::PointerDrag { .. }
-                | waldo_protocol::Action::Scroll { .. }
-                | waldo_protocol::Action::Key { .. }
-                | waldo_protocol::Action::KeyChord { .. }
-                | waldo_protocol::Action::Text { .. }
-                | waldo_protocol::Action::Accessibility { .. }
-                | waldo_protocol::Action::Window { .. }
-                | waldo_protocol::Action::Workspace { .. }
-        )
+        is_pointer_action(action)
+            || matches!(
+                action,
+                waldo_protocol::Action::Key { .. }
+                    | waldo_protocol::Action::KeyChord { .. }
+                    | waldo_protocol::Action::Text { .. }
+                    | waldo_protocol::Action::Accessibility { .. }
+                    | waldo_protocol::Action::Window { .. }
+                    | waldo_protocol::Action::Workspace { .. }
+            )
     })
 }
 
@@ -426,18 +436,7 @@ fn validate_action_order(actions: &[waldo_protocol::Action]) -> Result<(), Proto
     for action in actions {
         if matches!(action, waldo_protocol::Action::Wait { .. }) {
             waited = true;
-        } else if waited
-            && matches!(
-                action,
-                waldo_protocol::Action::PointerMoveAbsolute { .. }
-                    | waldo_protocol::Action::PointerMoveRelative { .. }
-                    | waldo_protocol::Action::PointerButton { .. }
-                    | waldo_protocol::Action::PointerClick { .. }
-                    | waldo_protocol::Action::PointerDrag { .. }
-                    | waldo_protocol::Action::PointerPath { .. }
-                    | waldo_protocol::Action::Scroll { .. }
-            )
-        {
+        } else if waited && is_pointer_action(action) {
             return Err(ProtocolError {
                 code: ErrorCode::InvalidRequest,
                 message: "a pointer action cannot follow a wait in the same batch; observe again before replanning visual coordinates".into(),
