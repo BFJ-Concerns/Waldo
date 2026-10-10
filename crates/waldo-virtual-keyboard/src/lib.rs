@@ -23,6 +23,26 @@ use crate::{
     wayland::Device,
 };
 use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
+
+/// Longest text the virtual keyboard types in one action. Each character
+/// expands into key transitions planned before any is sent, so the bound
+/// keeps a large request from exhausting memory; the clipboard route has
+/// its own, larger limit.
+const MAX_TEXT_CHARACTERS: usize = 65_536;
+
+fn require_typeable_length(text: &str) -> Result<(), ProtocolError> {
+    let length = text.chars().count();
+    if length > MAX_TEXT_CHARACTERS {
+        return Err(ProtocolError {
+            code: ErrorCode::InvalidRequest,
+            message: format!(
+                "text of {length} characters exceeds the virtual keyboard's {MAX_TEXT_CHARACTERS}-character limit; paste longer text through the clipboard"
+            ),
+            retryable: false,
+        });
+    }
+    Ok(())
+}
 use waldo_controller::ExecutionToken;
 use waldo_protocol::{
     Action, ActionRoute, ErrorCode, InputState, ProtocolError, TextRoutePreference,
@@ -340,6 +360,7 @@ impl KeyboardState {
     }
 
     fn resolve_text(&self, text: &str) -> Result<Vec<KeySequence>, ProtocolError> {
+        require_typeable_length(text)?;
         let mut characters = text.chars().peekable();
         let mut sequences = Vec::with_capacity(text.chars().count());
         while let Some(mut character) = characters.next() {
@@ -468,5 +489,18 @@ fn invalid(message: impl Into<String>) -> ProtocolError {
         code: ErrorCode::InvalidRequest,
         message: message.into(),
         retryable: false,
+    }
+}
+
+#[cfg(test)]
+mod text_limit_tests {
+    use super::{MAX_TEXT_CHARACTERS, require_typeable_length};
+
+    #[test]
+    fn text_beyond_the_character_limit_is_refused_before_planning() {
+        assert!(require_typeable_length(&"é".repeat(MAX_TEXT_CHARACTERS)).is_ok());
+        let error = require_typeable_length(&"é".repeat(MAX_TEXT_CHARACTERS + 1)).unwrap_err();
+        assert_eq!(error.code, waldo_protocol::ErrorCode::InvalidRequest);
+        assert!(error.message.contains("clipboard"));
     }
 }

@@ -23,6 +23,16 @@ impl From<ActionRoute> for ActionExecution {
     }
 }
 
+/// The time stamp for a synthesised Wayland input event: milliseconds since
+/// the Unix epoch, wrapped to the protocols' 32 bits. The virtual pointer and
+/// keyboard share it so their events carry one clock.
+pub fn input_event_time_ms() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32
+}
+
 /// Backend seam beneath the controller-owned ordering and safety policy.
 pub trait ActionExecutor: Send + Sync {
     fn execute(

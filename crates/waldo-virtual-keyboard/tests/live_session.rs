@@ -1,6 +1,7 @@
 //! Pinned live test: inside a Niri session the compositor's own keymap is
 //! obtained, compiles, and a virtual keyboard initialises against it.
-//! Skips itself elsewhere and says so; a skip is not a pass.
+//! Elsewhere each test returns early, printing why, and the test runner then
+//! counts it as passed: a green run outside a Niri session exercised nothing.
 
 use std::sync::Arc;
 

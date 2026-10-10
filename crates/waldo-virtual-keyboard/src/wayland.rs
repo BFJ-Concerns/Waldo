@@ -130,9 +130,19 @@ impl Device {
             .flush()
             .map_err(|error| backend_failure(format!("flush Wayland connection: {error}"), true))?;
         if let Some(guard) = self.queue.prepare_read() {
-            // Nothing to read is the ordinary case; a real error surfaces
-            // on the dispatch below.
-            let _ = guard.read();
+            // Nothing to read is the ordinary case; any other failure means
+            // the connection is gone and the keyboard state is stale.
+            match guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    return Err(backend_failure(
+                        format!("read Wayland events: {error}"),
+                        true,
+                    ));
+                }
+            }
         }
         self.queue
             .dispatch_pending(&mut self.state)
@@ -142,7 +152,7 @@ impl Device {
 
     pub(crate) fn key(&self, keycode: u32, pressed: bool) {
         self.keyboard.key(
-            timestamp(),
+            waldo_action::input_event_time_ms(),
             keycode,
             if pressed { KEY_PRESSED } else { KEY_RELEASED },
         );
@@ -177,10 +187,20 @@ impl Drop for Device {
     }
 }
 
+/// Largest keymap accepted from the compositor. Real XKB keymaps are tens
+/// of kilobytes; the bound keeps a malformed size from exhausting memory.
+const MAX_KEYMAP_BYTES: u32 = 4 * 1024 * 1024;
+
 /// Reads the keymap the compositor shared. The descriptor may be a
 /// duplicate whose file offset is not at the start, so the read names its
 /// offset rather than trusting the shared position.
 fn read_keymap(fd: OwnedFd, size: u32) -> Result<String, ProtocolError> {
+    if size == 0 || size > MAX_KEYMAP_BYTES {
+        return Err(backend_failure(
+            format!("the compositor keymap size {size} is outside 1..={MAX_KEYMAP_BYTES} bytes"),
+            false,
+        ));
+    }
     let file = File::from(fd);
     let mut bytes = vec![0; size as usize];
     file.read_exact_at(&mut bytes, 0)
@@ -188,13 +208,6 @@ fn read_keymap(fd: OwnedFd, size: u32) -> Result<String, ProtocolError> {
     let text = String::from_utf8(bytes)
         .map_err(|_| backend_failure("the compositor keymap is not UTF-8", false))?;
     Ok(text.trim_end_matches('\0').to_owned())
-}
-
-fn timestamp() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u32
 }
 
 pub(crate) fn backend_failure(message: impl Into<String>, retryable: bool) -> ProtocolError {
@@ -278,5 +291,23 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for WaylandState {
         _connection: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_KEYMAP_BYTES, read_keymap};
+
+    #[test]
+    fn keymap_sizes_outside_the_bound_are_refused_before_reading() {
+        for size in [0, MAX_KEYMAP_BYTES + 1, u32::MAX] {
+            let file = std::fs::File::open("/dev/null").unwrap();
+            let error = read_keymap(file.into(), size).unwrap_err();
+            assert!(
+                error.message.contains("outside"),
+                "{size}: {}",
+                error.message
+            );
+        }
     }
 }

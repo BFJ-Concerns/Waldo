@@ -1,13 +1,8 @@
 //! Wayland virtual-pointer execution with held-button containment.
 
-use std::{
-    collections::BTreeSet,
-    sync::Mutex,
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeSet, sync::Mutex, thread, time::Duration};
 
-use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
+use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor, input_event_time_ms};
 use waldo_controller::ExecutionToken;
 use waldo_niri::NiriInspector;
 use waldo_protocol::{
@@ -166,7 +161,7 @@ impl PointerState {
         match prepared {
             PreparedAction::MoveAbsolute(point) => self.send_absolute(&point)?,
             PreparedAction::MoveRelative { x, y } => {
-                self.pointer.motion(timestamp(), x, y);
+                self.pointer.motion(input_event_time_ms(), x, y);
                 self.pointer.frame();
             }
             PreparedAction::Button { button, state } => self.button(button, state),
@@ -200,7 +195,7 @@ impl PointerState {
                 return Ok(());
             }
             PreparedAction::Scroll { x, y } => {
-                let time = timestamp();
+                let time = input_event_time_ms();
                 if x != 0.0 {
                     self.pointer.axis(time, Axis::HorizontalScroll, x);
                 }
@@ -261,8 +256,13 @@ impl PointerState {
 
     fn send_absolute(&mut self, point: &PreparedPoint) -> Result<(), ActionExecutionFailure> {
         self.select_output(&point.output)?;
-        self.pointer
-            .motion_absolute(timestamp(), point.x, point.y, point.width, point.height);
+        self.pointer.motion_absolute(
+            input_event_time_ms(),
+            point.x,
+            point.y,
+            point.width,
+            point.height,
+        );
         self.pointer.frame();
         Ok(())
     }
@@ -311,7 +311,8 @@ impl PointerState {
                 ButtonState::Released
             }
         };
-        self.pointer.button(timestamp(), code, wayland_state);
+        self.pointer
+            .button(input_event_time_ms(), code, wayland_state);
         self.pointer.frame();
     }
 
@@ -515,7 +516,7 @@ impl Drop for PointerState {
     fn drop(&mut self) {
         for button in std::mem::take(&mut self.held_buttons) {
             self.pointer
-                .button(timestamp(), button, ButtonState::Released);
+                .button(input_event_time_ms(), button, ButtonState::Released);
         }
         self.pointer.frame();
         self.pointer.destroy();
@@ -644,13 +645,6 @@ fn button_code(button: PointerButton) -> u32 {
         PointerButton::Back => BTN_SIDE,
         PointerButton::Forward => BTN_EXTRA,
     }
-}
-
-fn timestamp() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u32
 }
 
 fn sleep_cancellable(

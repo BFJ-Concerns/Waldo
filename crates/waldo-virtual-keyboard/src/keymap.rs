@@ -238,7 +238,9 @@ impl CompiledKeymap {
                     else {
                         continue;
                     };
-                    for keysym in keysyms {
+                    // A level producing several symbols types all of them at
+                    // once, so it is not a way to type any one character.
+                    if let [keysym] = keysyms {
                         table.sequences.entry(keysym.raw()).or_insert_with(|| {
                             vec![KeyStroke {
                                 keycode: evdev,
@@ -462,6 +464,26 @@ pub(crate) mod tests {
 
     fn keymap_de() -> CompiledKeymap {
         keymap("de")
+    }
+
+    #[test]
+    fn a_level_typing_several_symbols_is_no_way_to_type_one_of_them() {
+        let us = keymap("us");
+        let start = us
+            .text
+            .find("key <AC01>")
+            .expect("the us keymap has <AC01>");
+        let end = start + us.text[start..].find("};").unwrap() + 2;
+        let text = format!(
+            "{}key <AC01> {{ [ {{ a, b }} ] }};{}",
+            &us.text[..start],
+            &us.text[end..]
+        );
+        let edited = CompiledKeymap::compile(&text).unwrap();
+
+        // <AC01> now types "ab" in one stroke; 'a' has no other key.
+        assert_eq!(sequence(&edited, 0, 'a'), None);
+        assert!(sequence(&edited, 0, 'b').is_some());
     }
 
     #[test]
