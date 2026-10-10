@@ -33,9 +33,9 @@ OBSERVE_TOOL = "mcp__plugin_waldo_waldo__observe"
 QUERY_TOOL = "mcp__plugin_waldo_waldo__query"
 
 
-def init_event(plugin_source, plugin_path, server_status="connected"):
+def init_event(plugin_source, plugin_path, server_status="connected", version="0.1.0"):
     return {"type": "system", "subtype": "init",
-            "plugins": [{"name": "waldo", "source": plugin_source, "path": plugin_path, "version": "0.1.0"}],
+            "plugins": [{"name": "waldo", "source": plugin_source, "path": plugin_path, "version": version}],
             "mcp_servers": [{"name": "plugin:waldo:waldo", "status": server_status, "source": "plugin"}],
             "tools": [QUERY_TOOL, OBSERVE_TOOL]}
 
@@ -135,11 +135,26 @@ class InstallerTests(unittest.TestCase):
         transcript.write_text("".join(json.dumps(event) + "\n" for event in events))
         return transcript
 
-    def claude_summary(self, transcript, plugin_source="waldo@personal"):
+    def candidate_plugin(self, name="candidate"):
+        candidate = self.root / name
+        for file, content in {
+            ".claude-plugin/plugin.json": '{"name":"waldo","version":"0.1.0"}',
+            ".codex-plugin/plugin.json": '{"name":"waldo","version":"0.1.0+codex.20261010120000"}',
+            ".mcp.json": '{"mcpServers":{"waldo":{"command":"/candidate/waldo-mcp"}}}',
+            ".mcp.claude.json": '{"mcpServers":{"waldo":{"command":"/candidate/waldo-mcp"}}}',
+            "skills/desktop-control/SKILL.md": "Candidate guidance.\n",
+        }.items():
+            path = candidate / file
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        return candidate
+
+    def claude_summary(self, transcript, plugin_source="waldo@personal", candidate=None):
         """The summary the installer derives from a transcript, and whether it
         counts as proof."""
         output = self.successful_steps(
-            f'summary="$(summarise_claude_turn {shlex.quote(str(transcript))} {shlex.quote(plugin_source)})"\n'
+            f'summary="$(summarise_claude_turn {shlex.quote(str(transcript))} {shlex.quote(plugin_source)} '
+            f'{shlex.quote(str(candidate or self.root / "candidate"))})"\n'
             'printf "%s\\n" "$summary"\n'
             'if claude_turn_proves "$summary"; then echo proves; else echo refuses; fi')
         summary_text, verdict = output.rsplit("\n", 2)[:2]
@@ -268,13 +283,15 @@ class InstallerTests(unittest.TestCase):
         marketplace = self.root / "plugins/.claude-plugin/marketplace.json"
         marketplace.parent.mkdir(parents=True)
         marketplace.write_text("{not json")
-        result = self.steps('resolve_installation\n'
-                            'if write_claude_marketplace; then echo wrote; else echo refused; fi',
-                            WALDO_PLUGIN_HOME=str(self.root / "plugins/waldo"))
+        result = self.steps(
+            f'claude_marketplace={shlex.quote(str(marketplace))}\n'
+            'marketplace_owner=Operator\nclaude_marketplace_name=waldo\n'
+            f'plugin_home={shlex.quote(str(self.root / "plugins/waldo"))}\n'
+            'if write_claude_marketplace; then echo wrote; else echo refused; fi')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "refused")
         self.assertEqual(marketplace.read_text(), "{not json")
-        self.assertEqual(sorted(path.name for path in self.root.iterdir() if path.name.startswith("tmp")), [])
+        self.assertEqual(list(marketplace.parent.glob(".waldo-marketplace.*")), [])
 
     def test_claude_marketplace_is_created_beside_the_plugin_home(self):
         plugin_home = self.root / "elsewhere/waldo-candidate"
@@ -344,7 +361,10 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue((plugin_home / "skills/desktop-control/SKILL.md").is_file())
 
     def test_claude_turn_proof_needs_an_observe_result_with_a_delivered_image(self):
-        events = [init_event("waldo@personal", "/home/operator/plugins/waldo"),
+        candidate = self.candidate_plugin()
+        loaded = self.root / "cached-candidate"
+        shutil.copytree(candidate, loaded)
+        events = [init_event("waldo@personal", str(loaded)),
                   tool_use("q1", QUERY_TOOL),
                   tool_result("q1", [{"type": "text", "text": "{\"type\":\"queried\"}"}]),
                   tool_use("o1", OBSERVE_TOOL),
@@ -353,7 +373,8 @@ class InstallerTests(unittest.TestCase):
         summary, proves = self.claude_summary(self.write_transcript("proof.jsonl", events))
         self.assertTrue(proves, summary)
         self.assertEqual(summary, {"plugin_source": "waldo@personal", "plugins_loaded": 1,
-                                   "plugin_paths": ["/home/operator/plugins/waldo"], "servers_connected": 1,
+                                   "plugin_paths": [str(loaded)], "plugin_versions": ["0.1.0"],
+                                   "candidate_matches": True, "servers_connected": 1,
                                    "observe_calls": 1, "image_results": 1, "mutating_calls": 0,
                                    "completion_markers": 1})
 
@@ -361,7 +382,8 @@ class InstallerTests(unittest.TestCase):
         # The model's words are never the proof: a turn that claims success
         # with no Observe tool result, or with one carrying no image, or with
         # the plugin loaded from somewhere else, is refused.
-        loaded = init_event("waldo@personal", "/home/operator/plugins/waldo")
+        candidate = self.candidate_plugin()
+        loaded = init_event("waldo@personal", str(candidate))
         cases = {
             "no observe call": [loaded, result_event("MCP_IMAGE_PROOF_OK")],
             "observe result without an image": [
@@ -387,6 +409,145 @@ class InstallerTests(unittest.TestCase):
             with self.subTest(case=name):
                 summary, proves = self.claude_summary(self.write_transcript("refused.jsonl", events))
                 self.assertFalse(proves, summary)
+
+    def codex_proof_steps(self, candidate, cache_home, auth_source=None):
+        proof = self.root / "proof"
+        (proof / "cwd").mkdir(parents=True, exist_ok=True)
+        transcript = self.write_transcript("codex-events.jsonl", [
+            {"type": "item.completed", "item": {"type": "mcp_tool_call", "server": "waldo",
+                "tool": "observe", "result": {"content": [
+                    {"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo="}],
+                    "structuredContent": observation(True)}}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "MCP_IMAGE_PROOF_OK"}},
+        ])
+        script = (
+            'resolve_installation\n'
+            f'proof_dir={shlex.quote(str(proof))}\n'
+            'run_codex() { if [[ "$2" == plugin ]]; then return 0; fi; '
+            f'cat {shlex.quote(str(transcript))}; }}\n'
+            'if codex_registration_and_proof; then verdict=proved; else verdict=refused; fi\n'
+            'printf "%s\n%s\n%s\n" "$verdict" "$installed_codex_manifest" "$codex_diagnostic"'
+        )
+        return self.steps(script, WALDO_INSTALL_ROOT=str(self.root / "install"),
+                          WALDO_PLUGIN_HOME=str(candidate), WALDO_CODEX_HOME=str(cache_home),
+                          WALDO_CODEX_AUTH_SOURCE=str(auth_source or self.root / "auth.json"))
+
+    def codex_cache(self, candidate, label="codex"):
+        cache_home = self.root / label
+        cache_home.mkdir()
+        version = json.loads((candidate / ".codex-plugin/plugin.json").read_text())["version"]
+        selected = cache_home / "plugins/cache/waldo/waldo" / version
+        shutil.copytree(candidate, selected)
+        (self.root / "auth.json").write_text('{"login":"fixture"}')
+        return cache_home, selected
+
+    def test_relative_codex_auth_source_links_to_the_validated_file(self):
+        candidate = self.candidate_plugin()
+        cache_home, _ = self.codex_cache(candidate)
+        # Relative to the installer invocation, not to the redirected home.
+        source = os.path.relpath(self.root / "auth.json", REPO)
+        result = self.codex_proof_steps(candidate, cache_home, source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "proved", result.stdout)
+        link = cache_home / "auth.json"
+        self.assertTrue(link.is_file(), f"validated login became a dangling link: {link.readlink()}")
+        self.assertTrue(link.readlink().is_absolute(), link.readlink())
+        self.assertEqual(link.read_bytes(), (self.root / "auth.json").read_bytes())
+
+    def test_codex_cache_selects_the_candidate_even_when_it_sorts_first(self):
+        candidate = self.candidate_plugin()
+        cache_home, selected = self.codex_cache(candidate)
+        stale = selected.parent / "0.1.0"
+        shutil.copytree(candidate, stale)
+        (stale / ".codex-plugin/plugin.json").write_text('{"name":"waldo","version":"0.1.0"}')
+        result = self.codex_proof_steps(candidate, cache_home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "proved", result.stdout)
+        self.assertEqual(Path(result.stdout.splitlines()[1]), selected / ".codex-plugin/plugin.json")
+
+    def test_codex_cache_refuses_missing_or_altered_candidate(self):
+        for change in ("missing", "altered"):
+            with self.subTest(change=change):
+                candidate = self.candidate_plugin()
+                cache_home, selected = self.codex_cache(candidate, f"codex-{change}")
+                manifest = selected / ".codex-plugin/plugin.json"
+                if change == "missing":
+                    manifest.unlink()
+                else:
+                    manifest.write_text('{"name":"waldo","version":"0.1.0"}')
+                result = self.codex_proof_steps(candidate, cache_home)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[0], "refused", result.stdout)
+                self.assertTrue(result.stdout.splitlines()[2], result.stdout)
+                shutil.rmtree(cache_home)
+
+    def test_claude_proof_refuses_stale_version_or_candidate_bytes(self):
+        candidate = self.candidate_plugin()
+        for change in ("version", ".claude-plugin/plugin.json", ".mcp.claude.json", ".mcp.json",
+                       "skills/desktop-control/SKILL.md", "missing path"):
+            with self.subTest(change=change):
+                loaded = self.root / ("loaded-" + change.replace("/", "-"))
+                shutil.copytree(candidate, loaded)
+                if change not in ("version", "missing path"):
+                    (loaded / change).write_text("stale bytes")
+                events = [init_event("waldo@personal", str(loaded),
+                                     version="0.0.1" if change == "version" else "0.1.0"),
+                          tool_use("o1", OBSERVE_TOOL),
+                          tool_result("o1", [image_block()], observation(True)),
+                          result_event("MCP_IMAGE_PROOF_OK")]
+                if change == "missing path":
+                    shutil.rmtree(loaded)
+                summary, proves = self.claude_summary(self.write_transcript("stale.jsonl", events))
+                self.assertFalse(proves, summary)
+                if loaded.exists():
+                    shutil.rmtree(loaded)
+
+    def test_corrupt_marketplace_is_refused_during_resolution(self):
+        for agent in ("claude", "codex"):
+            with self.subTest(agent=agent):
+                plugin_home = self.root / agent / "plugins/waldo"
+                codex_manifest = self.root / agent / "marketplace.json"
+                manifest = (plugin_home.parent / ".claude-plugin/marketplace.json" if agent == "claude"
+                            else codex_manifest)
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text("{not json")
+                result = self.steps('if resolve_installation; then echo resolved; else echo refused; fi',
+                                    WALDO_PLUGIN_HOME=str(plugin_home),
+                                    WALDO_MARKETPLACE=str(codex_manifest))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "refused")
+                self.assertIn("Could not read marketplace manifest", result.stderr)
+                self.assertIn(str(manifest), result.stderr)
+                self.assertEqual(manifest.read_text(), "{not json")
+                manifest.unlink()
+
+    def test_interrupted_marketplace_write_leaves_original_bytes(self):
+        manifest = self.root / "marketplace.json"
+        original = '{"name":"shared","plugins":[{"name":"sentinel","source":"./sentinel"}]}\n'
+        manifest.write_text(original)
+        stubs = self.root / "write-failure"
+        stubs.mkdir()
+        # Interrupt a destination write through the OS file-size limit. A
+        # rename is interrupted before it starts; no stub invents damage.
+        install = stubs / "install"
+        install.write_text(
+            '#!/usr/bin/env python3\nimport os, resource, sys\n'
+            f'if sys.argv[-1] == {str(manifest)!r}:\n'
+            '    resource.setrlimit(resource.RLIMIT_FSIZE, (10, 10))\n'
+            f'os.execv({shutil.which("install")!r}, ["install", *sys.argv[1:]])\n')
+        install.chmod(0o755)
+        move = stubs / "mv"
+        move.write_text('#!/bin/sh\nkill -TERM "$PPID"\nexit 1\n')
+        move.chmod(0o755)
+        result = self.steps('resolve_installation\nwrite_codex_marketplace',
+                            WALDO_MARKETPLACE=str(manifest), PATH=f"{stubs}:{self.env['PATH']}")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(manifest.read_text(), original)
+        temporary = list(manifest.parent.glob(".waldo-marketplace.*"))
+        self.assertEqual(len(temporary), 1)
+        merged = json.loads(temporary[0].read_text())
+        self.assertEqual(merged["plugins"][0], {"name": "sentinel", "source": "./sentinel"})
+        self.assertEqual(merged["plugins"][1]["name"], "waldo")
 
     @unittest.skipUnless(SESSION, "needs the Niri session to answer the readiness query")
     def test_readiness_queries_real_controller_via_environment_and_settings_file(self):

@@ -39,6 +39,9 @@ skill's JSON examples to the schema.
   consequential action.
 - **Stop's scope.** Stop overtakes Act on the same connection and releases the
   lease and any held input. It does not close applications or remove files.
+  A batch's `cancelled` result reports cancellation without identifying who
+  caused it. When the operator asks for control, stop and wait for them to
+  hand it back.
 - **Ownership of launched processes.** When an agent launches an application
   for its task, it records the exact process handles, process groups and paths
   at launch and cleans up only those on completion, abandonment or failure.

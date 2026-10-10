@@ -80,14 +80,17 @@ resolve_installation() {
     claude_marketplace="$claude_marketplace_root/.claude-plugin/marketplace.json"
     # A marketplace that already exists keeps its own name, which is the
     # name its plugins are installed under.
-    claude_marketplace_name="$(existing_marketplace_name "$claude_marketplace")"
-    codex_marketplace_name="$(existing_marketplace_name "$marketplace")"
+    claude_marketplace_name="$(existing_marketplace_name "$claude_marketplace")" || return 1
+    codex_marketplace_name="$(existing_marketplace_name "$marketplace")" || return 1
 }
 
 existing_marketplace_name() {
     local name=""
     if [[ -f "$1" ]]; then
-        name="$(jq -r '.name | strings' "$1" 2>/dev/null)" || name=""
+        name="$(jq -r '.name | strings' "$1")" || {
+            printf 'Could not read marketplace manifest: %s\n' "$1" >&2
+            return 1
+        }
     fi
     printf '%s\n' "${name:-$marketplace_name}"
 }
@@ -212,7 +215,7 @@ write_marketplace() {
     local manifest="$1" entry="$2" name="$3" extra_filter="${4:-.}"
     local manifest_tmp filter
     install -d -m 0755 "$(dirname -- "$manifest")" || return 1
-    manifest_tmp="$(mktemp)" || return 1
+    manifest_tmp="$(mktemp "$(dirname -- "$manifest")/.waldo-marketplace.XXXXXX")" || return 1
     filter='(if $created then .name = $name | .owner = {"name": $owner} else .name //= $name end)
         | .plugins = ((.plugins // []) | map(select(.name != "waldo")) + [$entry])
         | '"$extra_filter"
@@ -226,7 +229,11 @@ write_marketplace() {
         rm -f -- "$manifest_tmp"
         return 1
     }
-    install -m 0644 "$manifest_tmp" "$manifest" || {
+    chmod 0644 "$manifest_tmp" || {
+        rm -f -- "$manifest_tmp"
+        return 1
+    }
+    mv -f -- "$manifest_tmp" "$manifest" || {
         rm -f -- "$manifest_tmp"
         return 1
     }
@@ -297,10 +304,11 @@ proof_prompt='Query Waldo to choose one available output, call Waldo Observe exa
 # mcp__plugin_<plugin>_<server>__<tool>, and each tool result is a user event
 # whose tool_use_result carries the content blocks and structured content.
 # $2 names the plugin source the turn must have loaded: waldo@<marketplace>
-# for a registered plugin, waldo@inline for a --plugin-dir load.
+# for a registered plugin, waldo@inline for a --plugin-dir load. The optional
+# $3 is the candidate root; its version and bytes must match the reported path.
 summarise_claude_turn() {
-    local transcript="$1" plugin_source="$2"
-    jq -s --arg plugin_source "$plugin_source" '
+    local transcript="$1" plugin_source="$2" candidate="${3:-$plugin_home}" summary
+    summary="$(jq -s --arg plugin_source "$plugin_source" '
         . as $events
         | [$events[] | select(.type == "system" and .subtype == "init")] as $inits
         | [$events[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use")] as $tool_uses
@@ -324,6 +332,7 @@ summarise_claude_turn() {
             plugin_source: $plugin_source,
             plugins_loaded: ([$inits[].plugins[]? | select(.name == "waldo" and .source == $plugin_source)] | length),
             plugin_paths: [$inits[].plugins[]? | select(.name == "waldo" and .source == $plugin_source) | .path],
+            plugin_versions: [$inits[].plugins[]? | select(.name == "waldo" and .source == $plugin_source) | .version],
             servers_connected: ([$inits[].mcp_servers[]? | select(.name == "plugin:waldo:waldo" and .status == "connected")] | length),
             observe_calls: ($observe_ids | length),
             image_results: ($image_results | length),
@@ -331,12 +340,30 @@ summarise_claude_turn() {
                 | select(.name == "mcp__plugin_waldo_waldo__act" or .name == "mcp__plugin_waldo_waldo__stop")] | length),
             completion_markers: ([$events[]
                 | select(.type == "result" and ((.result // "") | contains("MCP_IMAGE_PROOF_OK")))] | length)
-        }' "$transcript"
+        }' "$transcript")" || return 1
+    local candidate_version loaded_root matches=false file
+    candidate_version="$(jq -er '.version | strings | select(length > 0)' \
+        "$candidate/.claude-plugin/plugin.json")" || return 1
+    if jq -e --arg version "$candidate_version" '
+        .plugins_loaded == 1 and .plugin_versions == [$version]
+        and (.plugin_paths[0] | type == "string" and startswith("/"))
+    ' <<<"$summary" >/dev/null; then
+        loaded_root="$(jq -r '.plugin_paths[0]' <<<"$summary")" || return 1
+        matches=true
+        for file in .claude-plugin/plugin.json .mcp.claude.json .mcp.json skills/desktop-control/SKILL.md; do
+            if ! cmp -s -- "$candidate/$file" "$loaded_root/$file"; then
+                matches=false
+                break
+            fi
+        done
+    fi
+    jq --argjson matches "$matches" '. + {candidate_matches: $matches}' <<<"$summary" || return 1
 }
 
 claude_turn_proves() {
     jq -e '
         .plugins_loaded == 1
+        and .candidate_matches == true
         and .servers_connected == 1
         and .observe_calls == 1
         and .image_results == 1
@@ -397,6 +424,86 @@ codex_turn_proves() {
         and .mutating_calls == 0
         and .completion_markers >= 1
     ' <<<"$1" >/dev/null
+}
+
+# Best-effort: a failure here is recorded in the environment file and
+# reported, never fatal. Every step names its own diagnostic, because a
+# function called under `if` runs with errexit suspended.
+codex_registration_and_proof() {
+    codex_diagnostic=""
+    codex_summary="null"
+    installed_codex_manifest=""
+    if [[ "$install_mode" == redirected ]]; then
+        local auth_source="${WALDO_CODEX_AUTH_SOURCE:-$operator_codex_home/auth.json}"
+        if [[ ! -f "$auth_source" ]]; then
+            codex_diagnostic="redirected Codex proof needs an existing Codex login at $auth_source"
+            return 1
+        fi
+        auth_source="$(realpath -e -- "$auth_source")" || {
+            codex_diagnostic="could not resolve the Codex login path $auth_source"
+            return 1
+        }
+        local auth_candidate="$codex_home/auth.json"
+        if [[ -e "$auth_candidate" || -L "$auth_candidate" ]]; then
+            codex_diagnostic="refusing to replace existing redirected Codex authentication at $auth_candidate"
+            return 1
+        fi
+        ln -s -- "$auth_source" "$auth_candidate" || {
+            codex_diagnostic="could not link the Codex login into $codex_home"
+            return 1
+        }
+        # Cleanup removes only a link this run created.
+        auth_link="$auth_candidate"
+    fi
+    write_codex_marketplace || {
+        codex_diagnostic="could not write the Codex marketplace $marketplace"
+        return 1
+    }
+    run_codex codex plugin add "waldo@$codex_marketplace_name" || {
+        codex_diagnostic="codex plugin add waldo@$codex_marketplace_name failed"
+        return 1
+    }
+    local candidate_version
+    candidate_version="$(jq -er '.version | strings | select(length > 0 and (contains("/") | not))' \
+        "$plugin_home/.codex-plugin/plugin.json")" || {
+        codex_diagnostic="could not read the candidate Codex plugin version"
+        return 1
+    }
+    installed_codex_manifest="$codex_home/plugins/cache/$codex_marketplace_name/waldo/$candidate_version/.codex-plugin/plugin.json"
+    cmp -s -- "$plugin_home/.codex-plugin/plugin.json" "$installed_codex_manifest" || {
+        codex_diagnostic="installed Codex plugin manifest does not match the candidate version $candidate_version"
+        return 1
+    }
+    local installed_root
+    installed_root="$(dirname -- "$(dirname -- "$installed_codex_manifest")")" || {
+        codex_diagnostic="could not resolve the installed Codex plugin root"
+        return 1
+    }
+    cmp -s "$plugin_home/.mcp.json" "$installed_root/.mcp.json" || {
+        codex_diagnostic="installed Codex MCP manifest bytes do not match the candidate plugin"
+        return 1
+    }
+    local transcript="$proof_dir/codex.jsonl"
+    run_codex codex exec \
+        --json \
+        --ephemeral \
+        --sandbox read-only \
+        --cd "$proof_dir/cwd" \
+        --skip-git-repo-check \
+        "$proof_prompt" </dev/null >"$transcript" || {
+        codex_diagnostic="codex exec failed"
+        return 1
+    }
+    local summary
+    summary="$(summarise_codex_turn "$transcript")" || {
+        codex_diagnostic="Codex transcript could not be summarised"
+        return 1
+    }
+    codex_summary="$summary"
+    codex_turn_proves "$codex_summary" || {
+        codex_diagnostic="Codex did not prove plugin loading and one structured MCP image"
+        return 1
+    }
 }
 
 # Installation entry point. Sourcing exposes only the steps above.
@@ -629,78 +736,6 @@ if ! claude_turn_proves "$claude_summary"; then
         "$claude_summary" >&2
     exit 1
 fi
-
-# Best-effort: a failure here is recorded in the environment file and
-# reported, never fatal. Every step names its own diagnostic, because a
-# function called under `if` runs with errexit suspended.
-codex_registration_and_proof() {
-    codex_diagnostic=""
-    codex_summary="null"
-    installed_codex_manifest=""
-    if [[ "$install_mode" == redirected ]]; then
-        local auth_source="${WALDO_CODEX_AUTH_SOURCE:-$operator_codex_home/auth.json}"
-        if [[ ! -f "$auth_source" ]]; then
-            codex_diagnostic="redirected Codex proof needs an existing Codex login at $auth_source"
-            return 1
-        fi
-        local auth_candidate="$codex_home/auth.json"
-        if [[ -e "$auth_candidate" || -L "$auth_candidate" ]]; then
-            codex_diagnostic="refusing to replace existing redirected Codex authentication at $auth_candidate"
-            return 1
-        fi
-        ln -s -- "$auth_source" "$auth_candidate" || {
-            codex_diagnostic="could not link the Codex login into $codex_home"
-            return 1
-        }
-        # Cleanup removes only a link this run created.
-        auth_link="$auth_candidate"
-    fi
-    write_codex_marketplace || {
-        codex_diagnostic="could not write the Codex marketplace $marketplace"
-        return 1
-    }
-    run_codex codex plugin add "waldo@$codex_marketplace_name" || {
-        codex_diagnostic="codex plugin add waldo@$codex_marketplace_name failed"
-        return 1
-    }
-    local manifests
-    mapfile -t manifests < <(
-        find "$codex_home/plugins/cache/$codex_marketplace_name/waldo" -path '*/.codex-plugin/plugin.json' 2>/dev/null \
-            | sort
-    )
-    if [[ ${#manifests[@]} -eq 0 ]]; then
-        codex_diagnostic="Codex installed no waldo plugin beneath $codex_home/plugins/cache/$codex_marketplace_name/waldo"
-        return 1
-    fi
-    installed_codex_manifest="${manifests[${#manifests[@]}-1]}"
-    local installed_root
-    installed_root="$(dirname -- "$(dirname -- "$installed_codex_manifest")")"
-    cmp -s "$plugin_home/.mcp.json" "$installed_root/.mcp.json" || {
-        codex_diagnostic="installed Codex MCP manifest bytes do not match the candidate plugin"
-        return 1
-    }
-    local transcript="$proof_dir/codex.jsonl"
-    run_codex codex exec \
-        --json \
-        --ephemeral \
-        --sandbox read-only \
-        --cd "$proof_dir/cwd" \
-        --skip-git-repo-check \
-        "$proof_prompt" </dev/null >"$transcript" || {
-        codex_diagnostic="codex exec failed"
-        return 1
-    }
-    local summary
-    summary="$(summarise_codex_turn "$transcript")" || {
-        codex_diagnostic="Codex transcript could not be summarised"
-        return 1
-    }
-    codex_summary="$summary"
-    codex_turn_proves "$codex_summary" || {
-        codex_diagnostic="Codex did not prove plugin loading and one structured MCP image"
-        return 1
-    }
-}
 
 failure_stage="best-effort Codex registration and proof"
 codex_record='{"present": false}'

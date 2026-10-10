@@ -20,9 +20,10 @@ built-in tools removed, Waldo's read-only `query` and `observe` tools
 pre-approved and permission prompts turned off, so any other tool call is
 denied unless your own Claude Code settings (permission rules, hooks or
 permission mode) allow it. It passes only when the transcript shows the
-plugin loaded from the marketplace, its MCP server connected, and an Observe
-result carrying an image; the model's reply must also report completion, but
-is never taken as evidence of loading or image delivery. Nothing is recorded
+candidate plugin loaded from the marketplace, its reported version and
+manifest and skill bytes match the candidate, its MCP server connected, and
+an Observe result carries an image. The model's reply must also report
+completion, but is never taken as evidence of loading or image delivery. Nothing is recorded
 as installed without that proof. This turn sends a real screenshot of one of
 your outputs to Claude, so clear anything sensitive from the screen before
 you run the installer.
@@ -36,7 +37,10 @@ unless you configured another; add it to your `PATH` or use the full path):
 waldo query --include-windows
 ```
 
-Run `./install-local` again to upgrade after pulling new changes.
+Run `./install-local` again to upgrade after pulling new changes. Existing
+marketplace manifests must be readable JSON or the install stops with a
+diagnostic. Marketplace updates preserve other plugins' entries and replace
+the manifest atomically.
 
 ## Rehearsal installs
 
@@ -54,11 +58,13 @@ it names your live controller's socket.
 Codex support is best-effort. When `codex` is on `PATH`, the installer also
 registers the plugin in Codex's marketplace and proves it with its own turn:
 `codex exec` in a read-only sandbox must return an Observe result carrying an
-image, and the MCP manifest in the plugin Codex installed must match the
-candidate's. A Codex failure is reported and recorded under
-`installation.agents.codex` in the environment file but never fails the
+image. The installed plugin must have the candidate's exact version and
+matching plugin and MCP manifest bytes. A Codex failure is reported and
+recorded under `installation.agents.codex` in the environment file but never fails the
 installation; when Codex is absent, it is recorded as `{"present": false}`. A
-rehearsal links your existing Codex login into a private Codex home.
+rehearsal links your existing Codex login into a private Codex home. A relative
+`WALDO_CODEX_AUTH_SOURCE` is resolved from the installer's invocation directory
+to an absolute path before linking.
 
 The installer's own settings are listed under
 [Installer settings](configuration.md#installer-settings).

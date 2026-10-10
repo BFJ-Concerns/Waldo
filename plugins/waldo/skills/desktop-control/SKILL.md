@@ -180,8 +180,9 @@ already authorised — so the approval can be obtained before that step runs.
 - Agents sharing one desktop serialise driving; there is one driver at a time.
   When Query shows another client holding the lease, or an Act fails with
   `lease_held`, wait and re-query or hand back to the operator rather than
-  retrying in a loop. A batch stopped with `user_preempted` means the operator
-  has taken over: do not resume until they hand control back.
+  retrying in a loop. A batch stopped with `cancelled` reports cancellation,
+  not who caused it; when the operator asks for control, stop and wait until
+  they hand it back.
 
 ## Applications you launch
 
