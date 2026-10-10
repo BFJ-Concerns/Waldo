@@ -145,8 +145,9 @@ impl AccessibilitySummary {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct IdentityEvidence {
-    waldo_commit: String,
-    verifier_commit: String,
+    /// The commit checked out where the verifier ran. The binaries under
+    /// test are identified by their own digests, not by this commit.
+    checkout_commit: String,
     seed: u64,
     binaries: Vec<FileIdentity>,
     fixture: FileIdentity,
@@ -594,8 +595,7 @@ impl RuntimeHarness {
         let mcp = McpClient::start(&options.mcp, &runtime)?;
         let current_exe = std::env::current_exe()?;
         let identity = IdentityEvidence {
-            waldo_commit: git_ref("main")?,
-            verifier_commit: git_ref("HEAD")?,
+            checkout_commit: git_ref("HEAD")?,
             seed: options.seed,
             binaries: vec![
                 file_identity(&options.waldod)?,
