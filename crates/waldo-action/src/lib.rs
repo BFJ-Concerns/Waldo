@@ -216,18 +216,6 @@ impl GroundingFailure {
         }
     }
 
-    pub const fn stop_reason(self) -> StopReason {
-        match self {
-            Self::UnknownObservation => StopReason::StaleObservation,
-            Self::TargetLost => StopReason::TargetLost,
-            Self::GeometryChanged => StopReason::GeometryChanged,
-            Self::FocusChanged => StopReason::FocusChanged,
-            Self::CrossOutputDragUnsupported => StopReason::ExecutionFailed,
-            Self::MissingCursorGrounding => StopReason::ExecutionFailed,
-            Self::TargetOutsideObservation => StopReason::ExecutionFailed,
-        }
-    }
-
     pub fn protocol_error(self) -> ProtocolError {
         let message = match self {
             Self::UnknownObservation => "the cited observation is no longer retained",
@@ -355,13 +343,11 @@ fn pointer_targets_within(
                 if !point_within(*position, bounds) {
                     return Err(GroundingFailure::TargetOutsideObservation);
                 }
-                cursor = Some(*position);
             }
             Action::PointerDrag { from, to, .. } => {
                 if !point_within(*from, bounds) || !point_within(*to, bounds) {
                     return Err(GroundingFailure::TargetOutsideObservation);
                 }
-                cursor = Some(*to);
             }
             Action::PointerPath { points, .. } => {
                 if !points
@@ -371,20 +357,14 @@ fn pointer_targets_within(
                 {
                     return Err(GroundingFailure::TargetOutsideObservation);
                 }
-                cursor = points.last().copied().or(cursor);
             }
-            Action::PointerMoveRelative { delta } => {
-                let Some(current) = cursor else {
+            Action::PointerMoveRelative { .. } => {
+                let Some(destination) = cursor_after(action, cursor) else {
                     return Err(GroundingFailure::MissingCursorGrounding);
-                };
-                let destination = LogicalPoint {
-                    x: current.x + delta.x,
-                    y: current.y + delta.y,
                 };
                 if !point_within(destination, bounds) {
                     return Err(GroundingFailure::TargetOutsideObservation);
                 }
-                cursor = Some(destination);
             }
             Action::PointerButton { .. } | Action::Scroll { .. } => {
                 let Some(position) = cursor else {
@@ -396,17 +376,32 @@ fn pointer_targets_within(
             }
             _ => {}
         }
+        cursor = cursor_after(action, cursor);
     }
     Ok(())
 }
 
 fn point_within(point: LogicalPoint, bounds: LogicalRect) -> bool {
-    point.x.is_finite()
-        && point.y.is_finite()
-        && point.x >= bounds.origin.x
-        && point.y >= bounds.origin.y
-        && point.x < bounds.origin.x + bounds.width
-        && point.y < bounds.origin.y + bounds.height
+    bounds.contains(point)
+}
+
+/// Where the pointer is after an action, given where it was before: the
+/// one cursor transition that both grounding validation and the executed
+/// batch's bookkeeping follow. Relative motion from an unknown position
+/// leaves it unknown.
+pub fn cursor_after(action: &Action, cursor: Option<LogicalPoint>) -> Option<LogicalPoint> {
+    match action {
+        Action::PointerMoveAbsolute { position } | Action::PointerClick { position, .. } => {
+            Some(*position)
+        }
+        Action::PointerDrag { to, .. } => Some(*to),
+        Action::PointerPath { points, .. } => points.last().copied().or(cursor),
+        Action::PointerMoveRelative { delta } => cursor.map(|current| LogicalPoint {
+            x: current.x + delta.x,
+            y: current.y + delta.y,
+        }),
+        _ => cursor,
+    }
 }
 
 /// Input directed at application content must not drift to a newly focused window.

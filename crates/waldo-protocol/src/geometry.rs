@@ -26,6 +26,19 @@ pub struct LogicalRect {
     pub height: f64,
 }
 
+impl LogicalRect {
+    /// Whether a finite point lies in this half-open rectangle: its origin
+    /// edges are inside, its far edges are not.
+    pub fn contains(self, point: LogicalPoint) -> bool {
+        point.x.is_finite()
+            && point.y.is_finite()
+            && point.x >= self.origin.x
+            && point.y >= self.origin.y
+            && point.x < self.origin.x + self.width
+            && point.y < self.origin.y + self.height
+    }
+}
+
 /// Integer pixel dimensions.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -63,4 +76,26 @@ pub struct CoordinateMapping {
     pub scale: f64,
     /// Output buffer transform, already accounted for in the delivered image.
     pub transform: OutputTransform,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogicalPoint, LogicalRect};
+
+    #[test]
+    fn rectangles_contain_their_origin_edges_but_not_their_far_edges() {
+        let rect = LogicalRect {
+            origin: LogicalPoint { x: 10.0, y: 20.0 },
+            width: 100.0,
+            height: 50.0,
+        };
+        let at = |x, y| rect.contains(LogicalPoint { x, y });
+
+        assert!(at(10.0, 20.0));
+        assert!(at(109.9, 69.9));
+        assert!(!at(110.0, 40.0));
+        assert!(!at(50.0, 70.0));
+        assert!(!at(9.9, 40.0));
+        assert!(!at(f64::NAN, 40.0));
+    }
 }

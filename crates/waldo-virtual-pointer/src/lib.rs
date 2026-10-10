@@ -604,13 +604,9 @@ impl DesktopGeometry {
     }
 
     fn output_at(&self, point: LogicalPoint) -> Option<&waldo_protocol::OutputState> {
-        self.outputs.iter().find(|output| {
-            let bounds = output.logical_bounds;
-            point.x >= bounds.origin.x
-                && point.x < bounds.origin.x + bounds.width
-                && point.y >= bounds.origin.y
-                && point.y < bounds.origin.y + bounds.height
-        })
+        self.outputs
+            .iter()
+            .find(|output| output.logical_bounds.contains(point))
     }
 }
 

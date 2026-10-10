@@ -7,7 +7,8 @@ use std::{
 
 use waldo_accessibility::AccessibilityBackend;
 use waldo_action::{
-    ActionExecution, ActionExecutionFailure, ActionExecutor, GroundingFailure, validate_grounding,
+    ActionExecution, ActionExecutionFailure, ActionExecutor, GroundingFailure, cursor_after,
+    validate_grounding,
 };
 use waldo_controller::{ExecutionToken, ObservationGrounding};
 use waldo_niri::SessionInspector;
@@ -220,25 +221,7 @@ impl BatchActionExecutor {
                 },
             )
         })?;
-        match action {
-            Action::PointerMoveAbsolute { position } | Action::PointerClick { position, .. } => {
-                *cursor = Some(*position);
-            }
-            Action::PointerMoveRelative { delta } => {
-                let current = (*cursor).expect("relative motion was grounded before dispatch");
-                *cursor = Some(LogicalPoint {
-                    x: current.x + delta.x,
-                    y: current.y + delta.y,
-                });
-            }
-            Action::PointerDrag { to, .. } => *cursor = Some(*to),
-            Action::PointerPath { points, .. } => {
-                if let Some(position) = points.last() {
-                    *cursor = Some(*position);
-                }
-            }
-            _ => {}
-        }
+        *cursor = cursor_after(action, *cursor);
         Ok(())
     }
 
