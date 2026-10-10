@@ -137,10 +137,8 @@ pub enum StopReason {
     StaleObservation,
     GeometryChanged,
     FocusChanged,
-    UserPreempted,
     WaitFailed,
     VerificationFailed,
-    SettleTimeout,
     Cancelled,
 }
 
