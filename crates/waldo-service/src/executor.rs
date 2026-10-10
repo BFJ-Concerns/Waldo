@@ -9,7 +9,7 @@ use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
 use waldo_clipboard::ClipboardExecutor;
 use waldo_controller::ExecutionToken;
 use waldo_niri::NiriActionExecutor;
-use waldo_protocol::{Action, ActionRoute, ErrorCode, ProtocolError, TextRoutePreference};
+use waldo_protocol::{Action, ActionRoute, ProtocolError, TextRoutePreference};
 use waldo_virtual_keyboard::{ActiveLayoutSource, KeyboardUnavailable, VirtualKeyboardExecutor};
 use waldo_virtual_pointer::VirtualPointerExecutor;
 
@@ -133,14 +133,12 @@ impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
     ) -> Result<ActionExecution, ActionExecutionFailure> {
         self.with_keyboard(|keyboard| keyboard.execute(action, cancellation))
             .map_err(|unavailable| {
-                ActionExecutionFailure::not_executed(ProtocolError {
-                    code: ErrorCode::UnsupportedCapability,
-                    message: format!(
+                ActionExecutionFailure::not_executed(ProtocolError::unsupported_capability(
+                    format!(
                         "Wayland virtual-keyboard backend is unavailable: {}",
                         unavailable.limitation
                     ),
-                    retryable: unavailable.error.retryable,
-                })
+                ))
             })?
     }
 
@@ -169,7 +167,11 @@ impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
     ) -> Result<ActionExecution, ActionExecutionFailure> {
         self.accessibility
             .as_ref()
-            .ok_or_else(|| unsupported("AT-SPI text entry is unavailable"))?
+            .ok_or_else(|| {
+                ActionExecutionFailure::not_executed(ProtocolError::unsupported_capability(
+                    "AT-SPI text entry is unavailable",
+                ))
+            })?
             .set_focused_text(text, cancellation)
     }
 
@@ -197,10 +199,10 @@ impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
             .as_ref()
             .map_err(|error| unavailable_backend("clipboard", error))?;
         self.with_keyboard(|_| ()).map_err(|unavailable| {
-            unsupported(&format!(
+            ActionExecutionFailure::not_executed(ProtocolError::unsupported_capability(format!(
                 "clipboard paste needs the virtual keyboard: {}",
                 unavailable.limitation
-            ))
+            )))
         })?;
         let snapshot = clipboard
             .snapshot()
@@ -223,11 +225,7 @@ impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
             if cancellation.is_cancelled() {
                 let failure = ActionExecutionFailure::indeterminate(
                     ActionRoute::ClipboardPaste,
-                    ProtocolError {
-                        code: ErrorCode::Cancelled,
-                        message: "clipboard paste was cancelled after key dispatch".into(),
-                        retryable: false,
-                    },
+                    ProtocolError::cancelled("clipboard paste was cancelled after key dispatch"),
                 );
                 return restore_after_failure(clipboard, snapshot, failure);
             }
@@ -239,11 +237,10 @@ impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
                 Ok(false) => {
                     let failure = ActionExecutionFailure::indeterminate(
                         ActionRoute::ClipboardPaste,
-                        ProtocolError {
-                            code: ErrorCode::BackendFailure,
-                            message: "application did not take the temporary paste text before the paste deadline".into(),
-                            retryable: true,
-                        },
+                        ProtocolError::backend_failure(
+                            "application did not take the temporary paste text before the paste deadline",
+                            true,
+                        ),
                     );
                     return restore_after_failure(clipboard, snapshot, failure);
                 }
@@ -314,11 +311,9 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
                 .accessibility
                 .as_ref()
                 .ok_or_else(|| {
-                    ActionExecutionFailure::not_executed(ProtocolError {
-                        code: ErrorCode::UnsupportedCapability,
-                        message: "AT-SPI backend is unavailable".into(),
-                        retryable: true,
-                    })
+                    ActionExecutionFailure::not_executed(ProtocolError::unsupported_capability(
+                        "AT-SPI backend is unavailable",
+                    ))
                 })?
                 .execute(action, cancellation),
             _ => self.niri.execute(action, cancellation),
@@ -404,19 +399,9 @@ fn initialisation_failed(backend: &str, error: &ProtocolError) -> String {
 /// A backend that failed to initialise stays unavailable until `waldod`
 /// restarts, so repeating the action cannot succeed.
 fn unavailable_backend(backend: &str, error: &ProtocolError) -> ActionExecutionFailure {
-    ActionExecutionFailure::not_executed(ProtocolError {
-        code: ErrorCode::UnsupportedCapability,
-        message: initialisation_failed(backend, error),
-        retryable: false,
-    })
-}
-
-fn unsupported(message: &str) -> ActionExecutionFailure {
-    ActionExecutionFailure::not_executed(ProtocolError {
-        code: ErrorCode::UnsupportedCapability,
-        message: message.into(),
-        retryable: false,
-    })
+    ActionExecutionFailure::not_executed(ProtocolError::unsupported_capability(
+        initialisation_failed(backend, error),
+    ))
 }
 
 fn as_clipboard_paste_failure(failure: ActionExecutionFailure) -> ActionExecutionFailure {
@@ -556,22 +541,19 @@ mod tests {
         let authority = controller
             .begin_execution(connection, std::time::Duration::ZERO)
             .unwrap();
-        let refusal = ActionExecutionFailure::not_executed(ProtocolError {
-            code: ErrorCode::UnsupportedCapability,
-            message: "key Insert is absent from active layout".into(),
-            retryable: false,
-        });
+        let refusal = ActionExecutionFailure::not_executed(ProtocolError::unsupported_capability(
+            "key Insert is absent from active layout",
+        ));
         for failure in [None, Some(refusal.clone())] {
             let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let executor = super::DesktopActionExecutor::with_backends(
                 None,
                 std::sync::Arc::new(|| panic!("the injected keyboard needs no layout discovery")),
                 &settings,
-                Err(ProtocolError {
-                    code: ErrorCode::BackendFailure,
-                    message: "the paste test needs no pointer".into(),
-                    retryable: false,
-                }),
+                Err(ProtocolError::backend_failure(
+                    "the paste test needs no pointer",
+                    false,
+                )),
                 Ok(TestKeyboard {
                     observed: observed.clone(),
                     refusal: failure.clone(),
@@ -621,26 +603,24 @@ mod tests {
             None,
             std::sync::Arc::new(|| panic!("the injected keyboard needs no layout discovery")),
             &settings,
-            Err(ProtocolError {
-                code: ErrorCode::BackendFailure,
-                message: "the paste test needs no pointer".into(),
-                retryable: false,
-            }),
+            Err(ProtocolError::backend_failure(
+                "the paste test needs no pointer",
+                false,
+            )),
             Ok(TestKeyboard {
                 observed: Default::default(),
-                refusal: Some(ActionExecutionFailure::not_executed(ProtocolError {
-                    code: ErrorCode::UnsupportedCapability,
-                    message: "key Insert is absent from active layout".into(),
-                    retryable: false,
-                })),
+                refusal: Some(ActionExecutionFailure::not_executed(
+                    ProtocolError::unsupported_capability(
+                        "key Insert is absent from active layout",
+                    ),
+                )),
                 release_limitation: None,
             }),
             Ok(TestClipboard {
-                restore_failure: Some(ProtocolError {
-                    code: ErrorCode::BackendFailure,
-                    message: "selection owner vanished".into(),
-                    retryable: true,
-                }),
+                restore_failure: Some(ProtocolError::backend_failure(
+                    "selection owner vanished",
+                    true,
+                )),
                 release_limitation: None,
             }),
         )
@@ -793,10 +773,6 @@ mod tests {
     }
 
     fn error() -> ProtocolError {
-        ProtocolError {
-            code: ErrorCode::BackendFailure,
-            message: "deliberate route boundary".into(),
-            retryable: true,
-        }
+        ProtocolError::backend_failure("deliberate route boundary", true)
     }
 }

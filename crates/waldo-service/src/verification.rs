@@ -6,7 +6,7 @@ use waldo_protocol::{
     ProtocolError, SourceSelector, WindowId,
 };
 
-use crate::{error::backend_error, observe::CapturedObservation, server::ServiceState};
+use crate::{observe::CapturedObservation, server::ServiceState};
 
 /// Predicates validated before mutation with any retained frame evidence attached.
 pub(crate) struct VerificationPlan {
@@ -41,13 +41,9 @@ impl VerificationPlan {
                         },
                     )?;
                     if &grounding.source != result_source {
-                        return Err(ProtocolError {
-                            code: ErrorCode::InvalidRequest,
-                            message:
-                                "frame-change verification must compare the source the batch's resulting observation captures"
-                                    .into(),
-                            retryable: false,
-                        });
+                        return Err(ProtocolError::invalid_request(
+                            "frame-change verification must compare the source the batch's resulting observation captures",
+                        ));
                     }
                     prior_frames.insert(*from, grounding.application_frame_fingerprint);
                 }
@@ -56,11 +52,9 @@ impl VerificationPlan {
                         waldo_accessibility::require_known_state(state)?;
                     }
                     if !include_accessibility {
-                        return Err(ProtocolError {
-                            code: ErrorCode::InvalidRequest,
-                            message: "element verification needs accessibility evidence; act on an observation made with include_accessibility".into(),
-                            retryable: false,
-                        });
+                        return Err(ProtocolError::invalid_request(
+                            "element verification needs accessibility evidence; act on an observation made with include_accessibility",
+                        ));
                     }
                 }
                 Predicate::ProcessExited { pid } => validate_pid(*pid)?,
@@ -90,17 +84,16 @@ impl VerificationPlan {
             )
         });
         if needs_semantics && !observation.accessibility_available {
-            return Err(ProtocolError {
-                code: ErrorCode::BackendFailure,
-                message: format!(
+            return Err(ProtocolError::backend_failure(
+                format!(
                     "element verification could not be measured: {}",
                     observation
                         .accessibility_limitation
                         .as_deref()
                         .unwrap_or("the resulting observation has no accessibility evidence")
                 ),
-                retryable: true,
-            });
+                true,
+            ));
         }
         let needs_windows = self.predicates.iter().any(|predicate| {
             matches!(
@@ -209,11 +202,9 @@ fn process_directory_absent(proc_root: &Path, pid: u32) -> Result<bool, Protocol
 
 fn validate_pid(pid: u32) -> Result<(), ProtocolError> {
     if pid == 0 {
-        return Err(ProtocolError {
-            code: ErrorCode::InvalidRequest,
-            message: "a process predicate requires a non-zero PID".into(),
-            retryable: false,
-        });
+        return Err(ProtocolError::invalid_request(
+            "a process predicate requires a non-zero PID",
+        ));
     }
     Ok(())
 }
@@ -227,9 +218,10 @@ pub(crate) fn failed_verification() -> ProtocolError {
 }
 
 fn verification_backend(message: String) -> ProtocolError {
-    backend_error(format!(
-        "could not inspect post-action verification state: {message}"
-    ))
+    ProtocolError::backend_failure(
+        format!("could not inspect post-action verification state: {message}"),
+        true,
+    )
 }
 
 #[cfg(test)]

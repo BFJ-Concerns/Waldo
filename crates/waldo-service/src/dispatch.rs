@@ -6,7 +6,6 @@ use waldo_protocol::{
 
 use crate::{
     act::act,
-    error::backend_error,
     observe::observe,
     server::{ServiceState, enable_capture_capability},
 };
@@ -22,7 +21,7 @@ pub(crate) async fn dispatch(
     match message {
         ClientMessage::Hello { .. } => ServerMessage::Error {
             request_id: Some(request_id),
-            error: invalid_request("hello is only valid as the first message"),
+            error: ProtocolError::invalid_request("hello is only valid as the first message"),
         },
         ClientMessage::Observe { request, .. } => {
             observe(
@@ -123,7 +122,7 @@ fn merge_controller_capabilities(
 fn inspection_error(request_id: RequestId, message: String) -> ServerMessage {
     ServerMessage::Error {
         request_id: Some(request_id),
-        error: backend_error(message),
+        error: ProtocolError::backend_failure(message, true),
     }
 }
 
@@ -159,14 +158,6 @@ async fn stop(
             }
         }
         Err(error) => lease_error(request_id, error),
-    }
-}
-
-pub(crate) fn invalid_request(message: impl Into<String>) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::InvalidRequest,
-        message: message.into(),
-        retryable: false,
     }
 }
 

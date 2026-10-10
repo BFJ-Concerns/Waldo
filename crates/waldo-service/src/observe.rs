@@ -8,7 +8,7 @@ use waldo_protocol::{
 };
 use waldo_screencopy::{Capture, ScreenCapturer};
 
-use crate::{error::backend_error, server::ServiceState};
+use crate::server::ServiceState;
 
 pub(crate) async fn observe(
     request_id: RequestId,
@@ -121,7 +121,7 @@ pub(crate) async fn capture_observation(
     } = match captured {
         Ok(Ok(captured)) => captured,
         Ok(Err(error)) => return Err(error),
-        Err(error) => return Err(backend_error(error.to_string())),
+        Err(error) => return Err(ProtocolError::backend_failure(error.to_string(), true)),
     };
     let frame_fingerprint = frame_fingerprint(&capture.png);
     let observation_id = state.controller.lock().await.record_observation(
@@ -255,7 +255,7 @@ pub(crate) fn capture_frame(
 ) -> Result<CapturedFrame, ProtocolError> {
     let snapshot = inspector
         .inspect(include_windows || matches!(source, SourceSelector::Window { .. }))
-        .map_err(|error| backend_error(error.to_string()))?;
+        .map_err(|error| ProtocolError::backend_failure(error.to_string(), true))?;
     let resolved = resolve_capture_source(source, &snapshot)?;
     let focused_window = snapshot.focused_window;
     let focused_window_state = focused_window
@@ -288,7 +288,7 @@ pub(crate) fn capture_frame(
         }
         None => capturer.capture_output(&output.name),
     }
-    .map_err(|error| backend_error(error.to_string()))?;
+    .map_err(|error| ProtocolError::backend_failure(error.to_string(), true))?;
     let application_capture = match resolved.region {
         Some(region) => {
             let (x, y, width, height) = region_coordinates(region, output.logical_bounds)?;
@@ -296,7 +296,7 @@ pub(crate) fn capture_frame(
         }
         None => capturer.capture_application_output(&output.name),
     }
-    .map_err(|error| backend_error(error.to_string()))?;
+    .map_err(|error| ProtocolError::backend_failure(error.to_string(), true))?;
 
     Ok(CapturedFrame {
         focused_window,

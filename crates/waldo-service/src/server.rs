@@ -636,7 +636,7 @@ where
 fn invalid_request_response(request_id: Option<RequestId>, message: &str) -> ServerMessage {
     ServerMessage::Error {
         request_id,
-        error: crate::dispatch::invalid_request(message),
+        error: ProtocolError::invalid_request(message),
     }
 }
 

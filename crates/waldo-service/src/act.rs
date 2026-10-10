@@ -14,7 +14,6 @@ use waldo_protocol::{
 use crate::{
     batch::BatchActionExecutor,
     dispatch::lease_error,
-    error::backend_error,
     observe::{CapturedObservation, capture_observation},
     server::ServiceState,
     verification::{VerificationPlan, failed_verification},
@@ -123,7 +122,7 @@ pub(crate) async fn act(
         );
         let snapshot = inspector
             .inspect(include_windows)
-            .map_err(|error| backend_error(error.to_string()))?;
+            .map_err(|error| ProtocolError::backend_failure(error.to_string(), true))?;
         validate_grounding(
             Some(&validation_grounding),
             &snapshot.outputs,

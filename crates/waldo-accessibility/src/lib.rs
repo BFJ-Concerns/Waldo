@@ -83,16 +83,22 @@ struct RawNode {
 impl AccessibilityBackend {
     /// Connects to the accessibility bus and proves its registry is queryable.
     pub fn initialise() -> Result<Self, ProtocolError> {
-        let session = Connection::session()
-            .map_err(|error| backend_failure(format!("connect to session D-Bus: {error}"), true))?;
-        let bus = Proxy::new(&session, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus")
-            .map_err(|error| backend_failure(format!("open AT-SPI bus proxy: {error}"), false))?;
-        let address: String = bus
-            .call("GetAddress", &())
-            .map_err(|error| backend_failure(format!("read AT-SPI bus address: {error}"), true))?;
+        let session = Connection::session().map_err(|error| {
+            ProtocolError::backend_failure(format!("connect to session D-Bus: {error}"), true)
+        })?;
+        let bus = Proxy::new(&session, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus").map_err(
+            |error| {
+                ProtocolError::backend_failure(format!("open AT-SPI bus proxy: {error}"), false)
+            },
+        )?;
+        let address: String = bus.call("GetAddress", &()).map_err(|error| {
+            ProtocolError::backend_failure(format!("read AT-SPI bus address: {error}"), true)
+        })?;
         let connection = ConnectionBuilder::address(address.as_str())
             .and_then(|builder| builder.build())
-            .map_err(|error| backend_failure(format!("connect to AT-SPI bus: {error}"), true))?;
+            .map_err(|error| {
+                ProtocolError::backend_failure(format!("connect to AT-SPI bus: {error}"), true)
+            })?;
         registry_children(&connection)?;
 
         Ok(Self {
@@ -114,7 +120,7 @@ impl AccessibilityBackend {
         visible_bounds: LogicalRect,
     ) -> Result<AccessibilitySnapshot, ProtocolError> {
         let mut state = self.state.lock().map_err(|_| {
-            backend_failure(
+            ProtocolError::backend_failure(
                 "accessibility handle registry is poisoned".to_owned(),
                 false,
             )
@@ -270,7 +276,7 @@ impl AccessibilityBackend {
     ) -> Result<Option<(Connection, ObjectKey)>, ProtocolError> {
         let (connection, observed) = {
             let state = self.state.lock().map_err(|_| {
-                backend_failure(
+                ProtocolError::backend_failure(
                     "accessibility handle registry is poisoned".to_owned(),
                     false,
                 )
@@ -293,17 +299,15 @@ impl AccessibilityBackend {
         cancellation: &ExecutionToken,
     ) -> Result<ActionExecution, ActionExecutionFailure> {
         if cancellation.is_cancelled() {
-            return Err(ActionExecutionFailure::not_executed(ProtocolError {
-                code: ErrorCode::Cancelled,
-                message: "text entry was cancelled before AT-SPI dispatch".into(),
-                retryable: false,
-            }));
+            return Err(ActionExecutionFailure::not_executed(
+                ProtocolError::cancelled("text entry was cancelled before AT-SPI dispatch"),
+            ));
         }
         let element = self
             .state
             .lock()
             .map_err(|_| {
-                ActionExecutionFailure::not_executed(backend_failure(
+                ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                     "accessibility handle registry is poisoned".to_owned(),
                     false,
                 ))
@@ -311,11 +315,9 @@ impl AccessibilityBackend {
             .focused
             .clone()
             .ok_or_else(|| {
-                ActionExecutionFailure::not_executed(ProtocolError {
-                    code: ErrorCode::UnsupportedCapability,
-                    message: "the latest accessibility snapshot has no focused element".into(),
-                    retryable: true,
-                })
+                ActionExecutionFailure::not_executed(ProtocolError::unsupported_capability(
+                    "the latest accessibility snapshot has no focused element",
+                ))
             })?;
         self.require_still_focused(&element)
             .map_err(ActionExecutionFailure::not_executed)?;
@@ -333,7 +335,7 @@ impl AccessibilityBackend {
     fn require_still_focused(&self, element: &ElementHandle) -> Result<(), ProtocolError> {
         let (connection, observed) = {
             let state = self.state.lock().map_err(|_| {
-                backend_failure(
+                ProtocolError::backend_failure(
                     "accessibility handle registry is poisoned".to_owned(),
                     false,
                 )
@@ -373,7 +375,7 @@ impl AccessibilityBackend {
         operation: &AccessibilityOperation,
     ) -> Result<ActionExecution, ActionExecutionFailure> {
         let state = self.state.lock().map_err(|_| {
-            ActionExecutionFailure::not_executed(backend_failure(
+            ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                 "accessibility handle registry is poisoned".to_owned(),
                 false,
             ))
@@ -400,7 +402,7 @@ impl AccessibilityBackend {
         confirm_resolved(accessible.call::<_, _, String>("GetRoleName", &()))
             .map_err(ActionExecutionFailure::not_executed)?;
         let interfaces: InterfaceSet = accessible.call("GetInterfaces", &()).map_err(|error| {
-            ActionExecutionFailure::not_executed(backend_failure(
+            ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                 format!("read accessibility interfaces before action: {error}"),
                 true,
             ))
@@ -418,13 +420,9 @@ impl AccessibilityBackend {
                     .iter()
                     .position(|candidate| candidate.name == *action)
                     .ok_or_else(|| {
-                        ActionExecutionFailure::not_executed(ProtocolError {
-                            code: ErrorCode::InvalidRequest,
-                            message: format!(
-                                "element has no accessibility action named {action:?}"
-                            ),
-                            retryable: false,
-                        })
+                        ActionExecutionFailure::not_executed(ProtocolError::invalid_request(
+                            format!("element has no accessibility action named {action:?}"),
+                        ))
                     })?;
                 require_true(
                     proxy.call("DoAction", &(index as i32)),
@@ -443,18 +441,16 @@ impl AccessibilityBackend {
             AccessibilityOperation::SetValue { value } => {
                 require_interface(&interfaces, Interface::Value, "numeric value")?;
                 let value = value.parse::<f64>().map_err(|_| {
-                    ActionExecutionFailure::not_executed(ProtocolError {
-                        code: ErrorCode::InvalidRequest,
-                        message: "accessibility value must be a finite number".into(),
-                        retryable: false,
-                    })
+                    ActionExecutionFailure::not_executed(ProtocolError::invalid_request(
+                        "accessibility value must be a finite number",
+                    ))
                 })?;
                 if !value.is_finite() {
-                    return Err(ActionExecutionFailure::not_executed(ProtocolError {
-                        code: ErrorCode::InvalidRequest,
-                        message: "accessibility value must be a finite number".into(),
-                        retryable: false,
-                    }));
+                    return Err(ActionExecutionFailure::not_executed(
+                        ProtocolError::invalid_request(
+                            "accessibility value must be a finite number",
+                        ),
+                    ));
                 }
                 let proxy = proxy(&connection, &key, VALUE)
                     .map_err(ActionExecutionFailure::not_executed)?;
@@ -465,17 +461,17 @@ impl AccessibilityBackend {
             AccessibilityOperation::Focus => {
                 require_interface(&interfaces, Interface::Component, "component focus")?;
                 let states: StateSet = accessible.call("GetState", &()).map_err(|error| {
-                    ActionExecutionFailure::not_executed(backend_failure(
+                    ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                         format!("read accessibility focus capability: {error}"),
                         false,
                     ))
                 })?;
                 if !states.contains(atspi_common::State::Focusable) {
-                    return Err(ActionExecutionFailure::not_executed(ProtocolError {
-                        code: ErrorCode::UnsupportedCapability,
-                        message: "accessibility element is not focusable".into(),
-                        retryable: false,
-                    }));
+                    return Err(ActionExecutionFailure::not_executed(
+                        ProtocolError::unsupported_capability(
+                            "accessibility element is not focusable",
+                        ),
+                    ));
                 }
                 let proxy = proxy(&connection, &key, COMPONENT)
                     .map_err(ActionExecutionFailure::not_executed)?;
@@ -483,7 +479,7 @@ impl AccessibilityBackend {
                 let states: StateSet = accessible.call("GetState", &()).map_err(|error| {
                     ActionExecutionFailure::indeterminate(
                         ActionRoute::Accessibility,
-                        backend_failure(
+                        ProtocolError::backend_failure(
                             format!("verify accessibility focus after dispatch: {error}"),
                             false,
                         ),
@@ -525,7 +521,7 @@ impl AccessibilityBackend {
                 let parent_interfaces: InterfaceSet = parent_accessible
                     .call("GetInterfaces", &())
                     .map_err(|error| {
-                        ActionExecutionFailure::not_executed(backend_failure(
+                        ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                             format!("read selection parent interfaces: {error}"),
                             true,
                         ))
@@ -549,7 +545,7 @@ impl AccessibilityBackend {
                     selection.call("IsChildSelected", &index).map_err(|error| {
                         ActionExecutionFailure::indeterminate(
                             ActionRoute::Accessibility,
-                            backend_failure(
+                            ProtocolError::backend_failure(
                                 format!("verify selected accessibility child: {error}"),
                                 false,
                             ),
@@ -580,7 +576,7 @@ impl AccessibilityBackend {
             .state
             .lock()
             .map_err(|_| {
-                ActionExecutionFailure::not_executed(backend_failure(
+                ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                     "accessibility handle registry is poisoned".to_owned(),
                     false,
                 ))
@@ -616,7 +612,7 @@ impl AccessibilityBackend {
                     ))
                 })?;
         let mut state = self.state.lock().map_err(|_| {
-            ActionExecutionFailure::not_executed(backend_failure(
+            ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                 "accessibility handle registry is poisoned".to_owned(),
                 false,
             ))
@@ -706,18 +702,16 @@ impl ActionExecutor for AccessibilityBackend {
         cancellation: &ExecutionToken,
     ) -> Result<ActionExecution, ActionExecutionFailure> {
         if cancellation.is_cancelled() {
-            return Err(ActionExecutionFailure::not_executed(ProtocolError {
-                code: ErrorCode::Cancelled,
-                message: "the action batch was cancelled before accessibility dispatch".into(),
-                retryable: false,
-            }));
+            return Err(ActionExecutionFailure::not_executed(
+                ProtocolError::cancelled(
+                    "the action batch was cancelled before accessibility dispatch",
+                ),
+            ));
         }
         let Action::Accessibility { element, operation } = action else {
-            return Err(ActionExecutionFailure::not_executed(ProtocolError {
-                code: ErrorCode::UnsupportedCapability,
-                message: "this action has no accessibility route".into(),
-                retryable: false,
-            }));
+            return Err(ActionExecutionFailure::not_executed(
+                ProtocolError::unsupported_capability("this action has no accessibility route"),
+            ));
         };
         self.execute_accessibility(element, operation)
     }
@@ -803,7 +797,9 @@ fn registry_children(connection: &Connection) -> Result<Vec<ObjectRefOwned>, Pro
         ACCESSIBLE,
     )?
     .call("GetChildren", &())
-    .map_err(|error| backend_failure(format!("enumerate AT-SPI applications: {error}"), true))
+    .map_err(|error| {
+        ProtocolError::backend_failure(format!("enumerate AT-SPI applications: {error}"), true)
+    })
 }
 
 fn peer_pid(connection: &Connection, name: &str) -> Result<u32, ProtocolError> {
@@ -813,9 +809,13 @@ fn peer_pid(connection: &Connection, name: &str) -> Result<u32, ProtocolError> {
         "/org/freedesktop/DBus",
         "org.freedesktop.DBus",
     )
-    .map_err(|error| backend_failure(format!("open AT-SPI D-Bus proxy: {error}"), false))?
+    .map_err(|error| {
+        ProtocolError::backend_failure(format!("open AT-SPI D-Bus proxy: {error}"), false)
+    })?
     .call("GetConnectionUnixProcessID", &(name))
-    .map_err(|error| backend_failure(format!("resolve AT-SPI peer process: {error}"), true))
+    .map_err(|error| {
+        ProtocolError::backend_failure(format!("resolve AT-SPI peer process: {error}"), true)
+    })
 }
 
 /// Why reading an AT-SPI object failed.
@@ -882,7 +882,10 @@ fn required<T>(result: Result<T, zbus::Error>, operation: &str) -> Result<T, Rea
         if object_gone(&error) {
             ReadError::Gone
         } else {
-            ReadError::Failed(backend_failure(format!("{operation}: {error}"), true))
+            ReadError::Failed(ProtocolError::backend_failure(
+                format!("{operation}: {error}"),
+                true,
+            ))
         }
     })
 }
@@ -919,11 +922,9 @@ pub fn require_known_state(name: &str) -> Result<(), ProtocolError> {
     if known {
         Ok(())
     } else {
-        Err(ProtocolError {
-            code: ErrorCode::InvalidRequest,
-            message: format!("{name:?} is not an AT-SPI state name"),
-            retryable: false,
-        })
+        Err(ProtocolError::invalid_request(format!(
+            "{name:?} is not an AT-SPI state name"
+        )))
     }
 }
 
@@ -1105,8 +1106,9 @@ fn proxy<'a>(
     key: &'a ObjectKey,
     interface: &'static str,
 ) -> Result<Proxy<'a>, ProtocolError> {
-    Proxy::new(connection, key.name.as_str(), key.path.as_str(), interface)
-        .map_err(|error| backend_failure(format!("open accessibility object proxy: {error}"), true))
+    Proxy::new(connection, key.name.as_str(), key.path.as_str(), interface).map_err(|error| {
+        ProtocolError::backend_failure(format!("open accessibility object proxy: {error}"), true)
+    })
 }
 
 fn object_key(reference: &ObjectRefOwned) -> Option<ObjectKey> {
@@ -1133,11 +1135,9 @@ fn require_true(
 ) -> Result<(), ActionExecutionFailure> {
     match result {
         Ok(true) => Ok(()),
-        Ok(false) => Err(ActionExecutionFailure::not_executed(ProtocolError {
-            code: ErrorCode::BackendFailure,
-            message: format!("AT-SPI refused to {operation}"),
-            retryable: false,
-        })),
+        Ok(false) => Err(ActionExecutionFailure::not_executed(
+            ProtocolError::backend_failure(format!("AT-SPI refused to {operation}"), false),
+        )),
         Err(error) => Err(action_error(operation, error)),
     }
 }
@@ -1145,21 +1145,19 @@ fn require_true(
 fn focus_element(result: Result<bool, zbus::Error>) -> Result<(), ActionExecutionFailure> {
     match result {
         Ok(true) => Ok(()),
-        Ok(false) => Err(ActionExecutionFailure::not_executed(ProtocolError {
-            code: ErrorCode::UnsupportedCapability,
-            message: "AT-SPI refused to focus the accessibility element".into(),
-            retryable: false,
-        })),
-        Err(error) if is_not_supported(&error) => {
-            Err(ActionExecutionFailure::not_executed(ProtocolError {
-                code: ErrorCode::UnsupportedCapability,
-                message: format!("AT-SPI does not support focusing this element: {error}"),
-                retryable: false,
-            }))
-        }
+        Ok(false) => Err(ActionExecutionFailure::not_executed(
+            ProtocolError::unsupported_capability(
+                "AT-SPI refused to focus the accessibility element",
+            ),
+        )),
+        Err(error) if is_not_supported(&error) => Err(ActionExecutionFailure::not_executed(
+            ProtocolError::unsupported_capability(format!(
+                "AT-SPI does not support focusing this element: {error}"
+            )),
+        )),
         Err(error) => Err(ActionExecutionFailure::indeterminate(
             ActionRoute::Accessibility,
-            backend_failure(
+            ProtocolError::backend_failure(
                 format!("could not focus accessibility element: {error}"),
                 false,
             ),
@@ -1186,18 +1184,18 @@ fn require_interface(
     if interfaces.contains(interface) {
         Ok(())
     } else {
-        Err(ActionExecutionFailure::not_executed(ProtocolError {
-            code: ErrorCode::UnsupportedCapability,
-            message: format!("accessibility element does not expose {operation}"),
-            retryable: false,
-        }))
+        Err(ActionExecutionFailure::not_executed(
+            ProtocolError::unsupported_capability(format!(
+                "accessibility element does not expose {operation}"
+            )),
+        ))
     }
 }
 
 fn action_error(operation: &str, error: zbus::Error) -> ActionExecutionFailure {
     ActionExecutionFailure::indeterminate(
         ActionRoute::Accessibility,
-        backend_failure(format!("could not {operation}: {error}"), true),
+        ProtocolError::backend_failure(format!("could not {operation}: {error}"), true),
     )
 }
 
@@ -1217,7 +1215,7 @@ fn focus_cache<T>(lock: std::sync::LockResult<T>) -> Result<T, ActionExecutionFa
     lock.map_err(|_| {
         ActionExecutionFailure::indeterminate(
             ActionRoute::Accessibility,
-            backend_failure(
+            ProtocolError::backend_failure(
                 "focus moved, but the accessibility focus cache is poisoned so later text entry cannot target it".to_owned(),
                 false,
             ),
@@ -1238,14 +1236,6 @@ fn ambiguous_target(message: String) -> ProtocolError {
         code: ErrorCode::AmbiguousTarget,
         message,
         retryable: true,
-    }
-}
-
-fn backend_failure(message: String, retryable: bool) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::BackendFailure,
-        message,
-        retryable,
     }
 }
 
