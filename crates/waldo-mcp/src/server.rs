@@ -98,6 +98,9 @@ impl McpServer {
 
     async fn handle(&self, message: JsonRpcMessage) -> Option<Value> {
         let id = message.id?;
+        if message.jsonrpc != "2.0" {
+            return Some(rpc_error(id, -32600, "jsonrpc must be \"2.0\""));
+        }
         let result = match message.method.as_str() {
             "initialize" => initialize(message.params),
             "ping" => Ok(json!({})),
@@ -241,6 +244,30 @@ mod tests {
 
         assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 4);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdio_rejects_a_request_that_is_not_json_rpc_2() {
+        let (mut client_write, server_read) = tokio::io::duplex(16 * 1024);
+        let (server_write, mut client_read) = tokio::io::duplex(16 * 1024);
+        let server = McpServer::new("/controller-is-not-needed").unwrap();
+        let task = tokio::spawn(async move { server.run(server_read, server_write).await });
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        client_write
+            .write_all(b"{\"jsonrpc\":\"1.0\",\"id\":7,\"method\":\"tools/list\"}\n")
+            .await
+            .unwrap();
+        drop(client_write);
+
+        let mut lines = BufReader::new(&mut client_read).lines();
+        let response: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(response.get("result").is_none());
         task.await.unwrap().unwrap();
     }
 }

@@ -15,7 +15,6 @@ const SERVER_INSTRUCTIONS: &str = "Waldo observes and controls the operator's li
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JsonRpcMessage {
-    #[allow(dead_code)]
     pub jsonrpc: String,
     #[serde(default)]
     pub id: Option<Value>,
