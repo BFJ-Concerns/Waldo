@@ -154,7 +154,9 @@ struct LogicalTargets {
 struct FixtureSegmentEvidence {
     state: FixtureState,
     event_count: usize,
-    response_receipts: usize,
+    /// Every Act in the segment returned one executed receipt per action,
+    /// in action order.
+    receipts_complete: bool,
     window_focused: bool,
     workspace_focused: bool,
     fixture_process_removed: bool,
@@ -268,7 +270,7 @@ pub fn run(options: Options) -> Result<FinalCampaignSummary, Box<dyn std::error:
                     && segment.state.counters.key_releases >= 2
                     && segment.state.text_length > 0
                     && segment.event_count >= 16
-                    && segment.response_receipts >= 15
+                    && segment.receipts_complete
                     && segment.window_focused
                     && segment.workspace_focused;
                 let mut evidence_paths = vec![
@@ -543,7 +545,7 @@ fn run_fixture_segment(
         .create_directory(format!("toolkits/{}", spec.name))?;
     let (window_id, workspace_id, output_id) = fixture_window(&initial.descriptor.title)?;
     make_window_floating(window_id)?;
-    let (observation, target_state, calibration_receipts) =
+    let (observation, target_state, calibration_complete) =
         if spec.toolkit == FixtureToolkit::Electron {
             let observed = outside_in::observe_without_accessibility(
                 &mut harness.mcp,
@@ -584,8 +586,8 @@ fn run_fixture_segment(
                     geometry.screen_x.is_some() && geometry.screen_y.is_some()
                 })
             })?;
-            let receipt_count = executed_receipts(&calibration_response);
-            (calibrated_observation, calibrated_state, receipt_count)
+            let calibrated = receipts_executed_in_order(&calibration_response, 1);
+            (calibrated_observation, calibrated_state, calibrated)
         } else {
             let observed = observe_window_without_accessibility(
                 &mut harness.mcp,
@@ -594,7 +596,7 @@ fn run_fixture_segment(
                 &directory,
                 "initial",
             )?;
-            (observed, initial.clone(), 0)
+            (observed, initial.clone(), true)
         };
     let targets = targets(&observation, seed, spec, &target_state)?;
     let marker = format!("{}-v2-{:04x}", spec.name, seed & 0xffff);
@@ -666,10 +668,13 @@ fn run_fixture_segment(
     Ok(FixtureSegmentEvidence {
         state,
         event_count: events.len(),
-        response_receipts: executed_receipts(&response)
-            + executed_receipts(&window_response)
-            + executed_receipts(&workspace_response)
-            + calibration_receipts,
+        receipts_complete: calibration_complete
+            && receipts_executed_in_order(
+                &response,
+                request["actions"].as_array().map_or(0, Vec::len),
+            )
+            && receipts_executed_in_order(&window_response, 1)
+            && receipts_executed_in_order(&workspace_response, 1),
         window_focused,
         workspace_focused,
         fixture_process_removed,
@@ -826,10 +831,16 @@ fn run_coherent_act(
         drag_distinctive: state.counters.drags >= 1,
         click_distinctive: state.counters.entry_clicks >= 1,
         text_distinctive: state.text_sha256.as_deref() == Some(text_digest.as_str()),
-        wait_process_exited,
-        capture_returned: !final_observation.image_digest().is_empty(),
+        // The Wait's own receipt must report its predicate met; the
+        // verifier reaping the process proves only that it exited at all.
+        wait_process_exited: wait_process_exited
+            && receipt(&response, 4)["predicate_result"] == true,
+        // The explicit Capture has its own screencopy receipt, apart from
+        // the observation every Act returns.
+        capture_returned: receipt(&response, 5)["route"] == "screencopy"
+            && !final_observation.image_digest().is_empty(),
         screenshot_changed: observation.image_digest() != final_observation.image_digest(),
-        ordered_receipts: executed_receipts(&response) == 6,
+        ordered_receipts: receipts_executed_in_order(&response, 6),
         application_event_count: events.len(),
         final_image_sha256: final_observation.image_digest().to_owned(),
         fixture_process_removed,
@@ -1089,16 +1100,21 @@ fn make_window_floating(window_id: u64) -> Result<(), Box<dyn std::error::Error>
     }
 }
 
-fn executed_receipts(response: &Value) -> usize {
+fn receipt(response: &Value, index: usize) -> &Value {
+    &response["result"]["structuredContent"]["result"]["receipts"][index]
+}
+
+/// Whether an Act returned exactly `actions` receipts, each executed and
+/// carrying its action's index in order.
+fn receipts_executed_in_order(response: &Value, actions: usize) -> bool {
     response["result"]["structuredContent"]["result"]["receipts"]
         .as_array()
-        .map(|receipts| {
-            receipts
-                .iter()
-                .take_while(|receipt| receipt["status"] == "executed")
-                .count()
+        .is_some_and(|receipts| {
+            receipts.len() == actions
+                && receipts.iter().enumerate().all(|(index, receipt)| {
+                    receipt["index"] == index && receipt["status"] == "executed"
+                })
         })
-        .unwrap_or(0)
 }
 
 /// Runs the supplied CLI binary itself: its schema must be the protocol's,
@@ -1330,3 +1346,37 @@ fn wait_command() -> Command {
 #[cfg(test)]
 #[path = "tests/sleep_defaults.rs"]
 mod sleep_defaults;
+
+#[cfg(test)]
+mod receipt_tests {
+    use serde_json::json;
+
+    use super::receipts_executed_in_order;
+
+    fn act(receipts: serde_json::Value) -> serde_json::Value {
+        json!({"result": {"structuredContent": {"result": {"receipts": receipts}}}})
+    }
+
+    #[test]
+    fn receipts_must_cover_every_action_once_in_order() {
+        let executed = |index: usize| json!({"index": index, "status": "executed"});
+
+        assert!(receipts_executed_in_order(
+            &act(json!([executed(0), executed(1)])),
+            2
+        ));
+        assert!(!receipts_executed_in_order(&act(json!([executed(0)])), 2));
+        assert!(!receipts_executed_in_order(
+            &act(json!([executed(1), executed(0)])),
+            2
+        ));
+        assert!(!receipts_executed_in_order(
+            &act(json!([executed(0), executed(0)])),
+            2
+        ));
+        assert!(!receipts_executed_in_order(
+            &act(json!([executed(0), {"index": 1, "status": "failed"}])),
+            2
+        ));
+    }
+}
