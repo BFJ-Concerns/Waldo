@@ -15,6 +15,11 @@ The installer:
    capabilities — in
    `${XDG_STATE_HOME:-$HOME/.local/state}/waldo/environment.json`.
 
+A failed required metadata probe stops the install and records the
+installation as unavailable. An available profile requires the binary
+checksum, Claude Code version and source revision and working-tree status
+to have been obtained successfully.
+
 The proof turn runs Claude Code from an empty private directory with its
 built-in tools removed, Waldo's read-only `query` and `observe` tools
 pre-approved and permission prompts turned off, so any other tool call is
@@ -52,7 +57,10 @@ configuration alone, loads the candidate plugin for the proof turn only (with
 `claude --plugin-dir`), and removes its temporary controller on exit. The
 private socket is used only when `WALDO_SOCKET_PATH` is not already set: a
 value inherited from your environment is used as given, so unset it first if
-it names your live controller's socket.
+it names your live controller's socket. Keep runtime and socket-parent paths separate from binary and plugin
+installation destinations. Existing runtime and socket-parent directories must belong to your user and have mode 0700; unsuitable ones are
+refused before the service file is written. Their permissions are never
+changed, and cleanup removes only directories the rehearsal created.
 
 ## Codex
 

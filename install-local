@@ -143,8 +143,13 @@ systemd_argument() {
 }
 
 write_service_file() {
-    local line
-    install -d -m 0755 "$(dirname -- "$service_file")"
+    local line service_parent
+    service_parent="$(dirname -- "$service_file")" || return 1
+    # Redirected runtime parents have already been created or validated private.
+    if [[ "$install_mode" != redirected ]] \
+        || [[ "$service_parent" != "$redirected_runtime" && "$service_parent" != "$(dirname -- "$WALDO_SOCKET_PATH")" ]]; then
+        install -d -m 0755 "$service_parent" || return 1
+    fi
     while IFS= read -r line; do
         if [[ "$line" == ExecStart=* ]]; then
             printf 'ExecStart='
@@ -164,8 +169,8 @@ write_service_file() {
         else
             printf '%s\n' "$line"
         fi
-    done <"$repo_root/packaging/waldod.service" >"$service_file"
-    chmod 0644 "$service_file"
+    done <"$repo_root/packaging/waldod.service" >"$service_file" || return 1
+    chmod 0644 "$service_file" || return 1
 }
 
 # Copy the plugin source for the agents' marketplaces. The copy's MCP
@@ -436,6 +441,12 @@ codex_registration_and_proof() {
     codex_diagnostic=""
     codex_summary="null"
     installed_codex_manifest=""
+    codex_version=""
+    codex_manifest_sha256=""
+    codex_version="$(codex --version)" || {
+        codex_diagnostic="could not obtain the Codex version"
+        return 1
+    }
     if [[ "$install_mode" == redirected ]]; then
         local auth_source="${WALDO_CODEX_AUTH_SOURCE:-$operator_codex_home/auth.json}"
         if [[ ! -f "$auth_source" ]]; then
@@ -475,6 +486,10 @@ codex_registration_and_proof() {
     installed_codex_manifest="$codex_home/plugins/cache/$codex_marketplace_name/waldo/$candidate_version/.codex-plugin/plugin.json"
     cmp -s -- "$plugin_home/.codex-plugin/plugin.json" "$installed_codex_manifest" || {
         codex_diagnostic="installed Codex plugin manifest does not match the candidate version $candidate_version"
+        return 1
+    }
+    codex_manifest_sha256="$(sha256sum "$installed_codex_manifest" | cut -d' ' -f1)" || {
+        codex_diagnostic="could not checksum the installed Codex plugin manifest"
         return 1
     }
     local installed_root
@@ -529,14 +544,19 @@ proof_dir=""
 query_output=""
 failure_stage="initialisation"
 installation_succeeded=false
+created_runtime_directories=()
 
 record_unavailable() {
     local diagnostic="$1"
-    local profile_tmp
-    install -d -m 0700 "$(dirname -- "$profile_file")"
-    profile_tmp="$(mktemp)"
+    local profile_tmp recorded_at profile_parent
+    profile_parent="$(dirname -- "$profile_file")" || return 1
+    if [[ ! -d "$profile_parent" ]]; then
+        install -d -m 0700 "$profile_parent" || return 1
+    fi
+    recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" || return 1
+    profile_tmp="$(mktemp)" || return 1
     jq -n \
-        --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg recorded_at "$recorded_at" \
         --arg mode "$install_mode" \
         --arg diagnostic "$diagnostic" \
         '{
@@ -546,8 +566,14 @@ record_unavailable() {
                 mode: $mode,
                 diagnostic: $diagnostic
             }
-        }' >"$profile_tmp"
-    install -m 0600 "$profile_tmp" "$profile_file"
+        }' >"$profile_tmp" || {
+        rm -f -- "$profile_tmp"
+        return 1
+    }
+    install -m 0600 "$profile_tmp" "$profile_file" || {
+        rm -f -- "$profile_tmp"
+        return 1
+    }
     rm -f -- "$profile_tmp"
 }
 
@@ -603,7 +629,8 @@ cleanup() {
                 "$WALDO_SOCKET_PATH" >&2
             failed=true
         fi
-        for runtime_directory in "$redirected_runtime/waldo" "$redirected_runtime"; do
+        for ((index=${#created_runtime_directories[@]}-1; index>=0; index--)); do
+            runtime_directory="${created_runtime_directories[index]}"
             if [[ -e "$runtime_directory" || -L "$runtime_directory" ]]; then
                 if ! rmdir -- "$runtime_directory"; then
                     printf 'Redirected Waldo runtime residue remains at %s.\n' \
@@ -637,16 +664,34 @@ record_unavailable "installation and installed-binding verification have not com
 failure_stage="binary installation"
 cargo_install=(install --locked --force --root "$cargo_root")
 if [[ "$install_mode" == redirected ]]; then
-    install -d -m 0700 "$install_root" "$install_home" "$cargo_root" "$codex_home" "$redirected_runtime"
+    install -d -m 0700 "$install_root" "$install_home" "$cargo_root" "$codex_home"
 fi
 for package in waldo-service waldo-cli waldo-mcp; do
     cargo "${cargo_install[@]}" --path "$repo_root/crates/$package"
 done
 
 failure_stage="controller service installation"
+if [[ "$install_mode" == redirected ]]; then
+    runtime_directories=("$redirected_runtime" "$(dirname -- "$WALDO_SOCKET_PATH")")
+    # Check every existing directory before creating any or writing the unit.
+    for runtime_directory in "${runtime_directories[@]}"; do
+        if [[ -e "$runtime_directory" || -L "$runtime_directory" ]]; then
+            if [[ ! -d "$runtime_directory" ]] \
+                || [[ "$(stat -c '%a %u' -- "$runtime_directory")" != "700 $(id -u)" ]]; then
+                printf 'Rehearsal directory must be owned by the current user with mode 0700: %s\n' "$runtime_directory" >&2
+                exit 1
+            fi
+        fi
+    done
+    for runtime_directory in "${runtime_directories[@]}"; do
+        if [[ ! -d "$runtime_directory" ]]; then
+            install -d -m 0700 "$runtime_directory"
+            created_runtime_directories+=("$runtime_directory")
+        fi
+    done
+fi
 write_service_file
 if [[ "$install_mode" == redirected ]]; then
-    install -d -m 0700 "$redirected_runtime" "$(dirname -- "$WALDO_SOCKET_PATH")"
     service_log="$install_root/waldod.log"
     : >"$service_log"
     chmod 0600 "$service_log"
@@ -745,9 +790,9 @@ codex_record='{"present": false}'
 if command -v codex >/dev/null; then
     if codex_registration_and_proof; then
         codex_record="$(jq -n \
-            --arg version "$(codex --version)" \
+            --arg version "$codex_version" \
             --arg plugin_manifest "$installed_codex_manifest" \
-            --arg plugin_manifest_sha256 "$(sha256sum "$installed_codex_manifest" | cut -d' ' -f1)" \
+            --arg plugin_manifest_sha256 "$codex_manifest_sha256" \
             --argjson proof "$codex_summary" \
             '{
                 present: true,
@@ -759,7 +804,7 @@ if command -v codex >/dev/null; then
     else
         printf 'Codex (best-effort) did not complete: %s\n' "$codex_diagnostic" >&2
         codex_record="$(jq -n \
-            --arg version "$(codex --version)" \
+            --arg version "$codex_version" \
             --arg diagnostic "$codex_diagnostic" \
             --argjson proof "$codex_summary" \
             '{present: true, proved: false, version: $version, diagnostic: $diagnostic, proof: $proof}')"
@@ -770,9 +815,12 @@ failure_stage="verified environment recording"
 recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 source_commit="$(git -C "$repo_root" rev-parse HEAD)"
 source_tree_clean=false
-if [[ -z "$(git -C "$repo_root" status --porcelain)" ]]; then
+source_status="$(git -C "$repo_root" status --porcelain)"
+if [[ -z "$source_status" ]]; then
     source_tree_clean=true
 fi
+mcp_binary_sha256="$(sha256sum "$mcp_bin" | cut -d' ' -f1)"
+claude_version="$(claude --version)"
 profile_tmp="$(mktemp)"
 jq \
     --arg recorded_at "$recorded_at" \
@@ -781,8 +829,8 @@ jq \
     --argjson source_tree_clean "$source_tree_clean" \
     --arg plugin_home "$plugin_home" \
     --arg mcp_binary "$mcp_bin" \
-    --arg mcp_binary_sha256 "$(sha256sum "$mcp_bin" | cut -d' ' -f1)" \
-    --arg claude_version "$(claude --version)" \
+    --arg mcp_binary_sha256 "$mcp_binary_sha256" \
+    --arg claude_version "$claude_version" \
     --argjson claude_proof "$claude_summary" \
     --argjson codex "$codex_record" \
     '{

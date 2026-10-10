@@ -100,6 +100,124 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
+    def rehearsal_entry(self, failure="", runtime=None, socket_parent=None, service_file=None, profile_file=None):
+        """Run the real entry point; external builds and agent turns are isolated."""
+        root = self.root / "entry"
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir()
+        commands = root / "commands"
+        commands.mkdir(exist_ok=True)
+        for name in ("bash", "python3", "jq", "realpath", "rsync", "systemctl", "id",
+                     "dirname", "basename", "mktemp", "chmod", "rm", "rmdir",
+                     "stat", "cut", "date", "cmp", "ls", "env", "sleep"):
+            (commands / name).symlink_to(shutil.which(name))
+        daemon = root / "daemon"
+        daemon.write_text("#!/usr/bin/env python3\nimport signal\nsignal.signal(signal.SIGTERM, lambda *_: exit(0))\nsignal.pause()\n")
+        daemon.chmod(0o755)
+        query = root / "query"
+        query.write_text("#!/bin/sh\nprintf '%s\\n' '{\"type\":\"queried\",\"result\":{\"outputs\":[{\"name\":\"fixture\"}]}}'\n")
+        query.chmod(0o755)
+        real_git, real_sha = shutil.which("git"), shutil.which("sha256sum")
+        installer = commands / "install"
+        installer.write_text(
+            '#!/usr/bin/env python3\nimport os, pathlib, subprocess, sys\n'
+            'paths = [pathlib.Path(arg) for arg in sys.argv[1:]]\n'
+            'before = {p: p.stat().st_mode for p in paths if p.is_dir()}\n'
+            f'result = subprocess.run([{shutil.which("install")!r}, *sys.argv[1:]])\n'
+            'with open(pathlib.Path(os.environ["ENTRY"]) / "mode-changes", "a") as log:\n'
+            '    for p, mode in before.items():\n'
+            '        if p.is_dir() and p.stat().st_mode != mode: print(p, file=log)\n'
+            'sys.exit(result.returncode)\n')
+        installer.chmod(0o755)
+        scripts = {
+            "cargo": '#!/bin/bash\nroot=""\nwhile (($#)); do if [[ "$1" == --root ]]; then root="$2"; fi; shift; done\n'
+                     'install -d "$root/bin"\ninstall -m 0755 "$ENTRY/daemon" "$root/bin/waldod"\n'
+                     'install -m 0755 "$ENTRY/query" "$root/bin/waldo"\n'
+                     'printf binary > "$root/bin/waldo-mcp"\n',
+            "claude": '#!/bin/bash\nif [[ "$1" == --version ]]; then [[ "$FAIL_PROBE" != claude ]] || exit 41; echo fixture-version; exit; fi\n'
+                      'while (($#)); do if [[ "$1" == --plugin-dir ]]; then plugin="$2"; fi; shift; done\n'
+                      'python3 "$ENTRY/emit.py" "$plugin"\n',
+            "git": f'#!/bin/bash\nif [[ "$FAIL_PROBE" == git-status && "$*" == *status* ]] || [[ "$FAIL_PROBE" == git-head && "$*" == *rev-parse* ]]; then exit 42; fi\nexec {shlex.quote(real_git)} "$@"\n',
+            "sha256sum": f'#!/bin/bash\nif [[ "$FAIL_PROBE" == checksum && "$*" == *waldo-mcp* ]]; then rm -f -- "$1"; fi\nexec {shlex.quote(real_sha)} "$@"\n',
+        }
+        for name, content in scripts.items():
+            command = commands / name
+            command.write_text(content)
+            command.chmod(0o755)
+        (root / "emit.py").write_text(
+            'import json, pathlib, sys\np = pathlib.Path(sys.argv[1])\n'
+            'v = json.loads((p / ".claude-plugin/plugin.json").read_text())["version"]\n'
+            'events = ' + repr([
+                init_event("waldo@inline", "PLACEHOLDER"), tool_use("o1", OBSERVE_TOOL),
+                tool_result("o1", [image_block()], observation(True)), result_event("MCP_IMAGE_PROOF_OK")]) + '\n'
+            'events[0]["plugins"][0].update(path=str(p), version=v)\n'
+            'for event in events: print(json.dumps(event))\n')
+        install_root = root / "installation"
+        runtime = runtime or root / "runtime"
+        socket_parent = socket_parent or runtime / "waldo"
+        profile_file = profile_file or install_root / "state/waldo/environment.json"
+        result = subprocess.run([BASH, str(REPO / "install-local")], text=True,
+                                capture_output=True, timeout=30, env=self.env | {
+                                    "PATH": str(commands), "ENTRY": str(root), "FAIL_PROBE": failure,
+                                    "WALDO_INSTALL_ROOT": str(install_root),
+                                    "WALDO_PROFILE_FILE": str(profile_file),
+                                    "WALDO_RUNTIME_DIR": str(runtime),
+                                    "WALDO_SERVICE_FILE": str(service_file or install_root / "home/.config/systemd/user/waldod.service"),
+                                    "WALDO_SOCKET_PATH": str(socket_parent / "controller.sock")})
+        profile = json.loads(profile_file.read_text())
+        return result, profile, install_root
+
+    def test_rehearsal_refuses_unsuitable_directories_without_installing_service(self):
+        for target in ("runtime", "socket", "profile"):
+            with self.subTest(target=target):
+                directory = self.root / ("existing-" + target)
+                directory.mkdir(mode=0o755)
+                (directory / "keep").write_text("operator-owned")
+                result, profile, install_root = self.rehearsal_entry(
+                    runtime=directory if target == "runtime" else None,
+                    socket_parent=directory if target in ("socket", "profile") else None,
+                    profile_file=directory / "environment.json" if target == "profile" else None)
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(str(directory), result.stderr)
+                self.assertFalse((install_root / "home/.config/systemd/user/waldod.service").exists())
+                self.assertFalse(profile["installation"]["available"])
+                self.assertIn("controller service installation", profile["installation"]["diagnostic"])
+                shutil.rmtree(self.root / "entry")
+
+    def test_rehearsal_adopts_private_directories_and_removes_only_created_ones(self):
+        for target in ("runtime", "socket", "service"):
+            with self.subTest(target=target):
+                directory = self.root / ("existing-" + target)
+                directory.mkdir(mode=0o700)
+                (directory / "keep").write_text("operator-owned")
+                result, profile, _ = self.rehearsal_entry(
+                    runtime=directory if target == "runtime" else None,
+                    socket_parent=directory if target in ("socket", "service") else None,
+                    service_file=directory / "waldod.service" if target == "service" else None)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(profile["installation"]["available"])
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+                changed = (self.root / "entry/mode-changes").read_text().splitlines()
+                self.assertNotIn(str(directory), changed)
+                self.assertEqual((directory / "keep").read_text(), "operator-owned")
+                if target == "runtime":
+                    self.assertFalse((directory / "waldo").exists())
+                else:
+                    self.assertFalse((self.root / "entry/runtime").exists())
+                shutil.rmtree(self.root / "entry")
+
+    def test_required_metadata_failure_records_unavailable_at_recording_stage(self):
+        for probe in ("checksum", "claude", "git-status", "git-head"):
+            with self.subTest(probe=probe):
+                result, profile, _ = self.rehearsal_entry(failure=probe)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertFalse(profile["installation"]["available"])
+                self.assertIn("verified environment recording", profile["installation"]["diagnostic"])
+                self.assertNotIn("source_tree_clean", profile["installation"])
+                shutil.rmtree(self.root / "entry")
+
     def test_paths_every_binding_must_agree_on_are_made_absolute_or_refused(self):
         relative_socket = self.steps("resolve_installation", WALDO_SOCKET_PATH="relative/controller.sock")
         self.assertNotEqual(relative_socket.returncode, 0)
@@ -410,7 +528,7 @@ class InstallerTests(unittest.TestCase):
                 summary, proves = self.claude_summary(self.write_transcript("refused.jsonl", events))
                 self.assertFalse(proves, summary)
 
-    def codex_proof_steps(self, candidate, cache_home, auth_source=None):
+    def codex_proof_steps(self, candidate, cache_home, auth_source=None, probe=""):
         proof = self.root / "proof"
         (proof / "cwd").mkdir(parents=True, exist_ok=True)
         transcript = self.write_transcript("codex-events.jsonl", [
@@ -422,7 +540,10 @@ class InstallerTests(unittest.TestCase):
         ])
         script = (
             'resolve_installation\n'
-            f'proof_dir={shlex.quote(str(proof))}\n'
+            'codex() { echo fixture-version; }\n'
+            + ('codex() { return 43; }\n' if probe == 'version' else '')
+            + ('sha256sum() { return 44; }\n' if probe == 'checksum' else '')
+            + f'proof_dir={shlex.quote(str(proof))}\n'
             'run_codex() { if [[ "$2" == plugin ]]; then return 0; fi; '
             f'cat {shlex.quote(str(transcript))}; }}\n'
             'if codex_registration_and_proof; then verdict=proved; else verdict=refused; fi\n'
@@ -440,6 +561,16 @@ class InstallerTests(unittest.TestCase):
         shutil.copytree(candidate, selected)
         (self.root / "auth.json").write_text('{"login":"fixture"}')
         return cache_home, selected
+
+    def test_codex_metadata_failure_is_a_best_effort_refusal(self):
+        candidate = self.candidate_plugin()
+        for probe in ("version", "checksum"):
+            with self.subTest(probe=probe):
+                cache_home, _ = self.codex_cache(candidate, "codex-" + probe)
+                result = self.codex_proof_steps(candidate, cache_home, probe=probe)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[0], "refused", result.stdout)
+                self.assertIn("could not", result.stdout.splitlines()[2])
 
     def test_relative_codex_auth_source_links_to_the_validated_file(self):
         candidate = self.candidate_plugin()
