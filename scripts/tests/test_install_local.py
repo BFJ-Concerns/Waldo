@@ -21,7 +21,10 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
-BINARIES = REPO / "target/debug"
+# The binaries Cargo just built: under CARGO_TARGET_DIR when it is set, as
+# Cargo resolves it, else the checkout's target directory. --binaries
+# overrides this when the file is run directly.
+BINARIES = Path(os.environ.get("CARGO_TARGET_DIR") or REPO / "target").resolve() / "debug"
 # Resolved once so a case may hand the installer a PATH of stub commands.
 BASH = shutil.which("bash")
 SESSION = all(os.environ.get(name) for name in ("XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "NIRI_SOCKET"))
