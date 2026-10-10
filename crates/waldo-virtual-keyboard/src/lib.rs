@@ -39,6 +39,19 @@ fn require_typeable_length(text: &str) -> Result<(), ProtocolError> {
     }
     Ok(())
 }
+fn require_text_controls(text: &str) -> Result<(), ProtocolError> {
+    if let Some(character) = text
+        .chars()
+        .find(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(ProtocolError::invalid_request(format!(
+            "text contains control character U+{:04X}; use an explicit Key action for control keys",
+            u32::from(character)
+        )));
+    }
+    Ok(())
+}
+
 use waldo_controller::ExecutionToken;
 use waldo_protocol::{Action, ActionRoute, InputState, ProtocolError, TextRoutePreference};
 
@@ -361,6 +374,7 @@ impl KeyboardState {
 
     fn resolve_text(&self, text: &str) -> Result<Vec<KeySequence>, ProtocolError> {
         require_typeable_length(text)?;
+        require_text_controls(text)?;
         let mut characters = text.chars().peekable();
         let mut sequences = Vec::with_capacity(text.chars().count());
         while let Some(mut character) = characters.next() {
@@ -478,7 +492,28 @@ fn cancelled() -> ProtocolError {
 
 #[cfg(test)]
 mod text_limit_tests {
-    use super::{MAX_TEXT_CHARACTERS, require_typeable_length};
+    use super::{MAX_TEXT_CHARACTERS, require_text_controls, require_typeable_length};
+
+    #[test]
+    fn destructive_text_controls_are_invalid_requests_naming_the_codepoint() {
+        for character in ['\u{8}', '\u{1b}', '\u{7f}', '\u{85}'] {
+            let text = format!("a{character}");
+            let error = require_text_controls(&text).unwrap_err();
+            assert_eq!(error.code, waldo_protocol::ErrorCode::InvalidRequest);
+            assert!(
+                error
+                    .message
+                    .contains(&format!("U+{:04X}", u32::from(character))),
+                "{}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn text_line_breaks_tabs_and_printable_unicode_remain_allowed() {
+        assert!(require_text_controls("éλ\n\r\t").is_ok());
+    }
 
     #[test]
     fn text_beyond_the_character_limit_is_refused_before_planning() {
@@ -486,5 +521,56 @@ mod text_limit_tests {
         let error = require_typeable_length(&"é".repeat(MAX_TEXT_CHARACTERS + 1)).unwrap_err();
         assert_eq!(error.code, waldo_protocol::ErrorCode::InvalidRequest);
         assert!(error.message.contains("clipboard"));
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn live_release_flush_failure_is_reported_by_explicit_cleanup() {
+        if env::var_os("NIRI_SOCKET").is_none() || env::var_os("WAYLAND_DISPLAY").is_none() {
+            eprintln!("skipped: no live Niri session (NIRI_SOCKET and WAYLAND_DISPLAY needed)");
+            return;
+        }
+        let executor = VirtualKeyboardExecutor::initialise(Arc::new(|| {
+            Ok(ActiveLayout {
+                index: 0,
+                name: None,
+            })
+        }))
+        .unwrap();
+        let mut controller = waldo_controller::Controller::new(Duration::from_secs(30));
+        let connection = controller.connect();
+        let authority = controller
+            .begin_execution(connection, Duration::ZERO)
+            .unwrap();
+        executor
+            .execute(
+                &Action::Key {
+                    key: "shift".into(),
+                    state: InputState::Pressed,
+                },
+                authority.cancellation(),
+            )
+            .unwrap();
+        // Shut down only this client's transport. The kernel, rather than a
+        // mock result, makes flushing the queued key releases fail.
+        executor
+            .with_state(|state| {
+                state.device.disconnect_for_test();
+                Ok(())
+            })
+            .unwrap();
+        let limitation = executor
+            .release_all()
+            .expect("a failed release flush must not disappear");
+        assert!(
+            limitation.contains("keys may still be held") && limitation.contains("flush"),
+            "{limitation}"
+        );
+        eprintln!("explicit cleanup reported: {limitation}");
     }
 }

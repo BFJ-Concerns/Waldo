@@ -171,6 +171,16 @@ impl Device {
         self.keyboard.modifiers(depressed, latched, locked, group);
     }
 
+    #[cfg(test)]
+    pub(crate) fn disconnect_for_test(&self) {
+        use std::os::fd::AsRawFd;
+        nix::sys::socket::shutdown(
+            self.connection.as_fd().as_raw_fd(),
+            nix::sys::socket::Shutdown::Both,
+        )
+        .unwrap();
+    }
+
     /// Flushes and dispatches after an action; failure means the action's
     /// delivery is unknown.
     pub(crate) fn settle(&mut self) -> Result<(), ProtocolError> {

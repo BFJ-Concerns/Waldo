@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use waldo_protocol::{ErrorCode, InputState, ProtocolError};
+use waldo_protocol::{InputState, ProtocolError};
 
 use crate::keymap::KeySequence;
 
@@ -86,12 +86,9 @@ impl KeyboardModel {
         // Refuse before recording anything: a plan that fails emits no
         // transition, so it must leave no announcement behind either.
         if matches!(prepared, PreparedKeyboardAction::Text(_)) && self.has_active_modifiers() {
-            return Err(ProtocolError {
-                code: ErrorCode::UnsupportedCapability,
-                message: "virtual-keyboard text is unavailable while an explicit modifier or lock state is active"
-                    .into(),
-                retryable: false,
-            });
+            return Err(ProtocolError::unsupported_capability(
+                "virtual-keyboard text is unavailable while an explicit modifier or lock state is active",
+            ));
         }
         let mut transitions = Vec::new();
         if self.announced_group != Some(self.group) {
