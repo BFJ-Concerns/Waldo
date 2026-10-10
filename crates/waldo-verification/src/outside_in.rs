@@ -561,6 +561,7 @@ impl McpClient {
 
 pub(crate) struct RuntimeHarness {
     scratch_path: PathBuf,
+    socket: PathBuf,
     scratch: Option<PrivateRoot>,
     evidence: PrivateRoot,
     controller: ChildGuard,
@@ -607,12 +608,18 @@ impl RuntimeHarness {
         write_json(options.evidence_directory.join("identity.json"), &identity)?;
         Ok(Self {
             scratch_path,
+            socket,
             scratch: Some(scratch),
             evidence,
             controller,
             mcp,
             identity,
         })
+    }
+
+    /// The controller socket this harness's waldod serves.
+    pub(crate) fn socket(&self) -> &Path {
+        &self.socket
     }
 
     pub(crate) fn shutdown(

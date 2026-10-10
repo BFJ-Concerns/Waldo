@@ -225,6 +225,7 @@ pub fn run(options: Options) -> Result<FinalCampaignSummary, Box<dyn std::error:
         seed: options.seed,
     };
     let mut harness = RuntimeHarness::start_prepared(&runtime_options, evidence)?;
+    cells.push(run_cli_binary(&options.cli, &harness)?);
     let mut fixture_processes_removed = true;
 
     for (index, spec) in SPECS.into_iter().enumerate() {
@@ -1098,6 +1099,57 @@ fn executed_receipts(response: &Value) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+/// Runs the supplied CLI binary itself: its schema must be the protocol's,
+/// and a Query against the campaign's controller must succeed.
+fn run_cli_binary(
+    cli: &Path,
+    harness: &RuntimeHarness,
+) -> Result<CampaignCell, Box<dyn std::error::Error>> {
+    let run = |arguments: &[&str]| -> Result<(bool, Value), Box<dyn std::error::Error>> {
+        let output = Command::new(cli).args(arguments).output()?;
+        let value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        Ok((output.status.success(), value))
+    };
+    let socket = harness.socket().to_str().ok_or("non-UTF-8 socket path")?;
+    let (schema_ok, schema) = run(&["schema"])?;
+    let (query_ok, query) = run(&["--socket", socket, "query"])?;
+    harness
+        .evidence()
+        .write_json("cli/schema-major.json", &schema["schema_major"])?;
+    harness
+        .evidence()
+        .write_json("cli/query.json", &query["type"])?;
+    let failures: Vec<&str> = [
+        (
+            schema_ok && schema["schema_major"] == waldo_protocol::SCHEMA_MAJOR_VERSION,
+            "waldo schema did not report the protocol's schema major",
+        ),
+        (
+            query_ok && query["type"] == "queried",
+            "waldo query against the campaign controller did not succeed",
+        ),
+    ]
+    .into_iter()
+    .filter(|(passed, _)| !passed)
+    .map(|(_, failure)| failure)
+    .collect();
+    Ok(CampaignCell {
+        id: "cli-binary".to_owned(),
+        action_families: vec!["schema".to_owned(), "query".to_owned()],
+        outcome: if failures.is_empty() {
+            CampaignOutcome::Passed
+        } else {
+            CampaignOutcome::Failed
+        },
+        reason: (!failures.is_empty()).then(|| failures.join("; ")),
+        final_consumers: vec!["the supplied waldo binary's output".to_owned()],
+        evidence: vec![
+            "cli/schema-major.json".to_owned(),
+            "cli/query.json".to_owned(),
+        ],
+    })
 }
 
 fn campaign_identity(options: &Options) -> Result<CampaignIdentity, Box<dyn std::error::Error>> {
