@@ -83,6 +83,10 @@ class GtkInteractionFixture(Gtk.Application):
         keys.connect("key-pressed", self.key_pressed)
         keys.connect("key-released", self.key_released)
         entry.add_controller(keys)
+        entry_clicks = Gtk.GestureClick()
+        entry_clicks.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        entry_clicks.connect("released", self.entry_clicked)
+        entry.add_controller(entry_clicks)
         content.append(entry)
 
         selection = Gtk.DropDown.new_from_strings(["Alpha", "Beta", "Gamma"])
@@ -137,9 +141,11 @@ class GtkInteractionFixture(Gtk.Application):
 
     def pointer_release(self, gesture, _count, x, y):
         self.oracle.count("pointer_releases")
-        self.oracle.count("clicks")
+        # A release ends either a drag or a click, never both.
         if self.dragged:
             self.oracle.count("drags")
+        else:
+            self.oracle.count("clicks")
         self.oracle.record(
             "pointer_released",
             "interaction-surface",
@@ -190,6 +196,10 @@ class GtkInteractionFixture(Gtk.Application):
             if state & flag:
                 names.append(name)
         return names
+
+    def entry_clicked(self, _gesture, _count, _x, _y):
+        self.oracle.count("entry_clicks")
+        self.oracle.record("pointer_released", "text-entry")
 
     def text_changed(self, entry):
         self.oracle.update_text(entry.get_text())

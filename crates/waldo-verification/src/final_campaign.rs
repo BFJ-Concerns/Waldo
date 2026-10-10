@@ -258,6 +258,7 @@ pub fn run(options: Options) -> Result<FinalCampaignSummary, Box<dyn std::error:
                     && segment.state.counters.pointer_presses >= 3
                     && segment.state.counters.pointer_releases >= 3
                     && segment.state.counters.clicks >= 2
+                    && segment.state.counters.entry_clicks >= 1
                     && segment.state.counters.drags >= 1
                     && (!requires_scroll(spec)
                         || (segment.state.counters.horizontal_scrolls >= 1
@@ -796,7 +797,7 @@ fn run_coherent_act(
     let state = wait_for_fixture_state(&paths.state, |state| {
         state.text_sha256.as_deref() == Some(text_digest.as_str())
             && state.counters.drags >= 1
-            && state.counters.clicks >= 2
+            && state.counters.entry_clicks >= 1
     })
     .or_else(|error| {
         retain_failed_fixture_oracle(
@@ -822,7 +823,7 @@ fn run_coherent_act(
         saved_document_sha256,
         pointer_move_distinctive: state.counters.pointer_moves >= 2,
         drag_distinctive: state.counters.drags >= 1,
-        click_distinctive: state.counters.clicks >= 2,
+        click_distinctive: state.counters.entry_clicks >= 1,
         text_distinctive: state.text_sha256.as_deref() == Some(text_digest.as_str()),
         wait_process_exited,
         capture_returned: !final_observation.image_digest().is_empty(),

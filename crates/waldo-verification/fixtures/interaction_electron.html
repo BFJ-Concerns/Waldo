@@ -28,7 +28,7 @@
     const controlPath = query.get("control");
     const sha256 = value => crypto.createHash("sha256").update(value, "utf8").digest("hex");
     const counters = {
-      pointer_moves: 0, pointer_presses: 0, pointer_releases: 0, clicks: 0,
+      pointer_moves: 0, pointer_presses: 0, pointer_releases: 0, clicks: 0, entry_clicks: 0,
       drags: 0, horizontal_scrolls: 0, vertical_scrolls: 0,
       key_presses: 0, key_releases: 0, text_changes: 0, delayed_completions: 0,
     };
@@ -141,8 +141,9 @@
     });
     surface.addEventListener("pointerup", event => {
       counters.pointer_releases += 1;
-      counters.clicks += 1;
+      // A release ends either a drag or a click, never both.
       if (dragged) counters.drags += 1;
+      else counters.clicks += 1;
       record("pointer_released", "interaction-surface", { x: event.offsetX, y: event.offsetY, button: event.button + 1 });
       pointerOrigin = null;
     });
@@ -152,6 +153,10 @@
       record("scrolled", "interaction-surface", { horizontalDelta: event.deltaX, verticalDelta: event.deltaY });
       event.preventDefault();
     }, { passive: false });
+    entry.addEventListener("pointerup", () => {
+      counters.entry_clicks += 1;
+      record("pointer_released", "text-entry");
+    });
     entry.addEventListener("keydown", event => {
       counters.key_presses += 1;
       record("key_pressed", "text-entry", { physicalKey: event.code, logicalKey: event.key, modifiers: modifiers(event) });

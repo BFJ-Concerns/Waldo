@@ -57,7 +57,10 @@ pub struct FixtureCounters {
     pub pointer_moves: u64,
     pub pointer_presses: u64,
     pub pointer_releases: u64,
+    /// Pointer releases on the interaction surface that did not end a drag.
     pub clicks: u64,
+    /// Pointer releases on the text entry.
+    pub entry_clicks: u64,
     pub drags: u64,
     pub horizontal_scrolls: u64,
     pub vertical_scrolls: u64,

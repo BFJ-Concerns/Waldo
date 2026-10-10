@@ -55,6 +55,7 @@ class InteractionOracle:
             "pointer_presses": 0,
             "pointer_releases": 0,
             "clicks": 0,
+            "entry_clicks": 0,
             "drags": 0,
             "horizontal_scrolls": 0,
             "vertical_scrolls": 0,

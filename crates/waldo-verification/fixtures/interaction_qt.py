@@ -64,6 +64,9 @@ class ConsumerFilter(QObject):
                 self.fixture.key_event(event, "key_pressed")
             elif event.type() == QEvent.Type.KeyRelease:
                 self.fixture.key_event(event, "key_released")
+            elif event.type() == QEvent.Type.MouseButtonRelease:
+                self.fixture.oracle.count("entry_clicks")
+                self.fixture.oracle.record("pointer_released", "text-entry")
             elif event.type() == QEvent.Type.FocusIn:
                 self.fixture.oracle.focused_control = "text-entry"
                 self.fixture.oracle.record("focus_changed", "text-entry")
@@ -170,9 +173,11 @@ class QtInteractionFixture:
     def pointer_release(self, event: QMouseEvent):
         position = event.position()
         self.oracle.count("pointer_releases")
-        self.oracle.count("clicks")
+        # A release ends either a drag or a click, never both.
         if self.dragged:
             self.oracle.count("drags")
+        else:
+            self.oracle.count("clicks")
         self.oracle.record(
             "pointer_released",
             "interaction-surface",
