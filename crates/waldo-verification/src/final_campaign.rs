@@ -896,30 +896,12 @@ fn wait_for_fixture_state(
     path: &Path,
     predicate: impl Fn(&FixtureState) -> bool,
 ) -> Result<FixtureState, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last_error = None;
-    loop {
-        match fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice::<FixtureState>(&bytes) {
-                Ok(state) if predicate(&state) => return Ok(state),
-                Ok(_) => {}
-                Err(error) => last_error = Some(error.to_string()),
-            },
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                last_error = Some(error.to_string());
-            }
-            Err(_) => {}
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for fixture state {}: {}",
-                path.display(),
-                last_error.unwrap_or_else(|| "predicate remained false".to_owned())
-            )
-            .into());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+    Ok(crate::fixture_poll::poll_json(
+        path,
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        predicate,
+    )?)
 }
 
 fn targets(
@@ -1001,12 +983,22 @@ fn retain_failed_fixture_oracle(
     paths: &FixturePaths,
     error: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = fs::read(&paths.state)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<FixtureState>(&bytes).ok());
-    let events = fs::read_to_string(&paths.events)
-        .ok()
-        .and_then(|body| complete_fixture_events(&body).ok());
+    // A state or event log that cannot be read is retained as the reason,
+    // not as an absent oracle.
+    let state = match fs::read(&paths.state) {
+        Ok(bytes) => match serde_json::from_slice::<FixtureState>(&bytes) {
+            Ok(state) => serde_json::to_value(state)?,
+            Err(error) => json!({"unreadable": format!("invalid state JSON: {error}")}),
+        },
+        Err(error) => json!({"unreadable": format!("cannot read state: {error}")}),
+    };
+    let events = match fs::read_to_string(&paths.events) {
+        Ok(body) => match complete_fixture_events(&body) {
+            Ok(events) => serde_json::to_value(events)?,
+            Err(error) => json!({"unreadable": format!("invalid event log: {error}")}),
+        },
+        Err(error) => json!({"unreadable": format!("cannot read event log: {error}")}),
+    };
     evidence.write_json(
         format!("failures/{label}-oracle.json"),
         &json!({"error": error, "state": state, "events": events}),

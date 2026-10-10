@@ -7,6 +7,7 @@ use waldo_verification::{
 
 mod clipboard_outside_in;
 mod final_campaign;
+mod fixture_poll;
 mod outside_in;
 mod private_json;
 mod toolkit_preflight;

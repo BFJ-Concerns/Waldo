@@ -421,27 +421,12 @@ fn runner_command(options: &Options, runner: Runner, script: &Path) -> Command {
 }
 
 fn wait_for_state(path: &Path, timeout: Duration) -> Result<FixtureState, String> {
-    let deadline = Instant::now() + timeout;
-    let mut last_error = None;
-    while Instant::now() < deadline {
-        match fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice::<FixtureState>(&bytes) {
-                Ok(state) if state.ready => return Ok(state),
-                Ok(_) => {}
-                Err(error) => last_error = Some(error.to_string()),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => last_error = Some(error.to_string()),
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Err(format!(
-        "fixture did not publish a ready state within {} ms{}",
-        timeout.as_millis(),
-        last_error
-            .map(|error| format!(": {error}"))
-            .unwrap_or_default()
-    ))
+    crate::fixture_poll::poll_json(
+        path,
+        timeout,
+        Duration::from_millis(25),
+        |state: &FixtureState| state.ready,
+    )
 }
 
 fn wait_for_niri_window(title: &str, timeout: Duration) -> bool {

@@ -1907,22 +1907,12 @@ fn wait_for_accessibility_state(
     path: &Path,
     predicate: impl Fn(&AccessibilityFixtureState) -> bool,
 ) -> Result<AccessibilityFixtureState, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(state) = read_accessibility_state(path)
-            && predicate(&state)
-        {
-            return Ok(state);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for accessibility fixture at {}",
-                path.display()
-            )
-            .into());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+    Ok(crate::fixture_poll::poll_json(
+        path,
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        predicate,
+    )?)
 }
 
 pub(crate) fn parse_observation(
@@ -2182,16 +2172,12 @@ fn wait_for_state(
     path: &Path,
     predicate: impl Fn(&FixtureState) -> bool,
 ) -> Result<FixtureState, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Ok(state) = read_state(path)
-            && predicate(&state)
-        {
-            return Ok(state);
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    Err(format!("timed out waiting for fixture state at {}", path.display()).into())
+    Ok(crate::fixture_poll::poll_json(
+        path,
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        predicate,
+    )?)
 }
 
 fn read_state(path: &Path) -> Result<FixtureState, Box<dyn std::error::Error>> {
@@ -2201,10 +2187,14 @@ fn read_state(path: &Path) -> Result<FixtureState, Box<dyn std::error::Error>> {
 fn wait_for_release(path: &Path) -> Result<FixtureEvent, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if let Ok(contents) = fs::read_to_string(path)
-            && let Some(event) = release_from_complete_jsonl(&contents)?
-        {
-            return Ok(event);
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                if let Some(event) = release_from_complete_jsonl(&contents)? {
+                    return Ok(event);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot read {}: {error}", path.display()).into()),
         }
         thread::sleep(Duration::from_millis(20));
     }

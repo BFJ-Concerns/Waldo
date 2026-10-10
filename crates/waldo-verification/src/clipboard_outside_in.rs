@@ -1363,23 +1363,12 @@ fn wait_for_fixture(
     path: &Path,
     predicate: impl Fn(&FixtureState) -> bool,
 ) -> Result<FixtureState, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Ok(bytes) = fs::read(path)
-            && let Ok(state) = serde_json::from_slice::<FixtureState>(&bytes)
-            && predicate(&state)
-        {
-            return Ok(state);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for clipboard fixture at {}",
-                path.display()
-            )
-            .into());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+    Ok(crate::fixture_poll::poll_json(
+        path,
+        Duration::from_secs(8),
+        Duration::from_millis(25),
+        predicate,
+    )?)
 }
 
 fn read_and_remove_secret(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
