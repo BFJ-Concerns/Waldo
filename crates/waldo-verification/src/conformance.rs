@@ -2,6 +2,8 @@ use std::{collections::BTreeSet, fmt};
 
 use serde::{Deserialize, Serialize};
 
+use crate::run::is_sha256_digest;
+
 pub const CONFORMANCE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -486,7 +488,7 @@ fn validate_optional_digest(
     digest: Option<&str>,
 ) -> Result<(), ConformanceRecordError> {
     if let Some(digest) = digest
-        && (digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        && !is_sha256_digest(digest)
     {
         return Err(ConformanceRecordError(format!(
             "{field} must be a 64-character hexadecimal SHA-256 digest"
