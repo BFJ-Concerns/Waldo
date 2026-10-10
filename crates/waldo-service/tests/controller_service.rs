@@ -2777,6 +2777,44 @@ fn binding_does_not_change_an_existing_shared_directory() {
 }
 
 #[tokio::test]
+async fn binding_refuses_a_socket_another_controller_is_serving() {
+    let path = test_socket();
+    let serving = bind_test_service(&path);
+
+    let error = ControllerService::bind_with_inspector(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(UnavailableInspector::new("test session")),
+    )
+    .err()
+    .expect("a socket a running controller serves must be refused");
+
+    assert!(
+        error
+            .to_string()
+            .contains("another controller is already serving")
+    );
+    assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+    drop(serving);
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn binding_replaces_a_stale_socket_nobody_serves() {
+    let path = test_socket();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    assert!(path.exists());
+
+    let service = bind_test_service(&path);
+
+    assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+    drop(service);
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
 async fn shutdown_does_not_remove_a_path_that_replaced_the_bound_socket() {
     let path = test_socket();
     let moved = path.with_extension("moved");

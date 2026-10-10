@@ -1,6 +1,9 @@
 use std::{
     fs, io,
-    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        net::UnixStream,
+    },
     path::{Path, PathBuf},
 };
 
@@ -57,8 +60,17 @@ fn remove_stale_socket(path: &Path) -> Result<(), ServiceError> {
             path.display()
         )));
     }
-    fs::remove_file(path)?;
-    Ok(())
+    // A socket that still accepts connections belongs to a running controller;
+    // only one nobody is listening on is stale and safe to replace.
+    match UnixStream::connect(path) {
+        Ok(_) => Err(ServiceError::ControllerAlreadyServing(path.to_owned())),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(crate) struct SocketGuard {

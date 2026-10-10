@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, io};
+use std::{error::Error, fmt, io, path::PathBuf};
 
 use waldo_socket::TransportError;
 
@@ -8,6 +8,7 @@ pub enum ServiceError {
     Settings(waldo_settings::SettingsError),
     Transport(TransportError),
     UnsafeSocketPath(String),
+    ControllerAlreadyServing(PathBuf),
     PeerCredential(String),
     ConnectionTask(String),
 }
@@ -24,6 +25,11 @@ impl fmt::Display for ServiceError {
                     "refusing unsafe controller socket path: {reason}"
                 )
             }
+            Self::ControllerAlreadyServing(path) => write!(
+                formatter,
+                "another controller is already serving {}",
+                path.display()
+            ),
             Self::PeerCredential(reason) => {
                 write!(formatter, "controller peer authentication failed: {reason}")
             }
