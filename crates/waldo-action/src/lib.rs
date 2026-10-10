@@ -41,6 +41,12 @@ pub trait ActionExecutor: Send + Sync {
         None
     }
 
+    /// Payload-free note about a route that is still usable, such as an
+    /// earlier write that is no longer offered.
+    fn caveat(&self, _route: ActionRoute) -> Option<String> {
+        None
+    }
+
     /// Releases any explicitly held input, tears down its virtual devices and
     /// restores preserved desktop state. Returns a payload-free reason when
     /// cleanup left state unrestored, so the boundary that asked for it can

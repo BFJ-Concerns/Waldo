@@ -17,7 +17,7 @@ pub(crate) trait PasteClipboard: ActionExecutor {
     type Snapshot;
     fn snapshot(&self) -> Result<Self::Snapshot, ProtocolError>;
     fn offer_text_once(&self, text: &str) -> Result<(), ActionExecutionFailure>;
-    fn is_empty(&self) -> Result<bool, ProtocolError>;
+    fn temporary_paste_delivered(&self) -> Result<bool, ProtocolError>;
     fn restore_temporary(&self, snapshot: Self::Snapshot) -> Result<(), ProtocolError>;
     fn clipboard_limitation(&self) -> Option<String>;
 }
@@ -33,8 +33,8 @@ impl PasteClipboard for ClipboardExecutor {
     fn offer_text_once(&self, text: &str) -> Result<(), ActionExecutionFailure> {
         self.offer_text_once(text)
     }
-    fn is_empty(&self) -> Result<bool, ProtocolError> {
-        self.is_empty()
+    fn temporary_paste_delivered(&self) -> Result<bool, ProtocolError> {
+        self.temporary_paste_delivered()
     }
     fn restore_temporary(&self, snapshot: Self::Snapshot) -> Result<(), ProtocolError> {
         self.restore_temporary(snapshot)
@@ -231,7 +231,7 @@ impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
                 );
                 return restore_after_failure(clipboard, snapshot, failure);
             }
-            match clipboard.is_empty() {
+            match clipboard.temporary_paste_delivered() {
                 Ok(true) => break,
                 Ok(false) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(10));
@@ -241,7 +241,7 @@ impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
                         ActionRoute::ClipboardPaste,
                         ProtocolError {
                             code: ErrorCode::BackendFailure,
-                            message: "application did not consume the temporary clipboard before the paste deadline".into(),
+                            message: "application did not take the temporary paste text before the paste deadline".into(),
                             retryable: true,
                         },
                     );
@@ -356,6 +356,13 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
             },
             _ => None,
         }
+    }
+
+    fn caveat(&self, route: ActionRoute) -> Option<String> {
+        self.clipboard
+            .as_ref()
+            .ok()
+            .and_then(|clipboard| clipboard.caveat(route))
     }
 
     fn release_all(&self) -> Option<String> {
@@ -473,7 +480,7 @@ mod tests {
         fn offer_text_once(&self, _: &str) -> Result<(), ActionExecutionFailure> {
             Ok(())
         }
-        fn is_empty(&self) -> Result<bool, ProtocolError> {
+        fn temporary_paste_delivered(&self) -> Result<bool, ProtocolError> {
             Ok(true)
         }
         fn restore_temporary(&self, _: ()) -> Result<(), ProtocolError> {

@@ -12,10 +12,7 @@ use waldo_protocol::{
     ConnectionId, DrivingSessionId, ErrorCode, ProtocolError,
 };
 use wl_clipboard_rs::{
-    copy::{
-        ClipboardType as CopyClipboardType, MimeType as CopyMimeType, Options, Seat as CopySeat,
-        ServeRequests, Source, clear,
-    },
+    copy::{ClipboardType as CopyClipboardType, Seat as CopySeat, clear},
     paste::{
         ClipboardType, Error as PasteError, MimeType as PasteMimeType, Seat, get_contents,
         get_mime_types,
@@ -23,6 +20,16 @@ use wl_clipboard_rs::{
 };
 
 const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
+
+/// The MIME types a temporary text paste is offered under, so text-only
+/// consumers and X11 bridges each find a name they ask for.
+const TEXT_MIME_TYPES: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+];
 
 /// Returns the named Wayland seat used for the regular clipboard.
 pub fn regular_clipboard_seat() -> Result<String, ProtocolError> {
@@ -50,7 +57,29 @@ struct PreservationState {
     fallback_restore: Option<ClipboardSnapshot>,
     published_restore: Option<ClipboardSnapshot>,
     publication: Option<stable_offer::Publication>,
+    /// A failed restoration of the operator's clipboard; mutation is blocked
+    /// until restoration succeeds.
     failure: Option<ProtocolError>,
+    /// An ordinary write's offer that stopped being served. It blocks
+    /// nothing and is cleared by the next write.
+    publication_failure: Option<ProtocolError>,
+}
+
+impl PreservationState {
+    /// Records a successful restoration of `snapshot`, published by
+    /// `publication` when it was not empty.
+    fn record_restoration(
+        &mut self,
+        snapshot: ClipboardSnapshot,
+        publication: Option<stable_offer::Publication>,
+    ) {
+        self.guard = None;
+        self.fallback_restore = None;
+        self.published_restore = publication.as_ref().map(|_| snapshot);
+        self.publication = publication;
+        self.failure = None;
+        self.publication_failure = None;
+    }
 }
 
 #[derive(Debug)]
@@ -90,34 +119,46 @@ impl ClipboardExecutor {
         })
     }
 
-    /// Offers temporary UTF-8 text and retires it after one paste request.
+    /// Offers temporary UTF-8 text and withdraws it after one completed
+    /// transfer.
     pub fn offer_text_once(&self, text: &str) -> Result<(), ActionExecutionFailure> {
         self.ensure_mutation_allowed()
             .map_err(ActionExecutionFailure::not_executed)?;
-        let mut options = Options::new();
-        options.seat(CopySeat::Specific(self.seat.clone()));
-        options.serve_requests(ServeRequests::Only(1));
-        options
-            .copy(Source::Bytes(text.as_bytes().into()), CopyMimeType::Text)
-            .map_err(|error| {
+        let representations = TEXT_MIME_TYPES
+            .iter()
+            .map(|mime_type| ((*mime_type).to_owned(), text.as_bytes().to_vec()))
+            .collect();
+        let publication =
+            stable_offer::publish_once(&self.seat, representations).map_err(|error| {
                 ActionExecutionFailure::indeterminate(
                     ActionRoute::Clipboard,
-                    backend_failure(format!("offer temporary paste text: {error}"), true),
+                    backend_failure(
+                        format!("offer temporary paste text: {}", error.message),
+                        error.retryable,
+                    ),
                 )
             })?;
-        self.replace_publication(None, None)
+        self.replace_publication(Some(publication), None)
             .map_err(|error| ActionExecutionFailure::indeterminate(ActionRoute::Clipboard, error))
     }
 
-    /// Reports whether the one-shot temporary clipboard has been consumed.
-    pub fn is_empty(&self) -> Result<bool, ProtocolError> {
-        match get_mime_types(ClipboardType::Regular, Seat::Specific(self.seat.as_str())) {
-            Ok(_) => Ok(false),
-            Err(PasteError::ClipboardEmpty) => Ok(true),
-            Err(error) => Err(backend_failure(
-                format!("inspect temporary Wayland clipboard: {error}"),
-                true,
+    /// Whether the temporary paste offer has delivered its text: false while
+    /// it waits, an error when serving it failed.
+    pub fn temporary_paste_delivered(&self) -> Result<bool, ProtocolError> {
+        let state = self
+            .preservation
+            .lock()
+            .map_err(|_| internal("clipboard preservation state lock is poisoned"))?;
+        let publication = state
+            .publication
+            .as_ref()
+            .ok_or_else(|| internal("no temporary paste offer is active"))?;
+        match publication.failure() {
+            Some(error) => Err(backend_failure(
+                format!("serve temporary paste text: {}", error.message),
+                error.retryable,
             )),
+            None => Ok(publication.delivered()),
         }
     }
 
@@ -214,22 +255,20 @@ impl ClipboardExecutor {
                 retryable: false,
             }));
         }
-        let mut options = Options::new();
-        options.seat(CopySeat::Specific(self.seat.clone()));
-        options
-            .copy(
-                Source::Bytes(data.into()),
-                CopyMimeType::Specific(mime_type.to_owned()),
-            )
+        let publication = stable_offer::publish(&self.seat, vec![(mime_type.to_owned(), data)])
             .map_err(|error| {
                 ActionExecutionFailure::indeterminate(
                     ActionRoute::Clipboard,
-                    backend_failure(format!("write Wayland clipboard: {error}"), true),
+                    backend_failure(
+                        format!("write Wayland clipboard: {}", error.message),
+                        error.retryable,
+                    ),
                 )
             })?;
-        self.replace_publication(None, None).map_err(|error| {
-            ActionExecutionFailure::indeterminate(ActionRoute::Clipboard, error)
-        })?;
+        self.replace_publication(Some(publication), None)
+            .map_err(|error| {
+                ActionExecutionFailure::indeterminate(ActionRoute::Clipboard, error)
+            })?;
         Ok(ActionRoute::Clipboard.into())
     }
 
@@ -364,11 +403,7 @@ impl ClipboardExecutor {
         let result = restore(&snapshot);
         match result {
             Ok(publication) => {
-                state.guard = None;
-                state.fallback_restore = None;
-                state.published_restore = publication.as_ref().map(|_| snapshot);
-                state.publication = publication;
-                state.failure = None;
+                state.record_restoration(snapshot, publication);
                 Ok(ActionRoute::Clipboard.into())
             }
             Err(error) => {
@@ -468,11 +503,7 @@ impl ClipboardExecutor {
         };
         match restore(&snapshot) {
             Ok(publication) => {
-                state.guard = None;
-                state.fallback_restore = None;
-                state.published_restore = publication.as_ref().map(|_| snapshot);
-                state.publication = publication;
-                state.failure = None;
+                state.record_restoration(snapshot, publication);
                 Ok(())
             }
             Err(error) => {
@@ -482,11 +513,25 @@ impl ClipboardExecutor {
         }
     }
 
-    /// Returns a payload-free marker for an unresolved restoration failure.
+    /// Returns a payload-free marker for an unresolved restoration failure,
+    /// which blocks clipboard mutation.
     pub fn limitation(&self) -> Option<String> {
         let mut state = self.preservation.lock().ok()?;
         Self::promote_publication_failure(&mut state);
         state.failure.as_ref().map(restoration_limitation)
+    }
+
+    /// Returns a payload-free note that the last write's offer stopped being
+    /// served. It blocks nothing; the next write replaces the offer.
+    pub fn publication_caveat(&self) -> Option<String> {
+        let mut state = self.preservation.lock().ok()?;
+        Self::promote_publication_failure(&mut state);
+        state.publication_failure.as_ref().map(|error| {
+            format!(
+                "the last clipboard write is no longer offered: {}; the next clipboard write replaces it",
+                error.message
+            )
+        })
     }
 
     fn ensure_mutation_allowed(&self) -> Result<(), ProtocolError> {
@@ -516,9 +561,13 @@ impl ClipboardExecutor {
         }
         state.publication = publication;
         state.published_restore = published_restore;
+        state.publication_failure = None;
         Ok(())
     }
 
+    /// Moves a serving failure out of the current publication. A restored
+    /// clipboard that stopped being served is a restoration failure, which
+    /// blocks mutation; an ordinary write's is only reported.
     fn promote_publication_failure(state: &mut PreservationState) {
         if state.failure.is_some() {
             return;
@@ -530,10 +579,16 @@ impl ClipboardExecutor {
         else {
             return;
         };
-        if state.fallback_restore.is_none() {
-            state.fallback_restore = state.published_restore.take();
+        state.publication = None;
+        match state.published_restore.take() {
+            Some(restore) => {
+                if state.fallback_restore.is_none() {
+                    state.fallback_restore = Some(restore);
+                }
+                state.failure = Some(error);
+            }
+            None => state.publication_failure = Some(error),
         }
-        state.failure = Some(error);
     }
 }
 
@@ -575,6 +630,12 @@ impl ActionExecutor for ClipboardExecutor {
     fn limitation(&self, route: ActionRoute) -> Option<String> {
         (route == ActionRoute::Clipboard)
             .then(|| self.limitation())
+            .flatten()
+    }
+
+    fn caveat(&self, route: ActionRoute) -> Option<String> {
+        (route == ActionRoute::Clipboard)
+            .then(|| self.publication_caveat())
             .flatten()
     }
 
@@ -887,6 +948,31 @@ mod tests {
     }
 
     #[test]
+    fn an_ordinary_write_that_stops_being_served_is_reported_without_blocking() {
+        let executor = guarded_executor(ConnectionId::new(1), DrivingSessionId::new(1));
+        {
+            let mut state = executor.preservation.lock().unwrap();
+            state.guard = None;
+            state.publication = Some(super::stable_offer::Publication::failed(backend_failure(
+                "consumer descriptor rejected the write",
+                true,
+            )));
+        }
+
+        assert!(executor.ensure_mutation_allowed().is_ok());
+        assert!(executor.limitation().is_none());
+        let caveat = executor.publication_caveat().unwrap();
+        assert!(caveat.contains("no longer offered"), "{caveat}");
+        assert!(
+            caveat.contains("next clipboard write replaces it"),
+            "{caveat}"
+        );
+
+        executor.replace_publication(None, None).unwrap();
+        assert!(executor.publication_caveat().is_none());
+    }
+
+    #[test]
     fn background_publication_failure_promotes_the_private_restore_fallback() {
         let executor = guarded_executor(ConnectionId::new(1), DrivingSessionId::new(1));
         let snapshot = {
@@ -1092,6 +1178,7 @@ mod tests {
                 published_restore: None,
                 publication: None,
                 failure: None,
+                publication_failure: None,
             }),
         }
     }

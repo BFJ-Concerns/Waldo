@@ -360,7 +360,8 @@ pub(crate) fn enable_action_capabilities(
             capabilities.clipboard.limitation = Some(limitation);
         } else if executor.supports(waldo_protocol::ActionRoute::Clipboard) {
             capabilities.clipboard.available = true;
-            capabilities.clipboard.limitation = None;
+            capabilities.clipboard.limitation =
+                executor.caveat(waldo_protocol::ActionRoute::Clipboard);
         }
     }
 }

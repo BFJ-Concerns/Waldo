@@ -3,7 +3,11 @@ use std::{
     io::{ErrorKind, Read},
     os::fd::{AsFd, OwnedFd},
     os::unix::net::UnixStream,
-    sync::{Arc, Mutex, mpsc::sync_channel},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::sync_channel,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -34,41 +38,121 @@ use wayland_protocols_wlr::data_control::v1::client::{
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ROUNDTRIP_EVENTS: usize = 65_536;
 
-pub(crate) fn probe() -> Result<String, ProtocolError> {
+/// A Wayland connection whose globals and named seats have been read.
+struct Discovered {
+    connection: Connection,
+    queue: EventQueue<OfferState>,
+    registry: WlRegistry,
+    state: OfferState,
+}
+
+/// Connects, then reads the globals and every seat's name within the
+/// deadline: the setup every clipboard operation starts from.
+fn discover(
+    state: OfferState,
+    deadline: Instant,
+    purpose: &str,
+) -> Result<Discovered, ProtocolError> {
     let connection = Connection::connect_to_env()
         .map_err(|error| backend_failure(format!("connect to Wayland: {error}"), true))?;
-    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
-    let mut queue = connection.new_event_queue::<OfferState>();
+    let queue = connection.new_event_queue::<OfferState>();
     let qh = queue.handle();
     let registry = connection.display().get_registry(&qh, ());
-    let mut state = OfferState::default();
-    bounded_roundtrip(
-        &connection,
-        &mut queue,
-        &mut state,
-        deadline,
-        "discover Wayland globals",
-    )?;
-    let data_control = state.globals.iter().any(|global| {
-        matches!(
-            global.interface.as_str(),
-            "ext_data_control_manager_v1" | "zwlr_data_control_manager_v1"
+    let mut discovered = Discovered {
+        connection,
+        queue,
+        registry,
+        state,
+    };
+    discovered.roundtrip(deadline, &format!("discover Wayland globals {purpose}"))?;
+    bind_seats(&discovered.registry, &qh, &mut discovered.state);
+    discovered.roundtrip(deadline, &format!("read Wayland seat names {purpose}"))?;
+    Ok(discovered)
+}
+
+/// The data-control manager the compositor offers, preferring the
+/// standard ext protocol over the wlr one.
+enum DataControlManager {
+    Ext(ExtDataControlManagerV1),
+    Wlr(ZwlrDataControlManagerV1),
+}
+
+impl Discovered {
+    fn roundtrip(&mut self, deadline: Instant, operation: &str) -> Result<(), ProtocolError> {
+        bounded_roundtrip(
+            &self.connection,
+            &mut self.queue,
+            &mut self.state,
+            deadline,
+            operation,
         )
-    });
-    if !data_control {
+    }
+
+    fn has_data_control(&self) -> bool {
+        self.state.globals.iter().any(|global| {
+            matches!(
+                global.interface.as_str(),
+                "ext_data_control_manager_v1" | "zwlr_data_control_manager_v1"
+            )
+        })
+    }
+
+    fn seat(&self, seat_name: &str) -> Option<WlSeat> {
+        self.state
+            .seats
+            .iter()
+            .find(|seat| seat.name.as_deref() == Some(seat_name))
+            .map(|seat| seat.proxy.clone())
+    }
+
+    fn data_control_manager(&self) -> Option<DataControlManager> {
+        let qh = self.queue.handle();
+        let global = |interface: &str| {
+            self.state
+                .globals
+                .iter()
+                .find(|global| global.interface == interface)
+                .cloned()
+        };
+        if let Some(global) = global("ext_data_control_manager_v1") {
+            return Some(DataControlManager::Ext(self.registry.bind(
+                global.name,
+                global.version.min(1),
+                &qh,
+                (),
+            )));
+        }
+        global("zwlr_data_control_manager_v1").map(|global| {
+            DataControlManager::Wlr(
+                self.registry
+                    .bind(global.name, global.version.min(2), &qh, ()),
+            )
+        })
+    }
+
+    /// Fails when the compositor ended Waldo's data-control device, which
+    /// no longer reports the clipboard after that.
+    fn require_live_device(&self, operation: &str) -> Result<(), ProtocolError> {
+        if self.state.device_finished {
+            return Err(backend_failure(
+                format!("{operation}: the compositor ended Waldo's clipboard data control"),
+                true,
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn probe() -> Result<String, ProtocolError> {
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    let discovered = discover(OfferState::default(), deadline, "for the clipboard")?;
+    if !discovered.has_data_control() {
         return Err(unsupported(
             "stable clipboard preservation requires a Wayland seat and ext-data-control or wlr-data-control",
         ));
     }
-    bind_seats(&registry, &qh, &mut state);
-    bounded_roundtrip(
-        &connection,
-        &mut queue,
-        &mut state,
-        deadline,
-        "read Wayland seat names",
-    )?;
-    state
+    discovered
+        .state
         .seats
         .iter()
         .find_map(|seat| seat.name.clone())
@@ -79,72 +163,37 @@ pub(crate) fn snapshot(
     seat_name: &str,
     max_bytes: usize,
 ) -> Result<Vec<(String, Vec<u8>)>, ProtocolError> {
-    let connection = Connection::connect_to_env()
-        .map_err(|error| backend_failure(format!("connect to Wayland: {error}"), true))?;
     let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
-    let mut queue = connection.new_event_queue::<OfferState>();
-    let qh = queue.handle();
-    let registry = connection.display().get_registry(&qh, ());
-    let mut state = OfferState::default();
-    bounded_roundtrip(
-        &connection,
-        &mut queue,
-        &mut state,
-        deadline,
-        "discover Wayland globals",
-    )?;
-    bind_seats(&registry, &qh, &mut state);
-    bounded_roundtrip(
-        &connection,
-        &mut queue,
-        &mut state,
-        deadline,
-        "read Wayland seat names",
-    )?;
-    let seat = state
-        .seats
-        .iter()
-        .find(|seat| seat.name.as_deref() == Some(seat_name))
-        .map(|seat| seat.proxy.clone())
-        .ok_or_else(|| {
-            unsupported(format!(
-                "configured clipboard seat {seat_name:?} is no longer available"
-            ))
-        })?;
-    let ext_manager = state
-        .globals
-        .iter()
-        .find(|global| global.interface == "ext_data_control_manager_v1")
-        .cloned();
-    let wlr_manager = state
-        .globals
-        .iter()
-        .find(|global| global.interface == "zwlr_data_control_manager_v1")
-        .cloned();
-    match (ext_manager, wlr_manager) {
-        (Some(global), _) => {
-            let manager: ExtDataControlManagerV1 =
-                registry.bind(global.name, global.version.min(1), &qh, ());
+    let mut discovered = discover(OfferState::default(), deadline, "for the clipboard")?;
+    let seat = discovered.seat(seat_name).ok_or_else(|| {
+        unsupported(format!(
+            "configured clipboard seat {seat_name:?} is no longer available"
+        ))
+    })?;
+    let qh = discovered.queue.handle();
+    match discovered.data_control_manager() {
+        Some(DataControlManager::Ext(manager)) => {
             manager.get_data_device(&seat, &qh, ());
         }
-        (None, Some(global)) => {
-            let manager: ZwlrDataControlManagerV1 =
-                registry.bind(global.name, global.version.min(2), &qh, ());
+        Some(DataControlManager::Wlr(manager)) => {
             manager.get_data_device(&seat, &qh, ());
         }
-        (None, None) => {
+        None => {
             return Err(unsupported(
                 "stable clipboard preservation requires ext-data-control or wlr-data-control",
             ));
         }
     }
-    bounded_roundtrip(
-        &connection,
-        &mut queue,
-        &mut state,
-        deadline,
-        "read current clipboard offer",
-    )?;
+    discovered.roundtrip(deadline, "read current clipboard offer")?;
+    // A device the compositor ended reports no selection, which would
+    // otherwise read as an empty clipboard.
+    discovered.require_live_device("read current clipboard offer")?;
+    let Discovered {
+        connection,
+        mut queue,
+        mut state,
+        ..
+    } = discovered;
     let Some(selection) = state.selection.clone() else {
         return Ok(Vec::new());
     };
@@ -185,6 +234,12 @@ pub(crate) fn snapshot(
         deadline,
         "confirm stable clipboard offer generation",
     )?;
+    if state.device_finished {
+        return Err(backend_failure(
+            "confirm stable clipboard offer generation: the compositor ended Waldo's clipboard data control",
+            true,
+        ));
+    }
     if state.selection_generation != generation
         || state.selection.as_ref().map(ClipboardOffer::id) != Some(selection.id())
     {
@@ -197,18 +252,50 @@ pub(crate) fn snapshot(
     Ok(representations)
 }
 
+/// Owns the clipboard with these representations, served until another
+/// owner replaces them.
 pub(crate) fn publish(
     seat_name: &str,
     representations: Vec<(String, Vec<u8>)>,
 ) -> Result<Publication, ProtocolError> {
+    publish_with(seat_name, representations, None)
+}
+
+/// Owns the clipboard for exactly one completed transfer, then withdraws
+/// the offer; [`Publication::delivered`] reports that transfer.
+pub(crate) fn publish_once(
+    seat_name: &str,
+    representations: Vec<(String, Vec<u8>)>,
+) -> Result<Publication, ProtocolError> {
+    publish_with(seat_name, representations, Some(1))
+}
+
+fn publish_with(
+    seat_name: &str,
+    representations: Vec<(String, Vec<u8>)>,
+    transfers: Option<u32>,
+) -> Result<Publication, ProtocolError> {
     let seat_name = seat_name.to_owned();
     let publication = Publication {
         failure: Arc::new(Mutex::new(None)),
+        delivered: Arc::new(AtomicBool::new(false)),
     };
     let background_publication = publication.clone();
+    let delivered = Arc::clone(&publication.delivered);
     coordinate_publication(
         SNAPSHOT_TIMEOUT,
-        move |deadline| prepare_publication(&seat_name, representations, deadline),
+        move |deadline| {
+            prepare_publication(
+                &seat_name,
+                OfferState {
+                    publication: representations,
+                    transfers_remaining: transfers,
+                    delivered: Some(delivered),
+                    ..OfferState::default()
+                },
+                deadline,
+            )
+        },
         move |(mut queue, mut state)| {
             if let Err(error) = serve_owned_publication(&mut queue, &mut state) {
                 background_publication.record_failure(error);
@@ -288,9 +375,15 @@ where
 #[derive(Clone, Debug)]
 pub(crate) struct Publication {
     failure: Arc<Mutex<Option<ProtocolError>>>,
+    delivered: Arc<AtomicBool>,
 }
 
 impl Publication {
+    /// Whether a one-shot offer completed its transfer to a consumer.
+    pub(crate) fn delivered(&self) -> bool {
+        self.delivered.load(Ordering::Acquire)
+    }
+
     pub(crate) fn failure(&self) -> Option<ProtocolError> {
         self.failure
             .lock()
@@ -309,6 +402,7 @@ impl Publication {
     pub(crate) fn failed(error: ProtocolError) -> Self {
         let publication = Self {
             failure: Arc::new(Mutex::new(None)),
+            delivered: Arc::new(AtomicBool::new(false)),
         };
         publication.record_failure(error);
         publication
@@ -319,19 +413,21 @@ fn serve_owned_publication(
     queue: &mut EventQueue<OfferState>,
     state: &mut OfferState,
 ) -> Result<(), ProtocolError> {
-    while !state.publication_cancelled {
+    loop {
+        // A failure recorded while preparing, or by the last dispatch, ends
+        // serving with that failure even when it also cancelled the offer.
+        if let Some(error) = state.publication_failure.take() {
+            return Err(error);
+        }
+        if state.publication_cancelled {
+            return Ok(());
+        }
         let dispatched = queue.dispatch_pending(state).map_err(|error| {
             backend_failure(
                 format!("serve ordered clipboard publication: dispatch events: {error}"),
                 true,
             )
         })?;
-        if let Some(error) = state.publication_failure.take() {
-            return Err(error);
-        }
-        if state.publication_cancelled {
-            break;
-        }
         if dispatched > 0 {
             continue;
         }
@@ -354,7 +450,6 @@ fn serve_owned_publication(
             })?;
         }
     }
-    Ok(())
 }
 
 fn wait_for_publication_readable(
@@ -390,88 +485,49 @@ fn wait_for_publication_readable(
 
 fn prepare_publication(
     seat_name: &str,
-    representations: Vec<(String, Vec<u8>)>,
+    state: OfferState,
     deadline: Instant,
 ) -> Result<(EventQueue<OfferState>, OfferState), ProtocolError> {
-    let connection = Connection::connect_to_env()
-        .map_err(|error| backend_failure(format!("connect to Wayland: {error}"), true))?;
-    let mut queue = connection.new_event_queue::<OfferState>();
-    let qh = queue.handle();
-    let registry = connection.display().get_registry(&qh, ());
-    let mut state = OfferState {
-        publication: representations,
-        ..OfferState::default()
-    };
-    bounded_roundtrip(
-        &connection,
-        &mut queue,
-        &mut state,
-        deadline,
-        "discover Wayland globals for clipboard publication",
-    )?;
-    bind_seats(&registry, &qh, &mut state);
-    bounded_roundtrip(
-        &connection,
-        &mut queue,
-        &mut state,
-        deadline,
-        "read Wayland seat names for clipboard publication",
-    )?;
-    let seat = state
-        .seats
-        .iter()
-        .find(|seat| seat.name.as_deref() == Some(seat_name))
-        .map(|seat| seat.proxy.clone())
+    let mut discovered = discover(state, deadline, "for clipboard publication")?;
+    let seat = discovered
+        .seat(seat_name)
         .ok_or_else(|| unsupported(format!("clipboard seat {seat_name:?} is unavailable")))?;
-    let ext_manager = state
-        .globals
-        .iter()
-        .find(|global| global.interface == "ext_data_control_manager_v1")
-        .cloned();
-    let wlr_manager = state
-        .globals
-        .iter()
-        .find(|global| global.interface == "zwlr_data_control_manager_v1")
-        .cloned();
-    match (ext_manager, wlr_manager) {
-        (Some(global), _) => {
-            let manager: ExtDataControlManagerV1 =
-                registry.bind(global.name, global.version.min(1), &qh, ());
+    let qh = discovered.queue.handle();
+    match discovered.data_control_manager() {
+        Some(DataControlManager::Ext(manager)) => {
             let source = manager.create_data_source(&qh, ());
-            for (mime_type, _) in &state.publication {
+            for (mime_type, _) in &discovered.state.publication {
                 source.offer(mime_type.clone());
             }
             let device = manager.get_data_device(&seat, &qh, ());
             require_deadline(deadline, "claim ordered clipboard publication")?;
             device.set_selection(Some(&source));
-            state.owned_source = Some(ClipboardSource::Ext { _proxy: source });
+            discovered.state.owned_source = Some(ClipboardSource::Ext { _proxy: source });
         }
-        (None, Some(global)) => {
-            let manager: ZwlrDataControlManagerV1 =
-                registry.bind(global.name, global.version.min(2), &qh, ());
+        Some(DataControlManager::Wlr(manager)) => {
             let source = manager.create_data_source(&qh, ());
-            for (mime_type, _) in &state.publication {
+            for (mime_type, _) in &discovered.state.publication {
                 source.offer(mime_type.clone());
             }
             let device = manager.get_data_device(&seat, &qh, ());
             require_deadline(deadline, "claim ordered clipboard publication")?;
             device.set_selection(Some(&source));
-            state.owned_source = Some(ClipboardSource::Wlr { _proxy: source });
+            discovered.state.owned_source = Some(ClipboardSource::Wlr { _proxy: source });
         }
-        (None, None) => {
+        None => {
             return Err(unsupported(
                 "ordered clipboard publication requires ext-data-control or wlr-data-control",
             ));
         }
     }
-    bounded_roundtrip(
-        &connection,
-        &mut queue,
-        &mut state,
-        deadline,
-        "acknowledge ordered clipboard publication",
-    )?;
-    Ok((queue, state))
+    discovered.roundtrip(deadline, "acknowledge ordered clipboard publication")?;
+    discovered.require_live_device("acknowledge ordered clipboard publication")?;
+    // A consumer may already have requested the offer during that roundtrip;
+    // its failure must refuse the publication rather than wait for serving.
+    if let Some(error) = discovered.state.publication_failure.take() {
+        return Err(error);
+    }
+    Ok((discovered.queue, discovered.state))
 }
 
 fn require_deadline(deadline: Instant, operation: &str) -> Result<(), ProtocolError> {
@@ -483,6 +539,33 @@ fn require_deadline(deadline: Instant, operation: &str) -> Result<(), ProtocolEr
             true,
         ))
     }
+}
+
+impl OfferState {
+    /// Counts one completed transfer. Returns true when a one-shot offer has
+    /// now served its transfers and must withdraw itself.
+    fn record_completed_transfer(&mut self) -> bool {
+        let Some(remaining) = self.transfers_remaining.as_mut() else {
+            return false;
+        };
+        *remaining = remaining.saturating_sub(1);
+        if *remaining > 0 {
+            return false;
+        }
+        if let Some(delivered) = &self.delivered {
+            delivered.store(true, Ordering::Release);
+        }
+        self.publication_cancelled = true;
+        true
+    }
+}
+
+/// How one consumer's transfer request ended.
+#[derive(Debug, PartialEq)]
+enum Transfer {
+    Completed,
+    /// The consumer closed its end before reading everything.
+    Abandoned,
 }
 
 #[derive(Default)]
@@ -497,6 +580,11 @@ struct OfferState {
     owned_source: Option<ClipboardSource>,
     publication_cancelled: bool,
     publication_failure: Option<ProtocolError>,
+    /// Transfers left before a one-shot offer withdraws itself; `None` for
+    /// an offer served until it is replaced.
+    transfers_remaining: Option<u32>,
+    delivered: Option<Arc<AtomicBool>>,
+    device_finished: bool,
 }
 
 #[derive(Clone)]
@@ -632,7 +720,7 @@ impl Dispatch<ExtDataControlManagerV1, ()> for OfferState {
 impl Dispatch<ZwlrDataControlDeviceV1, ()> for OfferState {
     fn event(
         state: &mut Self,
-        _proxy: &ZwlrDataControlDeviceV1,
+        proxy: &ZwlrDataControlDeviceV1,
         event: <ZwlrDataControlDeviceV1 as Proxy>::Event,
         _data: &(),
         _connection: &Connection,
@@ -647,6 +735,10 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for OfferState {
                 state.selection = id.map(ClipboardOffer::Wlr);
                 state.selection_generation = state.selection_generation.saturating_add(1);
             }
+            zwlr_data_control_device_v1::Event::Finished => {
+                proxy.destroy();
+                state.device_finished = true;
+            }
             _ => {}
         }
     }
@@ -659,7 +751,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for OfferState {
 impl Dispatch<ExtDataControlDeviceV1, ()> for OfferState {
     fn event(
         state: &mut Self,
-        _proxy: &ExtDataControlDeviceV1,
+        proxy: &ExtDataControlDeviceV1,
         event: <ExtDataControlDeviceV1 as Proxy>::Event,
         _data: &(),
         _connection: &Connection,
@@ -673,6 +765,10 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for OfferState {
             ext_data_control_device_v1::Event::Selection { id } => {
                 state.selection = id.map(ClipboardOffer::Ext);
                 state.selection_generation = state.selection_generation.saturating_add(1);
+            }
+            ext_data_control_device_v1::Event::Finished => {
+                proxy.destroy();
+                state.device_finished = true;
             }
             _ => {}
         }
@@ -734,9 +830,17 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for OfferState {
     ) {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
-                if let Err(error) = serve_publication(&state.publication, &mime_type, fd) {
-                    state.publication_failure = Some(error);
-                    state.publication_cancelled = true;
+                match serve_publication(&state.publication, &mime_type, fd) {
+                    Ok(Transfer::Completed) => {
+                        if state.record_completed_transfer() {
+                            proxy.destroy();
+                        }
+                    }
+                    Ok(Transfer::Abandoned) => {}
+                    Err(error) => {
+                        state.publication_failure = Some(error);
+                        state.publication_cancelled = true;
+                    }
                 }
             }
             zwlr_data_control_source_v1::Event::Cancelled => {
@@ -759,9 +863,17 @@ impl Dispatch<ExtDataControlSourceV1, ()> for OfferState {
     ) {
         match event {
             ext_data_control_source_v1::Event::Send { mime_type, fd } => {
-                if let Err(error) = serve_publication(&state.publication, &mime_type, fd) {
-                    state.publication_failure = Some(error);
-                    state.publication_cancelled = true;
+                match serve_publication(&state.publication, &mime_type, fd) {
+                    Ok(Transfer::Completed) => {
+                        if state.record_completed_transfer() {
+                            proxy.destroy();
+                        }
+                    }
+                    Ok(Transfer::Abandoned) => {}
+                    Err(error) => {
+                        state.publication_failure = Some(error);
+                        state.publication_cancelled = true;
+                    }
                 }
             }
             ext_data_control_source_v1::Event::Cancelled => {
@@ -777,7 +889,7 @@ fn serve_publication(
     representations: &[(String, Vec<u8>)],
     mime_type: &str,
     fd: OwnedFd,
-) -> Result<(), ProtocolError> {
+) -> Result<Transfer, ProtocolError> {
     let (_, data) = representations
         .iter()
         .find(|(offered_mime, _)| offered_mime == mime_type)
@@ -789,7 +901,7 @@ fn serve_publication(
         })?;
     let mut destination = std::fs::File::from(fd);
     match destination.write_all(data) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(Transfer::Completed),
         // Closing a per-request transfer descriptor abandons only that consumer's
         // read. The advertised offer and its ownership remain valid.
         Err(error)
@@ -798,7 +910,7 @@ fn serve_publication(
                 ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
             ) =>
         {
-            Ok(())
+            Ok(Transfer::Abandoned)
         }
         Err(error) => Err(backend_failure(
             format!("serve ordered clipboard representation to consumer: {error}"),
@@ -993,8 +1105,8 @@ mod tests {
     };
 
     use super::{
-        SNAPSHOT_TIMEOUT, coordinate_publication, read_representation, serve_publication,
-        wait_for_publication_readable, wait_for_readable,
+        OfferState, SNAPSHOT_TIMEOUT, Transfer, coordinate_publication, read_representation,
+        serve_publication, wait_for_publication_readable, wait_for_readable,
     };
 
     struct FakeOwnership(Arc<AtomicBool>);
@@ -1043,12 +1155,32 @@ mod tests {
         let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
         drop(reader);
 
-        serve_publication(
+        let transfer = serve_publication(
             &[("text/plain".into(), b"payload".to_vec())],
             "text/plain",
             writer.into(),
         )
         .unwrap();
+
+        // The offer survives, but the abandoned read delivered nothing.
+        assert_eq!(transfer, Transfer::Abandoned);
+    }
+
+    #[test]
+    fn a_one_shot_offer_counts_only_a_completed_transfer_as_delivery() {
+        let delivered = Arc::new(AtomicBool::new(false));
+        let mut state = OfferState {
+            transfers_remaining: Some(1),
+            delivered: Some(Arc::clone(&delivered)),
+            ..OfferState::default()
+        };
+        let mut persistent = OfferState::default();
+
+        assert!(state.record_completed_transfer());
+        assert!(delivered.load(Ordering::Acquire));
+        assert!(state.publication_cancelled);
+        assert!(!persistent.record_completed_transfer());
+        assert!(!persistent.publication_cancelled);
     }
 
     #[test]
