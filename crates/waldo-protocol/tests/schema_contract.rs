@@ -90,6 +90,47 @@ fn unknown_action_variants_fail_closed() {
 }
 
 #[test]
+fn unsupported_fields_inside_requests_are_refused() {
+    // Each valid request, and the field added to it that it does not take.
+    let cases = [
+        // A selector mixing two sources' identities.
+        (
+            r#"{"type":"observe","request_id":2,"request":{"source":{"type":"output","output_id":"DP-1"},"include_accessibility":false}}"#,
+            r#""output_id":"DP-1""#,
+            r#""output_id":"DP-1","window_id":"7""#,
+        ),
+        // An action parameter.
+        (
+            r#"{"type":"act","request_id":3,"request":{"observation_id":1,"actions":[{"type":"key","key":"Return","state":"pressed"}],"verification":[]}}"#,
+            r#""state":"pressed""#,
+            r#""state":"pressed","repeat":3"#,
+        ),
+        // A predicate parameter.
+        (
+            r#"{"type":"act","request_id":4,"request":{"observation_id":1,"actions":[],"verification":[{"type":"process_exited","pid":4}]}}"#,
+            r#""pid":4"#,
+            r#""pid":4,"signal":9"#,
+        ),
+        // An envelope field outside the message's own.
+        (
+            r#"{"type":"stop","request_id":5,"request":{}}"#,
+            r#""request":{}"#,
+            r#""request":{},"force":true"#,
+        ),
+    ];
+    for (valid, field, extended) in cases {
+        serde_json::from_str::<ClientMessage>(valid)
+            .unwrap_or_else(|error| panic!("{valid}: {error}"));
+        let refused = valid.replacen(field, extended, 1);
+        assert_ne!(refused, valid);
+        assert!(
+            serde_json::from_str::<ClientMessage>(&refused).is_err(),
+            "accepted {refused}"
+        );
+    }
+}
+
+#[test]
 fn additive_result_fields_are_ignored_by_older_readers() {
     let json = r#"
         {

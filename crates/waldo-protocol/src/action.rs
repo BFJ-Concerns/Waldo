@@ -44,7 +44,7 @@ pub struct ClipboardRepresentation {
 
 /// A deterministic accessibility operation against an opaque element handle.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AccessibilityOperation {
     Invoke { action: String },
     SetText { text: String },
@@ -55,7 +55,7 @@ pub enum AccessibilityOperation {
 
 /// Niri-native operations against a positively identified window.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WindowOperation {
     Focus,
     Close,
@@ -66,7 +66,7 @@ pub enum WindowOperation {
 
 /// Niri-native operations against a positively identified workspace.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkspaceOperation {
     Focus,
     MoveToOutput { output: String },
@@ -74,7 +74,7 @@ pub enum WorkspaceOperation {
 
 /// Mechanical conditions which may be waited for or verified.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Predicate {
     FrameChanged {
         from: ObservationId,
@@ -100,7 +100,7 @@ pub enum Predicate {
 
 /// One locally executed member of an ordered action batch.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     PointerMoveAbsolute {
         position: LogicalPoint,
