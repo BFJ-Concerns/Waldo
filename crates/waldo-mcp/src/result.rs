@@ -8,9 +8,12 @@ use waldo_protocol::{ErrorCode, Observation, PixelSize, ProtocolError, ServerMes
 use crate::tools::ToolResult;
 
 /// Renders a controller response as an MCP tool result. `isError` is set for
-/// a protocol error, a batch that did not complete, and an observation image
-/// that could not be presented; an inconclusive application outcome on a
-/// completed batch is not an error.
+/// a protocol error, a batch that did not complete, a Stop whose clean-up
+/// left desktop state unrestored, and an observation image that could not
+/// be presented; an inconclusive application outcome on a completed batch
+/// is not an error. The structured content is the controller's whole
+/// response either way, so a Stop's released session and clean-up
+/// limitation stay readable beside the error flag.
 pub(crate) fn tool_response(mut response: ServerMessage, max_edge: NonZeroU32) -> Value {
     if let ServerMessage::Error { error, .. } = &response {
         return tool_failure(error.clone());
@@ -19,6 +22,10 @@ pub(crate) fn tool_response(mut response: ServerMessage, max_edge: NonZeroU32) -
     let batch_failed = matches!(
         &response,
         ServerMessage::Acted { result, .. } if result.stop_reason != StopReason::Completed
+    );
+    let cleanup_failed = matches!(
+        &response,
+        ServerMessage::Stopped { result, .. } if result.cleanup_limitation.is_some()
     );
     let presentation = present_response_images(&mut response, max_edge);
     let mut response = serde_json::to_value(response).expect("controller responses serialise");
@@ -44,7 +51,7 @@ pub(crate) fn tool_response(mut response: ServerMessage, max_edge: NonZeroU32) -
     serde_json::to_value(ToolResult {
         content,
         structured_content: Some(structured),
-        is_error: batch_failed || presentation.is_err(),
+        is_error: batch_failed || cleanup_failed || presentation.is_err(),
     })
     .expect("tool result serialises")
 }
@@ -271,6 +278,37 @@ mod tests {
             "failed"
         );
         assert!(completed.get("isError").is_none());
+    }
+
+    #[test]
+    fn a_stop_whose_cleanup_left_state_unrestored_is_a_tool_error() {
+        let edge = std::num::NonZeroU32::new(64).unwrap();
+        let stopped = |cleanup_limitation: Option<&str>| waldo_protocol::ServerMessage::Stopped {
+            request_id: waldo_protocol::RequestId::new(9),
+            result: waldo_protocol::StopResult {
+                released_session: Some(waldo_protocol::DrivingSessionId::new(3)),
+                cleanup_limitation: cleanup_limitation.map(str::to_owned),
+            },
+        };
+
+        let clean = super::tool_response(stopped(None), edge);
+        let unrestored = super::tool_response(
+            stopped(Some(
+                "clipboard mutation is blocked until exact restoration succeeds",
+            )),
+            edge,
+        );
+
+        assert!(clean.get("isError").is_none());
+        assert_eq!(unrestored["isError"], true);
+        assert_eq!(
+            unrestored["structuredContent"]["result"]["released_session"],
+            3
+        );
+        assert_eq!(
+            unrestored["structuredContent"]["result"]["cleanup_limitation"],
+            "clipboard mutation is blocked until exact restoration succeeds"
+        );
     }
 
     #[test]
