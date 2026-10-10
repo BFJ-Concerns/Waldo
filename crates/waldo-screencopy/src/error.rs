@@ -32,7 +32,7 @@ impl fmt::Display for CaptureError {
             Self::InvalidBuffer(reason) => write!(formatter, "invalid screencopy buffer: {reason}"),
             Self::TimedOut => formatter.write_str("Niri screencopy timed out"),
             Self::CompositorFailed => formatter.write_str("Niri reported screencopy failure"),
-            Self::Io(error) => write!(formatter, "screencopy shared memory failed: {error}"),
+            Self::Io(error) => write!(formatter, "screencopy I/O failed: {error}"),
             Self::Image(error) => write!(formatter, "PNG encoding failed: {error}"),
         }
     }

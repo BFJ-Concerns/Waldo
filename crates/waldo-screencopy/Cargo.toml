@@ -14,7 +14,6 @@ memmap2.workspace = true
 nix.workspace = true
 wayland-client.workspace = true
 wayland-protocols-wlr.workspace = true
-waldo-protocol = { path = "../waldo-protocol" }
 
 [dev-dependencies]
 niri-ipc.workspace = true

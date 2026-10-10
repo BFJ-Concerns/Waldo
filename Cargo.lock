@@ -1349,7 +1349,6 @@ dependencies = [
  "memmap2",
  "niri-ipc",
  "nix",
- "waldo-protocol",
  "wayland-client",
  "wayland-protocols-wlr",
 ]

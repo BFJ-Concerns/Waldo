@@ -85,11 +85,18 @@ impl Screencopy {
             .map_err(|_| CaptureError::ProtocolMissing("zwlr_screencopy_manager_v1"))?;
         let mut state = State::new(shm);
 
+        let mut too_old = None;
         globals.contents().with_list(|list| {
             for global in list.iter().filter(|global| global.interface == "wl_output") {
+                // Version 4 is the first that reports the output names
+                // captures are requested by.
+                if global.version < 4 {
+                    too_old = Some(global.version);
+                    continue;
+                }
                 let output = globals.registry().bind::<wl_output::WlOutput, _, _>(
                     global.name,
-                    global.version.min(4),
+                    4,
                     &handle,
                     (),
                 );
@@ -100,6 +107,11 @@ impl Screencopy {
                 });
             }
         });
+        if let Some(version) = too_old {
+            return Err(CaptureError::Wayland(format!(
+                "the compositor offers wl_output version {version}; capture needs version 4 for output names"
+            )));
+        }
         queue
             .roundtrip(&mut state)
             .map_err(|error| CaptureError::Wayland(error.to_string()))?;

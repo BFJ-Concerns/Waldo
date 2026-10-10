@@ -3,7 +3,10 @@ use std::io::Cursor;
 use image::{ImageEncoder, RgbaImage, codecs::png::PngEncoder};
 use wayland_client::protocol::{wl_output::Transform, wl_shm};
 
-use crate::{CaptureError, shm::ShmBuffer};
+use crate::{
+    CaptureError,
+    shm::{BufferLayout, ShmBuffer},
+};
 
 pub(crate) fn png(
     buffer: &ShmBuffer,
@@ -78,24 +81,18 @@ fn rgba(
         return Err(CaptureError::UnsupportedFormat(format!("{:?}", format)));
     }
 
-    let pixel_count = usize::try_from(buffer_width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(buffer_height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .ok_or_else(|| CaptureError::InvalidBuffer("RGBA size overflow".into()))?;
-    let capacity = pixel_count
-        .checked_mul(4)
-        .ok_or_else(|| CaptureError::InvalidBuffer("RGBA byte size overflow".into()))?;
-    let mut rgba = Vec::with_capacity(capacity);
-    let stride = usize::try_from(buffer_stride)
-        .map_err(|_| CaptureError::InvalidBuffer("stride exceeds usize".into()))?;
-    let width = usize::try_from(buffer_width)
-        .map_err(|_| CaptureError::InvalidBuffer("width exceeds usize".into()))?;
-    let height = usize::try_from(buffer_height)
-        .map_err(|_| CaptureError::InvalidBuffer("height exceeds usize".into()))?;
+    let BufferLayout {
+        width,
+        height,
+        stride,
+        size,
+    } = BufferLayout::new(buffer_width, buffer_height, buffer_stride)?;
+    if source.len() < size {
+        return Err(CaptureError::InvalidBuffer(
+            "buffer is shorter than its stride and height".into(),
+        ));
+    }
+    let mut rgba = Vec::with_capacity(width * height * 4);
 
     for destination_y in 0..height {
         let source_y = if y_inverted {
@@ -105,10 +102,10 @@ fn rgba(
         };
         let row_start = source_y * stride;
         for x in 0..width {
+            // The layout check guarantees each row's pixels lie within
+            // `size`, which `source` covers.
             let offset = row_start + x * 4;
-            let bytes: [u8; 4] = source
-                .get(offset..offset + 4)
-                .ok_or_else(|| CaptureError::InvalidBuffer("pixel exceeds mapped memory".into()))?
+            let bytes: [u8; 4] = source[offset..offset + 4]
                 .try_into()
                 .expect("the requested source slice is exactly four bytes");
             let pixel = u32::from_ne_bytes(bytes);
@@ -208,7 +205,29 @@ mod tests {
     fn rejects_a_stride_that_points_past_the_mapping() {
         let error = rgba(&[0; 4], 1, 2, 8, wl_shm::Format::Xrgb8888, false).unwrap_err();
 
-        assert!(error.to_string().contains("pixel exceeds mapped memory"));
+        assert!(
+            error
+                .to_string()
+                .contains("shorter than its stride and height")
+        );
+    }
+
+    #[test]
+    fn rejects_buffer_shapes_that_would_overlap_or_vanish() {
+        for (width, height, stride) in [(0, 2, 8), (2, 0, 8), (2, 2, 4), (1, 1, u32::MAX)] {
+            assert!(
+                rgba(
+                    &[0; 64],
+                    width,
+                    height,
+                    stride,
+                    wl_shm::Format::Xrgb8888,
+                    false
+                )
+                .is_err(),
+                "{width}x{height} stride {stride}"
+            );
+        }
     }
 
     #[test]
