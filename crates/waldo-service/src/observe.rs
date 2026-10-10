@@ -403,35 +403,61 @@ pub(crate) fn frame_fingerprint(png: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Converts a client-supplied desktop region into the output-local whole
+/// pixels screencopy takes. A region the client could not have meant is an
+/// invalid request; output geometry the compositor reported in fractional
+/// pixels is a backend fault the client cannot repair by rewording.
 fn region_coordinates(
     region: waldo_protocol::LogicalRect,
     output: waldo_protocol::LogicalRect,
 ) -> Result<(i32, i32, i32, i32), ProtocolError> {
-    let local_x = region.origin.x - output.origin.x;
-    let local_y = region.origin.y - output.origin.y;
-    let values = [local_x, local_y, region.width, region.height];
-    if values
-        .iter()
-        .any(|value| !value.is_finite() || value.fract() != 0.0)
+    let whole = |value: f64| value.is_finite() && value.fract() == 0.0;
+    if ![
+        region.origin.x,
+        region.origin.y,
+        region.width,
+        region.height,
+    ]
+    .iter()
+    .all(|value| whole(*value))
     {
-        return Err(backend_error(
-            "capture region must use finite whole logical pixels".into(),
+        return Err(ProtocolError::invalid_request(
+            "capture region must use finite whole logical pixels",
         ));
     }
+    if region.width <= 0.0 || region.height <= 0.0 {
+        return Err(ProtocolError::invalid_request(
+            "capture region must have a positive width and height",
+        ));
+    }
+    if ![
+        output.origin.x,
+        output.origin.y,
+        output.width,
+        output.height,
+    ]
+    .iter()
+    .all(|value| whole(*value))
+    {
+        return Err(ProtocolError::backend_failure(
+            "the selected output's logical geometry is not whole pixels, so a region cannot be captured",
+            false,
+        ));
+    }
+    let local_x = region.origin.x - output.origin.x;
+    let local_y = region.origin.y - output.origin.y;
     if local_x < 0.0
         || local_y < 0.0
-        || region.width <= 0.0
-        || region.height <= 0.0
         || local_x + region.width > output.width
         || local_y + region.height > output.height
     {
-        return Err(backend_error(
-            "capture region lies outside the selected output".into(),
+        return Err(ProtocolError::invalid_request(
+            "capture region lies outside the selected output",
         ));
     }
     let convert = |value: f64| {
         i32::try_from(value as i64).map_err(|_| {
-            backend_error("capture region coordinate exceeds the protocol range".into())
+            ProtocolError::invalid_request("capture region coordinate exceeds the protocol range")
         })
     };
     Ok((
@@ -454,8 +480,8 @@ fn target_error(message: String) -> ProtocolError {
 mod tests {
     use waldo_niri::NiriSnapshot;
     use waldo_protocol::{
-        LogicalPoint, LogicalRect, OutputId, OutputState, OutputTransform, SourceSelector,
-        WindowId, WindowState, WorkspaceId, WorkspaceState,
+        ErrorCode, LogicalPoint, LogicalRect, OutputId, OutputState, OutputTransform,
+        SourceSelector, WindowId, WindowState, WorkspaceId, WorkspaceState,
     };
 
     use super::{region_coordinates, resolve_capture_source};
@@ -493,8 +519,29 @@ mod tests {
             height: 100.0,
         };
 
-        assert!(region_coordinates(fractional, OUTPUT).is_err());
-        assert!(region_coordinates(crossing, OUTPUT).is_err());
+        for region in [fractional, crossing] {
+            let error = region_coordinates(region, OUTPUT).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{}", error.message);
+            assert!(!error.retryable, "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn fractional_output_geometry_is_the_backend_fault_not_the_request() {
+        let region = LogicalRect {
+            origin: LogicalPoint { x: 2660.0, y: 50.0 },
+            width: 640.0,
+            height: 480.0,
+        };
+        let fractional_output = LogicalRect {
+            origin: LogicalPoint { x: 2560.5, y: 0.0 },
+            ..OUTPUT
+        };
+
+        let error = region_coordinates(region, fractional_output).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::BackendFailure, "{}", error.message);
+        assert!(!error.retryable, "{}", error.message);
     }
 
     #[test]

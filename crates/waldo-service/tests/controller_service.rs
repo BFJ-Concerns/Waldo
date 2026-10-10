@@ -982,6 +982,66 @@ async fn continued_observation_reports_real_frame_continuity_and_rejects_other_s
 }
 
 #[tokio::test]
+async fn a_region_the_client_placed_outside_its_output_is_an_invalid_request() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(SuccessfulExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("region-test").unwrap())
+        .await
+        .unwrap();
+
+    // The output is 1920x1080 at the origin; the region hangs off its right edge.
+    let response = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Region {
+                    output_id: OutputId("DP-1".into()),
+                    region: LogicalRect {
+                        origin: LogicalPoint {
+                            x: 1900.0,
+                            y: 100.0,
+                        },
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+
+    let ServerMessage::Error { error, request_id } = response else {
+        panic!("an out-of-output region was captured: {response:?}")
+    };
+    assert_eq!(request_id, Some(RequestId::new(2)));
+    assert_eq!(error.code, ErrorCode::InvalidRequest, "{}", error.message);
+    assert!(!error.retryable, "{}", error.message);
+    assert!(
+        error.message.contains("outside the selected output"),
+        "{}",
+        error.message
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
 async fn tiled_window_limit_is_queryable_and_refused_before_screencopy() {
     let path = test_socket();
     let mut snapshot = FixedInspector.inspect(true).unwrap();
