@@ -2,7 +2,7 @@
 
 mod stable_offer;
 
-use std::{collections::HashSet, io::Read, sync::Mutex};
+use std::{collections::HashSet, sync::Mutex};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
@@ -13,10 +13,7 @@ use waldo_protocol::{
 };
 use wl_clipboard_rs::{
     copy::{ClipboardType as CopyClipboardType, Seat as CopySeat, clear},
-    paste::{
-        ClipboardType, Error as PasteError, MimeType as PasteMimeType, Seat, get_contents,
-        get_mime_types,
-    },
+    paste::{ClipboardType, Error as PasteError, Seat, get_mime_types},
 };
 
 const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
@@ -124,10 +121,8 @@ impl ClipboardExecutor {
     pub fn offer_text_once(&self, text: &str) -> Result<(), ActionExecutionFailure> {
         self.ensure_mutation_allowed()
             .map_err(ActionExecutionFailure::not_executed)?;
-        let representations = TEXT_MIME_TYPES
-            .iter()
-            .map(|mime_type| ((*mime_type).to_owned(), text.as_bytes().to_vec()))
-            .collect();
+        let representations =
+            temporary_text_representations(text).map_err(ActionExecutionFailure::not_executed)?;
         let publication =
             stable_offer::publish_once(&self.seat, representations).map_err(|error| {
                 ActionExecutionFailure::indeterminate(
@@ -191,44 +186,18 @@ impl ClipboardExecutor {
             })
     }
 
-    fn read(&self, mime_type: &str) -> Result<ActionExecution, ActionExecutionFailure> {
+    fn read(
+        &self,
+        mime_type: &str,
+        cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
         validate_mime_type(mime_type).map_err(ActionExecutionFailure::not_executed)?;
-        let (reader, selected_mime) = get_contents(
-            ClipboardType::Regular,
-            Seat::Specific(self.seat.as_str()),
-            PasteMimeType::Specific(mime_type),
-        )
-        .map_err(|error| {
-            ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
-                format!("read Wayland clipboard as {mime_type}: {error}"),
-                true,
-            ))
-        })?;
-        let mut data = Vec::new();
-        reader
-            .take((MAX_CLIPBOARD_BYTES + 1) as u64)
-            .read_to_end(&mut data)
-            .map_err(|error| {
-                ActionExecutionFailure::indeterminate(
-                    ActionRoute::Clipboard,
-                    ProtocolError::backend_failure(
-                        format!("receive Wayland clipboard data: {error}"),
-                        true,
-                    ),
-                )
-            })?;
-        if data.len() > MAX_CLIPBOARD_BYTES {
-            return Err(ActionExecutionFailure::not_executed(
-                ProtocolError::unsupported_capability(format!(
-                    "clipboard value exceeds Waldo's {MAX_CLIPBOARD_BYTES}-byte transfer limit"
-                )),
-            ));
-        }
-
+        let data = stable_offer::read(&self.seat, mime_type, MAX_CLIPBOARD_BYTES, cancellation)
+            .map_err(ActionExecutionFailure::not_executed)?;
         Ok(ActionExecution {
             route: ActionRoute::Clipboard,
             output: Some(ActionOutput::Clipboard {
-                mime_type: selected_mime,
+                mime_type: mime_type.to_owned(),
                 data_base64: BASE64.encode(data),
             }),
         })
@@ -468,12 +437,14 @@ impl ClipboardExecutor {
                 Ok(())
             }
             Err(error) => {
-                if let Ok(mut state) = self.preservation.lock() {
-                    if state.guard.is_none() {
-                        state.fallback_restore = Some(snapshot);
-                    }
-                    state.failure = Some(error.clone());
+                let mut state = self
+                    .preservation
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.guard.is_none() {
+                    state.fallback_restore = Some(snapshot);
                 }
+                state.failure = Some(error.clone());
                 Err(error)
             }
         }
@@ -518,15 +489,23 @@ impl ClipboardExecutor {
     /// Returns a payload-free marker for an unresolved restoration failure,
     /// which blocks clipboard mutation.
     pub fn limitation(&self) -> Option<String> {
-        let mut state = self.preservation.lock().ok()?;
+        let (mut state, poisoned) = match self.preservation.lock() {
+            Ok(state) => (state, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
         Self::promote_publication_failure(&mut state);
-        state.failure.as_ref().map(restoration_limitation)
+        state.failure.as_ref().map(restoration_limitation).or_else(|| poisoned.then(||
+            "clipboard preservation state is poisoned; clipboard mutation stays blocked until the controller restarts".to_owned()
+        ))
     }
 
     /// Returns a payload-free note that the last write's offer stopped being
     /// served. It blocks nothing; the next write replaces the offer.
     pub fn publication_caveat(&self) -> Option<String> {
-        let mut state = self.preservation.lock().ok()?;
+        let mut state = self
+            .preservation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::promote_publication_failure(&mut state);
         state.publication_failure.as_ref().map(|error| {
             format!(
@@ -602,7 +581,7 @@ impl ActionExecutor for ClipboardExecutor {
             return Err(ActionExecutionFailure::not_executed(cancelled()));
         }
         match action {
-            Action::ClipboardRead { mime_type } => self.read(mime_type),
+            Action::ClipboardRead { mime_type } => self.read(mime_type, cancellation),
             Action::ClipboardWrite {
                 mime_type,
                 data_base64,
@@ -642,6 +621,34 @@ impl ActionExecutor for ClipboardExecutor {
             .err()
             .map(|error| restoration_limitation(&error))
     }
+}
+
+/// Validates the full advertised size before allocating any representation.
+/// STRING is ISO Latin-1; all other text aliases carry UTF-8.
+fn temporary_text_representations(text: &str) -> Result<Vec<(String, Vec<u8>)>, ProtocolError> {
+    let latin1 = text.chars().all(|character| u32::from(character) <= 255);
+    let count = TEXT_MIME_TYPES.len() - usize::from(!latin1);
+    if text
+        .len()
+        .checked_mul(count)
+        .is_none_or(|size| size > MAX_CLIPBOARD_BYTES)
+    {
+        return Err(ProtocolError::unsupported_capability(format!(
+            "clipboard value exceeds Waldo's {MAX_CLIPBOARD_BYTES}-byte transfer limit"
+        )));
+    }
+    Ok(TEXT_MIME_TYPES
+        .iter()
+        .filter(|mime| **mime != "STRING" || latin1)
+        .map(|mime| {
+            let bytes = if *mime == "STRING" {
+                text.chars().map(|character| character as u8).collect()
+            } else {
+                text.as_bytes().to_vec()
+            };
+            ((*mime).to_owned(), bytes)
+        })
+        .collect())
 }
 
 fn decode_representations(
@@ -734,6 +741,93 @@ mod tests {
         ClipboardExecutor, ClipboardSnapshot, PreservationGuard, PreservationState,
         decode_representations, validate_mime_type,
     };
+
+    fn poison_preservation(executor: &ClipboardExecutor) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = executor.preservation.lock().unwrap();
+            panic!("poison the preservation lock");
+        }));
+        assert!(executor.preservation.is_poisoned());
+    }
+
+    fn unused_seat_executor() -> ClipboardExecutor {
+        ClipboardExecutor {
+            seat: "waldo-test-seat-that-does-not-exist".into(),
+            preservation: Mutex::new(PreservationState::default()),
+        }
+    }
+
+    #[test]
+    fn oversized_temporary_text_is_refused_before_publication() {
+        let executor = unused_seat_executor();
+        let text = "x".repeat(super::MAX_CLIPBOARD_BYTES / super::TEXT_MIME_TYPES.len() + 1);
+        let failure = executor.offer_text_once(&text).unwrap_err();
+        assert_eq!(failure.error().code, ErrorCode::UnsupportedCapability);
+        assert!(
+            failure.error().message.contains("byte transfer limit"),
+            "{}",
+            failure.error().message
+        );
+        assert!(executor.preservation.lock().unwrap().publication.is_none());
+    }
+
+    #[test]
+    fn string_offers_have_latin1_bytes_and_utf8_aliases_keep_utf8() {
+        let representations = super::temporary_text_representations("é").unwrap();
+        for (mime, bytes) in representations {
+            assert_eq!(
+                bytes,
+                if mime == "STRING" {
+                    vec![0xe9]
+                } else {
+                    "é".as_bytes().to_vec()
+                },
+                "{mime}"
+            );
+        }
+        let representations = super::temporary_text_representations("λ").unwrap();
+        assert!(
+            representations
+                .iter()
+                .all(|(mime, bytes)| mime != "STRING" && bytes == "λ".as_bytes())
+        );
+    }
+
+    #[test]
+    fn poisoned_preservation_reports_a_limitation_and_keeps_mutation_blocked() {
+        let executor = unused_seat_executor();
+        poison_preservation(&executor);
+        let limitation = executor
+            .limitation()
+            .expect("poisoned state must be disclosed");
+        assert!(
+            limitation.contains("poisoned") && limitation.contains("restarts"),
+            "{limitation}"
+        );
+        assert!(executor.ensure_mutation_allowed().is_err());
+    }
+
+    #[test]
+    fn failed_restoration_is_retained_even_under_a_poisoned_lock() {
+        let executor = unused_seat_executor();
+        poison_preservation(&executor);
+        let snapshot = ClipboardSnapshot {
+            seat: executor.seat.clone(),
+            sources: vec![("text/plain".into(), b"private saved bytes".to_vec())],
+        };
+        let error = executor.restore_temporary(snapshot.clone()).unwrap_err();
+        let limitation = executor
+            .limitation()
+            .expect("recorded failure must be reported");
+        assert!(limitation.contains(&error.message), "{limitation}");
+        assert!(!limitation.contains("private saved bytes"));
+        let state = executor.preservation.lock().unwrap_err().into_inner();
+        assert_eq!(state.failure.as_ref(), Some(&error));
+        assert_eq!(
+            state.fallback_restore.as_ref().unwrap().sources,
+            snapshot.sources
+        );
+    }
 
     #[test]
     #[ignore = "requires a live Wayland data-control session"]
