@@ -444,8 +444,14 @@ async fn connection_loop(
     state: Arc<ServiceState>,
     connection_id: waldo_protocol::ConnectionId,
 ) -> Result<(), ServiceError> {
-    let (mut reader, writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
+    // Reading a frame is not cancel-safe: a frame half read when another
+    // `select!` branch wins would be lost and the stream desynchronised.
+    // The reader task owns the read half and hands over whole messages; the
+    // channel's `recv` is cancel-safe.
+    let (mut incoming, reader_task) = spawn_message_reader(reader);
+    let _reader_task = AbortOnDrop(reader_task);
     let mut shutdown = state.shutdown.subscribe();
     let mut queued = VecDeque::new();
     let mut active_act: Option<tokio::task::JoinHandle<Result<(), TransportError>>> = None;
@@ -464,7 +470,7 @@ async fn connection_loop(
                         quiesce_connection(&state, connection_id, &mut active_act).await;
                         return Ok(());
                     }
-                    message = read_client_message(&mut reader) => match message {
+                    message = next_message(&mut incoming) => match message {
                         Ok(IncomingMessage::Valid(message)) => message,
                         Ok(IncomingMessage::Invalid(response)) => {
                             if let Err(error) = write_message(&mut *writer.lock().await, &response).await {
@@ -527,7 +533,7 @@ async fn connection_loop(
                     }
                 }
             }
-            message = read_client_message(&mut reader) => {
+            message = next_message(&mut incoming) => {
                 match message {
                     Ok(IncomingMessage::Valid(message @ (ClientMessage::Stop { .. } | ClientMessage::Handover { .. }))) => {
                         // Authority-ending operations may overtake an Act to
@@ -556,6 +562,44 @@ async fn connection_loop(
                 }
             }
         }
+    }
+}
+
+/// Reads client messages until the stream fails or closes, ending with the
+/// error that stopped it, or when the connection loop drops the receiver.
+fn spawn_message_reader(
+    mut reader: tokio::net::unix::OwnedReadHalf,
+) -> (
+    tokio::sync::mpsc::Receiver<Result<IncomingMessage, TransportError>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        loop {
+            let message = read_client_message(&mut reader).await;
+            let stopped = message.is_err();
+            if sender.send(message).await.is_err() || stopped {
+                return;
+            }
+        }
+    });
+    (receiver, task)
+}
+
+async fn next_message(
+    incoming: &mut tokio::sync::mpsc::Receiver<Result<IncomingMessage, TransportError>>,
+) -> Result<IncomingMessage, TransportError> {
+    incoming
+        .recv()
+        .await
+        .unwrap_or(Err(TransportError::ConnectionClosed))
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

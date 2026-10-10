@@ -418,6 +418,13 @@ impl ScreenCapturer for FailingFinalCapturer {
 #[derive(Clone, Copy)]
 struct SuccessfulExecutor;
 
+/// Holds each action until the test lets it finish, so a batch completes at
+/// a moment the test chooses.
+struct GatedExecutor {
+    started: mpsc::Sender<()>,
+    proceed: Mutex<mpsc::Receiver<()>>,
+}
+
 struct ReleaseTrackingExecutor {
     releases: Arc<AtomicUsize>,
 }
@@ -484,6 +491,18 @@ impl ActionExecutor for RecordingPointerExecutor {
 
     fn supports(&self, route: ActionRoute) -> bool {
         route == ActionRoute::VirtualPointer
+    }
+}
+
+impl ActionExecutor for GatedExecutor {
+    fn execute(
+        &self,
+        _action: &Action,
+        _cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        let _ = self.started.send(());
+        let _ = self.proceed.lock().unwrap().recv();
+        Ok(ActionRoute::Screencopy.into())
     }
 }
 
@@ -1625,6 +1644,75 @@ async fn pipelined_act_then_stop_never_executes_after_stop_completion() {
     // may still be executing once Stop has answered.
     let backend_started = started_rx.try_recv().is_ok();
     assert!(!backend_started || finished.load(Ordering::Acquire));
+
+    drop(stream);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn a_request_split_across_batch_completion_is_read_whole() {
+    let path = test_socket();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (proceed_tx, proceed_rx) = mpsc::channel();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(GatedExecutor {
+            started: started_tx,
+            proceed: Mutex::new(proceed_rx),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut stream = connect_and_start_blocking_act(&path, "split-frame-test").await;
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let payload = serde_json::to_vec(&ClientMessage::Query {
+        request_id: RequestId::new(4),
+        request: QueryRequest::default(),
+    })
+    .unwrap();
+    let (head, tail) = payload.split_at(payload.len() / 2);
+    stream.write_u32(payload.len() as u32).await.unwrap();
+    stream.write_all(head).await.unwrap();
+    stream.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    proceed_tx.send(()).unwrap();
+    let acted: ServerMessage =
+        tokio::time::timeout(Duration::from_secs(5), read_message(&mut stream))
+            .await
+            .expect("the batch must complete")
+            .unwrap();
+    assert!(
+        matches!(acted, ServerMessage::Acted { .. }),
+        "unexpected response: {acted:?}"
+    );
+
+    stream.write_all(tail).await.unwrap();
+    stream.flush().await.unwrap();
+    let queried: ServerMessage =
+        tokio::time::timeout(Duration::from_secs(5), read_message(&mut stream))
+            .await
+            .expect("the split request must be answered")
+            .unwrap();
+    assert!(
+        matches!(
+            queried,
+            ServerMessage::Queried { request_id, .. } if request_id == RequestId::new(4)
+        ),
+        "unexpected response: {queried:?}"
+    );
 
     drop(stream);
     shutdown_tx.send(()).unwrap();
