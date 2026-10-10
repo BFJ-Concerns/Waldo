@@ -45,10 +45,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Waldo controller listening on {}", socket.display());
     let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
     service
         .run_until(async {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
+                _ = interrupt.recv() => {}
                 _ = terminate.recv() => {}
             }
         })

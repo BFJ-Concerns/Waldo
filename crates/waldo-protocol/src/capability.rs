@@ -38,7 +38,13 @@ pub struct Capabilities {
 impl Capabilities {
     /// A truthful baseline for a controller with no desktop backends attached.
     pub fn unavailable() -> Self {
-        let limitation = || BackendCapability::unavailable("backend not initialised");
+        Self::unavailable_because("backend not initialised")
+    }
+
+    /// Every backend unavailable for one stated reason.
+    pub fn unavailable_because(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        let limitation = || BackendCapability::unavailable(reason.clone());
         Self {
             screencopy: limitation(),
             virtual_pointer: limitation(),

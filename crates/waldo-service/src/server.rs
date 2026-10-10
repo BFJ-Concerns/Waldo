@@ -52,7 +52,12 @@ impl ServiceState {
         let mut capabilities = inspector
             .inspect(false)
             .map(|snapshot| snapshot.capabilities)
-            .unwrap_or_else(|_| Capabilities::unavailable());
+            .unwrap_or_else(|error| {
+                eprintln!("Waldo controller could not inspect the desktop at start-up: {error}");
+                Capabilities::unavailable_because(format!(
+                    "desktop inspection failed at start-up: {error}"
+                ))
+            });
         enable_capture_capability(&mut capabilities, capturer.as_ref());
         enable_action_capabilities(&mut capabilities, executor.as_ref());
         if accessibility.is_some() {

@@ -2958,6 +2958,61 @@ fn binding_does_not_change_an_existing_shared_directory() {
     let _ = fs::remove_dir_all(parent);
 }
 
+/// An inspector whose Niri connection always fails.
+struct FailingInspector;
+
+impl SessionInspector for FailingInspector {
+    fn inspect(&self, _include_windows: bool) -> Result<NiriSnapshot, waldo_niri::InspectionError> {
+        Err(waldo_niri::InspectionError::NiriReply(
+            "compositor socket refused".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn connected_clients_learn_why_start_up_inspection_failed() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_inspector(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FailingInspector),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    write_message(
+        &mut stream,
+        &ClientMessage::Hello {
+            request_id: RequestId::new(1),
+            schema_major: SCHEMA_MAJOR_VERSION,
+            client_id: ClientId::new("start-up-test").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let ServerMessage::Connected { capabilities, .. } = read_message(&mut stream).await.unwrap()
+    else {
+        panic!("the controller did not accept the client")
+    };
+    let limitation = capabilities.niri_ipc.limitation.unwrap();
+    assert!(
+        limitation.starts_with("desktop inspection failed at start-up: "),
+        "{limitation}"
+    );
+    assert!(
+        limitation.contains("compositor socket refused"),
+        "{limitation}"
+    );
+
+    drop(stream);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
 #[tokio::test]
 async fn binding_refuses_a_socket_another_controller_is_serving() {
     let path = test_socket();
