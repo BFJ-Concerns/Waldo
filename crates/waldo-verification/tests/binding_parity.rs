@@ -331,7 +331,7 @@ async fn saved_v2_corpus_has_stable_cli_mcp_semantics_and_final_consumers() {
             client_id: format!("parity-cli-{}", document.name),
             command: Command::Act {
                 document: root.join(&document.file),
-                observe: Some(root.join("observe.json")),
+                observe: root.join("observe.json"),
                 stop_after_ms: document.stop_after_ms,
                 handover_to: None,
             },

@@ -23,7 +23,7 @@ pub struct Arguments {
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
 
-    /// Logical identity shown in controller diagnostics.
+    /// Logical client identity sent in the controller handshake.
     #[arg(long, global = true, default_value = "waldo-cli")]
     pub client_id: String,
 
@@ -45,26 +45,23 @@ pub enum Command {
         /// JSON document path, or '-' for standard input.
         document: PathBuf,
     },
-    /// Execute an ActRequest JSON document.
+    /// Execute an ActRequest JSON document, grounded on a fresh observation.
+    ///
+    /// An observation belongs to the connection that made it, so the batch is
+    /// grounded on the ObserveRequest document's observation, taken on this
+    /// invocation's connection; the document's own observation_id is replaced.
     Act {
         /// JSON document path, or '-' for standard input.
         document: PathBuf,
         /// ObserveRequest document used to ground this action on the same connection.
         #[arg(long)]
-        observe: Option<PathBuf>,
+        observe: PathBuf,
         /// Cancel this batch through Stop after the given delay.
         #[arg(long, conflicts_with = "handover_to")]
         stop_after_ms: Option<u64>,
         /// Transfer the acquired driving lease after this batch completes.
         #[arg(long, conflicts_with = "stop_after_ms")]
         handover_to: Option<u64>,
-    },
-    /// Cancel and release this connection's driving session.
-    Stop,
-    /// Transfer this connection's driving lease to another connection.
-    Handover {
-        #[arg(long)]
-        connection: u64,
     },
     /// Send any non-Hello ClientMessage document without reshaping it.
     Send {
@@ -86,8 +83,8 @@ pub enum CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(error) => write!(formatter, "could not read action document: {error}"),
-            Self::Json(error) => write!(formatter, "action document is invalid: {error}"),
+            Self::Io(error) => write!(formatter, "could not read request document: {error}"),
+            Self::Json(error) => write!(formatter, "could not encode the result: {error}"),
             Self::Transport(error) => error.fmt(formatter),
             Self::InvalidClientId(error) => error.fmt(formatter),
             Self::HelloDocument => formatter.write_str(
@@ -131,6 +128,7 @@ impl From<TransportError> for CliError {
 }
 
 /// Executes one CLI invocation and returns its JSON value for rendering.
+/// [`reports_failure`] says whether that value records a failed request.
 pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
     if matches!(arguments.command, Command::Schema) {
         return Ok(serde_json::to_value(published_schema())?);
@@ -150,30 +148,27 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
         handover_to,
     } = arguments.command
     {
+        if document == Path::new("-") && observe == Path::new("-") {
+            return Err(CliError::SharedStdin);
+        }
         let mut request: ActRequest = match request_document(&document, RequestId::new(3))? {
             Ok(request) => request,
             Err(response) => return Ok(response),
         };
-        if let Some(observe_document) = observe {
-            if document == Path::new("-") && observe_document == Path::new("-") {
-                return Err(CliError::SharedStdin);
-            }
-            let observation_request: ObserveRequest =
-                match request_document(&observe_document, request_id)? {
-                    Ok(request) => request,
-                    Err(response) => return Ok(response),
-                };
-            let observed = client
-                .request(ClientMessage::Observe {
-                    request_id,
-                    request: observation_request,
-                })
-                .await?;
-            let ServerMessage::Observed { observation, .. } = observed else {
-                return Ok(serde_json::to_value(observed)?);
-            };
-            request.observation_id = observation.id;
-        }
+        let observation_request: ObserveRequest = match request_document(&observe, request_id)? {
+            Ok(request) => request,
+            Err(response) => return Ok(response),
+        };
+        let observed = client
+            .request(ClientMessage::Observe {
+                request_id,
+                request: observation_request,
+            })
+            .await?;
+        let ServerMessage::Observed { observation, .. } = observed else {
+            return Ok(serde_json::to_value(observed)?);
+        };
+        request.observation_id = observation.id;
         let act_message = ClientMessage::Act {
             request_id: RequestId::new(3),
             request,
@@ -192,7 +187,7 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
                     .await
             };
             let (acted, stopped) = tokio::join!(act, stop);
-            return json_envelope("act_cancelled", acted?, "stop", stopped?);
+            return json_envelope("act_stop", acted, "stop", stopped);
         }
 
         let acted = client.request(act_message).await?;
@@ -204,8 +199,8 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
                         target: ConnectionId::new(connection),
                     },
                 })
-                .await?;
-            return json_envelope("act_handover", acted, "handover", handed_over);
+                .await;
+            return json_envelope("act_handover", Ok(acted), "handover", handed_over);
         }
         return Ok(serde_json::to_value(acted)?);
     }
@@ -223,16 +218,6 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
             },
         },
         Command::Act { .. } => unreachable!("Act returned through its composed CLI path"),
-        Command::Stop => ClientMessage::Stop {
-            request_id,
-            request: StopRequest::default(),
-        },
-        Command::Handover { connection } => ClientMessage::Handover {
-            request_id,
-            request: HandoverRequest {
-                target: ConnectionId::new(connection),
-            },
-        },
         Command::Send { document } => {
             let message: ClientMessage = match request_document(&document, request_id)? {
                 Ok(request) => request,
@@ -248,44 +233,110 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
     Ok(serde_json::to_value(client.request(message).await?)?)
 }
 
-fn read_document<T: DeserializeOwned>(path: &Path) -> Result<T, CliError> {
+/// Whether a value [`execute`] returned records a failed request: a
+/// protocol error, a batch that did not complete, or a transport failure
+/// inside a composed result. The CLI exits unsuccessfully for these after
+/// printing the whole value.
+pub fn reports_failure(value: &Value) -> bool {
+    match value["type"].as_str() {
+        Some("error") => true,
+        Some("acted") => value["result"]["stop_reason"] != "completed",
+        Some("act_stop") => {
+            // Stop exists to cut the batch short, so a cancelled batch is the
+            // expected outcome rather than a failure.
+            let act = &value["act"];
+            reports_failure(&value["stop"])
+                || (act["type"] == "acted"
+                    && !matches!(
+                        act["result"]["stop_reason"].as_str(),
+                        Some("completed" | "cancelled")
+                    ))
+                || act["type"] != "acted"
+        }
+        Some("act_handover") => {
+            reports_failure(&value["act"]) || reports_failure(&value["handover"])
+        }
+        Some("transport_failure") => true,
+        _ => false,
+    }
+}
+
+fn read_document<T: DeserializeOwned>(
+    path: &Path,
+) -> Result<Result<T, serde_json::Error>, CliError> {
     let mut document = String::new();
     if path == Path::new("-") {
         io::stdin().read_to_string(&mut document)?;
     } else {
         document = fs::read_to_string(path)?;
     }
-    Ok(serde_json::from_str(&document)?)
+    Ok(serde_json::from_str(&document))
 }
 
 fn request_document<T: DeserializeOwned>(
     path: &Path,
     request_id: RequestId,
 ) -> Result<Result<T, Value>, CliError> {
-    match read_document(path) {
+    match read_document(path)? {
         Ok(request) => Ok(Ok(request)),
-        Err(CliError::Json(_)) => Ok(Err(serde_json::to_value(ServerMessage::Error {
+        Err(error) => Ok(Err(serde_json::to_value(ServerMessage::Error {
             request_id: Some(request_id),
             error: ProtocolError {
                 code: ErrorCode::InvalidRequest,
-                message: "request document does not match the protocol schema".into(),
+                message: document_diagnostic(&error),
                 retryable: false,
             },
         })?)),
-        Err(error) => Err(error),
     }
 }
 
+/// Says where and why a request document failed to parse. String values
+/// the parser quotes are elided, since documents can carry clipboard data
+/// or text the operator would not want repeated in a diagnostic.
+fn document_diagnostic(error: &serde_json::Error) -> String {
+    let kind = match error.classify() {
+        serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
+            "request document is not valid JSON"
+        }
+        serde_json::error::Category::Data | serde_json::error::Category::Io => {
+            "request document does not match the protocol schema"
+        }
+    };
+    let mut reason = String::new();
+    let mut quoted = false;
+    for character in error.to_string().chars() {
+        if character == '"' {
+            if !quoted {
+                reason.push_str("\"…\"");
+            }
+            quoted = !quoted;
+        } else if !quoted {
+            reason.push(character);
+        }
+    }
+    format!("{kind}: {reason}")
+}
+
+/// Composes an Act response with the request that followed it. A transport
+/// failure on either keeps the other's response, so receipts already
+/// received are never lost.
 fn json_envelope(
     kind: &str,
-    acted: ServerMessage,
+    acted: Result<ServerMessage, TransportError>,
     following_name: &str,
-    following: ServerMessage,
+    following: Result<ServerMessage, TransportError>,
 ) -> Result<Value, CliError> {
+    let render = |response: Result<ServerMessage, TransportError>| match response {
+        Ok(message) => serde_json::to_value(message),
+        Err(error) => Ok(serde_json::json!({
+            "type": "transport_failure",
+            "message": error.to_string(),
+        })),
+    };
     Ok(serde_json::json!({
         "type": kind,
-        "act": acted,
-        (following_name): following,
+        "act": render(acted)?,
+        (following_name): render(following)?,
     }))
 }
 
@@ -296,13 +347,8 @@ mod tests {
     use super::{Arguments, Command};
 
     #[test]
-    fn action_documents_have_a_direct_cli_route() {
-        let arguments = Arguments::try_parse_from(["waldo", "act", "batch.json"]).unwrap();
-
-        assert!(matches!(
-            arguments.command,
-            Command::Act { observe: None, .. }
-        ));
+    fn act_needs_an_observation_taken_on_its_own_connection() {
+        assert!(Arguments::try_parse_from(["waldo", "act", "batch.json"]).is_err());
     }
 
     #[test]
@@ -314,7 +360,7 @@ mod tests {
         assert!(matches!(
             arguments.command,
             Command::Act {
-                observe: Some(path),
+                observe: path,
                 ..
             } if path == std::path::Path::new("source.json")
         ));
@@ -322,12 +368,26 @@ mod tests {
 
     #[test]
     fn act_can_compose_stop_or_handover_without_changing_the_saved_document() {
-        let cancelled =
-            Arguments::try_parse_from(["waldo", "act", "batch.json", "--stop-after-ms", "25"])
-                .unwrap();
-        let handed_over =
-            Arguments::try_parse_from(["waldo", "act", "batch.json", "--handover-to", "7"])
-                .unwrap();
+        let cancelled = Arguments::try_parse_from([
+            "waldo",
+            "act",
+            "batch.json",
+            "--observe",
+            "source.json",
+            "--stop-after-ms",
+            "25",
+        ])
+        .unwrap();
+        let handed_over = Arguments::try_parse_from([
+            "waldo",
+            "act",
+            "batch.json",
+            "--observe",
+            "source.json",
+            "--handover-to",
+            "7",
+        ])
+        .unwrap();
 
         assert!(matches!(
             cancelled.command,
@@ -345,6 +405,47 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn failed_requests_and_batches_are_reported_as_failures() {
+        use serde_json::json;
+
+        let acted =
+            |stop_reason: &str| json!({"type": "acted", "result": {"stop_reason": stop_reason}});
+        let stopped = json!({"type": "stopped", "result": {"released_session": 1}});
+        let lost = json!({"type": "transport_failure", "message": "connection closed"});
+
+        assert!(!super::reports_failure(&json!({"type": "queried"})));
+        assert!(super::reports_failure(&json!({"type": "error"})));
+        assert!(!super::reports_failure(&acted("completed")));
+        assert!(super::reports_failure(&acted("execution_failed")));
+        assert!(super::reports_failure(&acted("verification_failed")));
+        assert!(!super::reports_failure(
+            &json!({"type": "act_stop", "act": acted("cancelled"), "stop": stopped})
+        ));
+        assert!(super::reports_failure(
+            &json!({"type": "act_stop", "act": acted("execution_failed"), "stop": stopped})
+        ));
+        assert!(super::reports_failure(
+            &json!({"type": "act_stop", "act": acted("cancelled"), "stop": lost})
+        ));
+        assert!(super::reports_failure(
+            &json!({"type": "act_handover", "act": acted("completed"), "handover": lost})
+        ));
+    }
+
+    #[test]
+    fn document_diagnostics_locate_the_fault_without_repeating_values() {
+        let error = serde_json::from_str::<waldo_protocol::ActRequest>(
+            r#"{"observation_id": "secret text", "actions": [], "verification": []}"#,
+        )
+        .unwrap_err();
+        let diagnostic = super::document_diagnostic(&error);
+
+        assert!(diagnostic.starts_with("request document does not match the protocol schema"));
+        assert!(diagnostic.contains("line 1"), "{diagnostic}");
+        assert!(!diagnostic.contains("secret"), "{diagnostic}");
     }
 
     #[test]

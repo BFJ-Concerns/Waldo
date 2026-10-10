@@ -27,16 +27,19 @@ the authority on every action and predicate variant.
 ## Command-line client
 
 `waldo` speaks the same protocol as the MCP server, with subcommands `schema`,
-`query`, `observe`, `act`, `stop`, `handover` and `send`; run
-`waldo <command> --help` for a command's options. `waldod` serves
+`query`, `observe`, `act` and `send`; run `waldo <command> --help` for a
+command's options. Each prints the controller's JSON response and exits with
+status 1 when that response is an error, a batch that did not complete, or a
+composed result with a failed part; a batch cut short by `--stop-after-ms`
+counts as succeeding. `waldod` serves
 `$XDG_RUNTIME_DIR/waldo/controller.sock` unless the `WALDO_SOCKET_PATH`
 setting names another socket, and both `waldod` and `waldo` accept
 `--socket PATH`.
 
 An observation and its identifier belong to the controller connection that
-requested it, so separate `waldo` invocations do not share one. To replay an
-act document, give `waldo act` an observe document too; it captures fresh
-grounding on the same connection and substitutes that observation's
+requested it, so separate `waldo` invocations do not share one. `waldo act`
+therefore takes an observe document as well as the act document: it captures
+fresh grounding on its own connection and substitutes that observation's
 identifier before dispatch. With `observe.json` containing:
 
 ```json
@@ -50,8 +53,12 @@ holding `observation_id`, `actions` and `verification`, run:
 waldo act act.json --observe observe.json
 ```
 
-Explicit lease handover to another connection is available through the CLI
-only; MCP clients finish their driving session with Stop.
+The driving lease belongs to the connection that acquired it, so stopping
+or handing it over happens within the same invocation: `waldo act
+--stop-after-ms MS` cancels the batch through Stop after a delay, and
+`--handover-to CONNECTION` transfers the lease once the batch completes.
+Handover is available through the CLI only; MCP clients finish their driving
+session with Stop.
 
 ## Image coordinates and results
 

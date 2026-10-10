@@ -137,6 +137,12 @@ async fn invalid_action_document_returns_structured_error_without_a_lease() {
     let document = path.parent().unwrap().join("invalid-act.json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    let observe_document = path.parent().unwrap().join("observe.json");
+    fs::write(
+        &observe_document,
+        r#"{"source": {"type": "output", "output_id": "TEST-1"}, "include_accessibility": false}"#,
+    )
+    .unwrap();
     fs::write(
         &document,
         r#"{
@@ -162,7 +168,7 @@ async fn invalid_action_document_returns_structured_error_without_a_lease() {
         client_id: "invalid-document-test".into(),
         command: Command::Act {
             document,
-            observe: None,
+            observe: observe_document,
             stop_after_ms: None,
             handover_to: None,
         },
@@ -240,7 +246,7 @@ async fn cli_act_can_transfer_its_owned_lease_to_a_connected_controller_client()
         client_id: "handover-owner".into(),
         command: Command::Act {
             document: act_document,
-            observe: Some(observe_document),
+            observe: observe_document,
             stop_after_ms: None,
             handover_to: Some(target.connection_id().get()),
         },

@@ -117,7 +117,7 @@ actions. When no batch is running, the agent's driving lease lapses 30
 seconds after its last action (`WALDO_LEASE_IDLE_TIMEOUT_SECONDS`) and any
 held keys or buttons are released.
 A batch that is still running keeps its lease, and only the connection that
-holds the lease can stop it, so a separate `waldo stop` cannot. To end a
+holds the lease can stop it, so another `waldo` invocation cannot. To end a
 running batch, or everything at once, stop the controller:
 
 ```sh
