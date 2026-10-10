@@ -1,7 +1,10 @@
 use std::{
     fs,
-    io::Write,
-    os::unix::fs::DirBuilderExt,
+    io::{Read, Write},
+    os::{
+        fd::OwnedFd,
+        unix::{fs::DirBuilderExt, net::UnixStream, process::ExitStatusExt},
+    },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -1202,21 +1205,26 @@ fn read_representations(
 fn clipboard_inventory(
     seat: &str,
 ) -> Result<Vec<RepresentationEvidence>, Box<dyn std::error::Error>> {
-    let listed = Command::new("wl-paste")
+    clipboard_inventory_with(Path::new("wl-paste"), seat)
+}
+
+fn clipboard_inventory_with(
+    wl_paste: &Path,
+    seat: &str,
+) -> Result<Vec<RepresentationEvidence>, Box<dyn std::error::Error>> {
+    if clipboard_selection_is_empty(wl_paste, seat)? {
+        return Ok(Vec::new());
+    }
+    let listed = Command::new(wl_paste)
         .args(["--seat", seat, "--list-types"])
         .output()?;
     if !listed.status.success() {
-        // wl-paste exits unsuccessfully both for an empty selection and for
-        // a failure to read one; only its empty-selection message is empty.
         let stderr = String::from_utf8_lossy(&listed.stderr);
-        if stderr.contains("Nothing is copied") {
-            return Ok(Vec::new());
-        }
         return Err(format!("wl-paste --list-types failed: {}", stderr.trim()).into());
     }
     let mut evidence = Vec::new();
     for mime_type in String::from_utf8(listed.stdout)?.lines() {
-        let output = Command::new("wl-paste")
+        let output = Command::new(wl_paste)
             .args(["--seat", seat, "--no-newline", "--type", mime_type])
             .output()?;
         if !output.status.success() {
@@ -1229,6 +1237,96 @@ fn clipboard_inventory(
         });
     }
     Ok(evidence)
+}
+
+fn clipboard_selection_is_empty(
+    wl_paste: &Path,
+    seat: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    // The callback reports only wl-paste's machine-readable selection state;
+    // it never reads or retains the representation delivered on stdin.
+    let (mut reader, writer) =
+        UnixStream::pair().map_err(|error| format!("wl-paste --watch state channel: {error}"))?;
+    reader
+        .set_nonblocking(true)
+        .map_err(|error| format!("wl-paste --watch state channel: {error}"))?;
+    let mut watcher = Command::new(wl_paste)
+        .args([
+            "--seat",
+            seat,
+            "--watch",
+            "sh",
+            "-c",
+            "printf '%s\\n' \"$CLIPBOARD_STATE\"",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("wl-paste --watch spawn: {error}"))?;
+
+    let state = (|| -> Result<bool, Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut report = Vec::new();
+        loop {
+            if let Some(status) = watcher
+                .try_wait()
+                .map_err(|error| format!("wl-paste --watch status: {error}"))?
+            {
+                return Err(
+                    format!("wl-paste --watch exited before a state report: {status}").into(),
+                );
+            }
+            if Instant::now() >= deadline {
+                return Err("wl-paste --watch timed out waiting for CLIPBOARD_STATE".into());
+            }
+            let mut byte = [0];
+            match reader.read(&mut byte) {
+                Ok(0) => return Err("wl-paste --watch closed its state channel".into()),
+                Ok(_) if byte[0] == b'\n' => {
+                    return match report.as_slice() {
+                        b"nil" | b"clear" => Ok(true),
+                        b"data" | b"sensitive" => Ok(false),
+                        _ => Err(format!(
+                            "wl-paste --watch unrecognised CLIPBOARD_STATE: {:?}",
+                            String::from_utf8_lossy(&report)
+                        )
+                        .into()),
+                    };
+                }
+                Ok(_) => {
+                    report.push(byte[0]);
+                    if report.len() > 64 {
+                        return Err(
+                            "wl-paste --watch CLIPBOARD_STATE report exceeds 64 bytes".into()
+                        );
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(format!("wl-paste --watch state read: {error}").into()),
+            }
+        }
+    })();
+
+    // Kill and reap on every outcome, including invalid state and timeout.
+    // A watcher that exits by itself is a failure, even with exit status zero.
+    let termination = watcher.kill();
+    let reaped = watcher.wait();
+    let cleanup = match (termination, reaped) {
+        (Ok(()), Ok(status)) if status.signal() == Some(9) => Ok(()),
+        (kill, wait) => Err(format!(
+            "wl-paste --watch termination failed: kill={kill:?}, wait={wait:?}"
+        )),
+    };
+    match (state, cleanup) {
+        (Ok(empty), Ok(())) => Ok(empty),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup.into()),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}").into()),
+    }
 }
 
 fn wait_for_clipboard(
@@ -1482,3 +1580,7 @@ mod tests {
 #[cfg(test)]
 #[path = "tests/transient_defaults.rs"]
 mod transient_defaults;
+
+#[cfg(test)]
+#[path = "tests/clipboard_inventory.rs"]
+mod inventory_tests;
