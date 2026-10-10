@@ -1,6 +1,17 @@
 use std::{error::Error, fmt, io, path::PathBuf};
 
+use waldo_protocol::{ErrorCode, ProtocolError};
 use waldo_socket::TransportError;
+
+/// A desktop backend failed while serving a request; the request may succeed
+/// if repeated.
+pub(crate) fn backend_error(message: String) -> ProtocolError {
+    ProtocolError {
+        code: ErrorCode::BackendFailure,
+        message,
+        retryable: true,
+    }
+}
 
 #[derive(Debug)]
 pub enum ServiceError {

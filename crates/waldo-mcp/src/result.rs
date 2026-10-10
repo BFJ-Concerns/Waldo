@@ -249,6 +249,7 @@ mod tests {
             },
             accessibility: Vec::new(),
             accessibility_available: false,
+            accessibility_limitation: None,
             continuation: None,
         };
 

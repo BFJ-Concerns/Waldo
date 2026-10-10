@@ -9,8 +9,8 @@ client and the results they return. The
 | Tool | Request | Result |
 | --- | --- | --- |
 | `query` | `include_windows` | Outputs, workspaces, focus, keyboard layout, capabilities and lease state |
-| `observe` | `source`, `include_accessibility`, optional `continue_from` | An observation identifier, coordinates, a PNG and any available accessibility state |
-| `act` | `observation_id`, ordered `actions`, `verification` predicates | Per-action receipts, the application outcome and, when available, a resulting observation |
+| `observe` | `source`, `include_accessibility`, optional `continue_from` | An observation identifier, coordinates, a PNG and any available accessibility state; `accessibility_limitation` says why requested accessibility state is missing |
+| `act` | `observation_id`, ordered `actions`, `verification` predicates | Per-action receipts, the application outcome and, when available, a resulting observation. Verification is judged on that resulting observation, so a predicate it cannot measure — an element predicate without accessibility, a frame comparison against another source — is refused before any action |
 | `stop` | Empty object | Cancels the client's batch and releases its driving lease and any held input; `cleanup_limitation` says what cleanup could not restore, such as a preserved clipboard |
 
 An observation source is a whole output, a window, or a region of an output.

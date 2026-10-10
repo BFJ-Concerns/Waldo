@@ -1,10 +1,11 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
+use waldo_niri::NiriSnapshot;
 use waldo_protocol::{
-    ConnectionId, ErrorCode, Observation, ObservationId, Predicate, ProtocolError, SourceSelector,
+    ConnectionId, ErrorCode, ObservationId, Predicate, ProtocolError, SourceSelector, WindowId,
 };
 
-use crate::server::ServiceState;
+use crate::{error::backend_error, observe::CapturedObservation, server::ServiceState};
 
 /// Predicates validated before mutation with any retained frame evidence attached.
 pub(crate) struct VerificationPlan {
@@ -13,9 +14,13 @@ pub(crate) struct VerificationPlan {
 }
 
 impl VerificationPlan {
+    /// Checks every predicate against the observation the batch will return:
+    /// `result_source` is what that observation captures, and
+    /// `include_accessibility` whether it carries semantic evidence.
     pub(crate) async fn prepare(
         predicates: Vec<Predicate>,
-        source: &SourceSelector,
+        result_source: &SourceSelector,
+        include_accessibility: bool,
         state: &ServiceState,
         connection_id: ConnectionId,
     ) -> Result<Self, ProtocolError> {
@@ -34,21 +39,28 @@ impl VerificationPlan {
                             retryable: true,
                         },
                     )?;
-                    if &grounding.source != source {
+                    if &grounding.source != result_source {
                         return Err(ProtocolError {
                             code: ErrorCode::InvalidRequest,
                             message:
-                                "frame-change verification must compare the same capture source"
+                                "frame-change verification must compare the source the batch's resulting observation captures"
                                     .into(),
                             retryable: false,
                         });
                     }
                     prior_frames.insert(*from, grounding.application_frame_fingerprint);
                 }
-                Predicate::ElementExists { .. } | Predicate::ElementState { .. } => {}
-                Predicate::WindowExists { .. }
-                | Predicate::FocusedWindow { .. }
-                | Predicate::ProcessExited { .. } => {}
+                Predicate::ElementExists { .. } | Predicate::ElementState { .. } => {
+                    if !include_accessibility {
+                        return Err(ProtocolError {
+                            code: ErrorCode::InvalidRequest,
+                            message: "element verification needs accessibility evidence; act on an observation made with include_accessibility".into(),
+                            retryable: false,
+                        });
+                    }
+                }
+                Predicate::ProcessExited { pid } => validate_pid(*pid)?,
+                Predicate::WindowExists { .. } | Predicate::FocusedWindow { .. } => {}
             }
         }
         drop(controller);
@@ -60,24 +72,32 @@ impl VerificationPlan {
 
     pub(crate) async fn evaluate(
         &self,
-        observation: &Observation,
+        captured: &CapturedObservation,
         state: &ServiceState,
-        connection_id: ConnectionId,
     ) -> Result<Vec<bool>, ProtocolError> {
         if self.predicates.is_empty() {
             return Ok(Vec::new());
         }
-        let current_frame = state
-            .controller
-            .lock()
-            .await
-            .observation(connection_id, observation.id)
-            .map(|grounding| grounding.application_frame_fingerprint)
-            .ok_or_else(|| ProtocolError {
-                code: ErrorCode::Internal,
-                message: "settled observation was not retained for verification".into(),
+        let observation = &captured.observation;
+        let needs_semantics = self.predicates.iter().any(|predicate| {
+            matches!(
+                predicate,
+                Predicate::ElementExists { .. } | Predicate::ElementState { .. }
+            )
+        });
+        if needs_semantics && !observation.accessibility_available {
+            return Err(ProtocolError {
+                code: ErrorCode::BackendFailure,
+                message: format!(
+                    "element verification could not be measured: {}",
+                    observation
+                        .accessibility_limitation
+                        .as_deref()
+                        .unwrap_or("the resulting observation has no accessibility evidence")
+                ),
                 retryable: true,
-            })?;
+            });
+        }
         let needs_windows = self.predicates.iter().any(|predicate| {
             matches!(
                 predicate,
@@ -95,48 +115,69 @@ impl VerificationPlan {
         } else {
             None
         };
+        let windows = || {
+            snapshot
+                .as_ref()
+                .expect("window predicates requested an inspection")
+        };
 
-        Ok(self
-            .predicates
+        self.predicates
             .iter()
             .map(|predicate| match predicate {
-                Predicate::FrameChanged { from } => self
+                Predicate::FrameChanged { from } => Ok(self
                     .prior_frames
                     .get(from)
-                    .is_some_and(|prior| *prior != current_frame),
-                Predicate::WindowExists { window_id } => snapshot
-                    .as_ref()
-                    .expect("window predicates requested an inspection")
-                    .windows
-                    .iter()
-                    .any(|window| &window.id == window_id),
-                Predicate::FocusedWindow { window_id } => {
-                    snapshot
-                        .as_ref()
-                        .expect("window predicates requested an inspection")
-                        .focused_window
-                        .as_ref()
-                        == Some(window_id)
-                }
-                Predicate::ProcessExited { pid } => !Path::new(&format!("/proc/{pid}")).exists(),
-                Predicate::ElementExists { element } => observation
+                    .is_some_and(|prior| *prior != captured.application_frame_fingerprint)),
+                Predicate::WindowExists { window_id } => Ok(window_exists(windows(), window_id)),
+                Predicate::FocusedWindow { window_id } => Ok(window_focused(windows(), window_id)),
+                Predicate::ProcessExited { pid } => process_exited(*pid),
+                Predicate::ElementExists { element } => Ok(observation
                     .accessibility
                     .iter()
-                    .any(|node| &node.handle == element),
+                    .any(|node| &node.handle == element)),
                 Predicate::ElementState {
                     element,
                     state,
                     present,
-                } => observation
+                } => Ok(observation
                     .accessibility
                     .iter()
                     .find(|node| &node.handle == element)
                     .is_some_and(|node| {
                         node.states.iter().any(|actual| actual == state) == *present
-                    }),
+                    })),
             })
-            .collect())
+            .collect()
     }
+}
+
+/// The predicate semantics waits and post-action verification share; each
+/// acquires its own evidence.
+pub(crate) fn window_exists(snapshot: &NiriSnapshot, window_id: &WindowId) -> bool {
+    snapshot
+        .windows
+        .iter()
+        .any(|window| &window.id == window_id)
+}
+
+pub(crate) fn window_focused(snapshot: &NiriSnapshot, window_id: &WindowId) -> bool {
+    snapshot.focused_window.as_ref() == Some(window_id)
+}
+
+pub(crate) fn process_exited(pid: u32) -> Result<bool, ProtocolError> {
+    validate_pid(pid)?;
+    Ok(!Path::new(&format!("/proc/{pid}")).exists())
+}
+
+fn validate_pid(pid: u32) -> Result<(), ProtocolError> {
+    if pid == 0 {
+        return Err(ProtocolError {
+            code: ErrorCode::InvalidRequest,
+            message: "a process predicate requires a non-zero PID".into(),
+            retryable: false,
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn failed_verification() -> ProtocolError {
@@ -148,9 +189,7 @@ pub(crate) fn failed_verification() -> ProtocolError {
 }
 
 fn verification_backend(message: String) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::BackendFailure,
-        message: format!("could not inspect post-action verification state: {message}"),
-        retryable: true,
-    }
+    backend_error(format!(
+        "could not inspect post-action verification state: {message}"
+    ))
 }

@@ -8,7 +8,7 @@ use waldo_protocol::{
 };
 use waldo_screencopy::{Capture, ScreenCapturer};
 
-use crate::server::ServiceState;
+use crate::{error::backend_error, server::ServiceState};
 
 pub(crate) async fn observe(
     request_id: RequestId,
@@ -46,7 +46,9 @@ pub(crate) async fn observe(
     };
 
     match capture_observation(source, include_accessibility, state, connection_id).await {
-        Ok(mut observation) => {
+        Ok(CapturedObservation {
+            mut observation, ..
+        }) => {
             if let Some((previous_id, previous)) = previous {
                 let Some(current) = state
                     .controller
@@ -78,12 +80,21 @@ pub(crate) async fn observe(
     }
 }
 
+/// A recorded observation with the frame evidence it was recorded with, so a
+/// caller comparing frames never depends on the observation still being
+/// retained after other clients have observed.
+pub(crate) struct CapturedObservation {
+    pub(crate) observation: Observation,
+    pub(crate) frame_fingerprint: u64,
+    pub(crate) application_frame_fingerprint: u64,
+}
+
 pub(crate) async fn capture_observation(
     source: SourceSelector,
     include_accessibility: bool,
     state: &ServiceState,
     connection_id: waldo_protocol::ConnectionId,
-) -> Result<Observation, ProtocolError> {
+) -> Result<CapturedObservation, ProtocolError> {
     let capture_source = source.clone();
     let inspector = std::sync::Arc::clone(&state.inspector);
     let capturer = std::sync::Arc::clone(&state.capturer);
@@ -131,33 +142,51 @@ pub(crate) async fn capture_observation(
         height: capture.height,
     };
 
-    let (accessibility, focused_element, accessibility_available) = if include_accessibility {
-        match (&state.accessibility, focused_window_state) {
-            (Some(backend), Some(window)) if window.pid.is_some() => {
-                let backend = std::sync::Arc::clone(backend);
-                let pid = window.pid.expect("guarded by is_some");
-                let window_id = window.id;
-                let application_id = window.application_id;
-                let window_title = window.title;
-                match tokio::task::spawn_blocking(move || {
-                    backend.snapshot(pid, window_id, application_id, window_title, logical_bounds)
-                })
-                .await
-                {
-                    Ok(Ok(snapshot)) => (snapshot.nodes, snapshot.focused, true),
-                    Ok(Err(error)) if error.code == ErrorCode::AmbiguousTarget => {
-                        return Err(error);
+    let (accessibility, focused_element, accessibility_available, accessibility_limitation) =
+        if include_accessibility {
+            match (&state.accessibility, focused_window_state) {
+                (Some(backend), Some(window)) if window.pid.is_some() => {
+                    let backend = std::sync::Arc::clone(backend);
+                    let pid = window.pid.expect("guarded by is_some");
+                    let window_id = window.id;
+                    let application_id = window.application_id;
+                    let window_title = window.title;
+                    match tokio::task::spawn_blocking(move || {
+                        backend.snapshot(
+                            pid,
+                            window_id,
+                            application_id,
+                            window_title,
+                            logical_bounds,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(snapshot)) => (snapshot.nodes, snapshot.focused, true, None),
+                        Ok(Err(error)) if error.code == ErrorCode::AmbiguousTarget => {
+                            return Err(error);
+                        }
+                        Ok(Err(error)) => (
+                            Vec::new(),
+                            None,
+                            false,
+                            Some(format!("accessibility snapshot failed: {}", error.message)),
+                        ),
+                        Err(error) => (
+                            Vec::new(),
+                            None,
+                            false,
+                            Some(format!("accessibility snapshot task failed: {error}")),
+                        ),
                     }
-                    _ => (Vec::new(), None, false),
                 }
+                _ => (Vec::new(), None, false, None),
             }
-            _ => (Vec::new(), None, false),
-        }
-    } else {
-        (Vec::new(), None, false)
-    };
+        } else {
+            (Vec::new(), None, false, None)
+        };
 
-    Ok(Observation {
+    let observation = Observation {
         id: observation_id,
         captured_at_unix_ms: capture.captured_at_unix_ms,
         source,
@@ -181,7 +210,13 @@ pub(crate) async fn capture_observation(
         },
         accessibility,
         accessibility_available,
+        accessibility_limitation,
         continuation: None,
+    };
+    Ok(CapturedObservation {
+        observation,
+        frame_fingerprint,
+        application_frame_fingerprint,
     })
 }
 
@@ -405,14 +440,6 @@ fn region_coordinates(
         convert(region.width)?,
         convert(region.height)?,
     ))
-}
-
-fn backend_error(message: String) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::BackendFailure,
-        message,
-        retryable: true,
-    }
 }
 
 fn target_error(message: String) -> ProtocolError {

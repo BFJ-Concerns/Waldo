@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    path::Path,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -18,7 +17,10 @@ use waldo_protocol::{
 };
 use waldo_screencopy::ScreenCapturer;
 
-use crate::observe::capture_frame;
+use crate::{
+    observe::capture_frame,
+    verification::{process_exited, window_exists, window_focused},
+};
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -107,24 +109,13 @@ impl BatchActionExecutor {
                 )?;
                 Ok(frame.application_frame_fingerprint != grounding.application_frame_fingerprint)
             }
-            Predicate::WindowExists { window_id } => Ok(self
-                .snapshot_windows()?
-                .windows
-                .iter()
-                .any(|window| &window.id == window_id)),
+            Predicate::WindowExists { window_id } => {
+                Ok(window_exists(&self.snapshot_windows()?, window_id))
+            }
             Predicate::FocusedWindow { window_id } => {
-                Ok(self.snapshot_windows()?.focused_window.as_ref() == Some(window_id))
+                Ok(window_focused(&self.snapshot_windows()?, window_id))
             }
-            Predicate::ProcessExited { pid } => {
-                if *pid == 0 {
-                    return Err(ProtocolError {
-                        code: ErrorCode::InvalidRequest,
-                        message: "process wait requires a non-zero PID".into(),
-                        retryable: false,
-                    });
-                }
-                Ok(!Path::new(&format!("/proc/{pid}")).exists())
-            }
+            Predicate::ProcessExited { pid } => process_exited(*pid),
             Predicate::ElementExists { element } => self.accessibility()?.element_exists(element),
             Predicate::ElementState {
                 element,

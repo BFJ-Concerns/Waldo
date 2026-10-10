@@ -2220,6 +2220,100 @@ async fn act_returns_mechanical_post_action_verification_results() {
 }
 
 #[tokio::test]
+async fn act_refuses_verification_it_cannot_measure_before_any_action() {
+    let path = test_socket();
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(SideEffectTrackingExecutor {
+            dispatches: Arc::clone(&dispatches),
+            releases: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("unmeasurable-test").unwrap())
+        .await
+        .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let window = Action::Window {
+        window_id: WindowId("41".into()),
+        operation: waldo_protocol::WindowOperation::Focus,
+    };
+    let region = SourceSelector::Region {
+        output_id: OutputId("DP-1".into()),
+        region: LogicalRect {
+            origin: LogicalPoint { x: 0.0, y: 0.0 },
+            width: 100.0,
+            height: 100.0,
+        },
+    };
+    let cases = [
+        // The batch's last capture makes the resulting observation a region,
+        // so a frame comparison against the whole output measures nothing.
+        (
+            vec![window.clone(), Action::Capture { source: region }],
+            Predicate::FrameChanged {
+                from: observation.id,
+            },
+        ),
+        // The observation was made without accessibility, so the resulting
+        // one carries no semantic evidence.
+        (
+            vec![window.clone()],
+            Predicate::ElementExists {
+                element: waldo_protocol::ElementHandle("element-1".into()),
+            },
+        ),
+        (vec![window.clone()], Predicate::ProcessExited { pid: 0 }),
+    ];
+    for (index, (actions, predicate)) in cases.into_iter().enumerate() {
+        let acted = client
+            .request(&ClientMessage::Act {
+                request_id: RequestId::new(3 + index as u64),
+                request: waldo_protocol::ActRequest {
+                    observation_id: observation.id,
+                    actions,
+                    verification: vec![predicate.clone()],
+                },
+            })
+            .await
+            .unwrap();
+        let ServerMessage::Error { error, .. } = acted else {
+            panic!("{predicate:?} must be refused before the batch runs: {acted:?}")
+        };
+        assert_eq!(error.code, ErrorCode::InvalidRequest, "{predicate:?}");
+    }
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
 async fn act_waits_past_transient_changes_for_a_quiet_post_action_frame() {
     let path = test_socket();
     let service = ControllerService::bind_with_all_backends(

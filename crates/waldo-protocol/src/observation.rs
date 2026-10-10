@@ -84,6 +84,10 @@ pub struct Observation {
     pub focus: FocusState,
     pub accessibility: Vec<AccessibilityNode>,
     pub accessibility_available: bool,
+    /// Why requested accessibility evidence is missing or incomplete, when
+    /// the semantic backend failed rather than being unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessibility_limitation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<ObservationContinuation>,
 }

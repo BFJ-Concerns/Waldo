@@ -14,7 +14,8 @@ use waldo_protocol::{
 use crate::{
     batch::BatchActionExecutor,
     dispatch::lease_error,
-    observe::capture_observation,
+    error::backend_error,
+    observe::{CapturedObservation, capture_observation},
     server::ServiceState,
     verification::{VerificationPlan, failed_verification},
 };
@@ -71,9 +72,18 @@ pub(crate) async fn act(
         }
         (grounding, referenced_frames)
     };
+    let result_source = actions
+        .iter()
+        .rev()
+        .find_map(|action| match action {
+            waldo_protocol::Action::Capture { source } => Some(source.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| grounding.source.clone());
     let verification = match VerificationPlan::prepare(
         verification,
-        &grounding.source,
+        &result_source,
+        grounding.include_accessibility,
         state,
         connection_id,
     )
@@ -153,14 +163,6 @@ pub(crate) async fn act(
         grounding.clone(),
         referenced_frames,
     );
-    let result_source = actions
-        .iter()
-        .rev()
-        .find_map(|action| match action {
-            waldo_protocol::Action::Capture { source } => Some(source.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| grounding.source.clone());
     let execution = tokio::task::spawn_blocking(move || {
         execute_batch(&batch_executor, &actions, &cancellation)
     })
@@ -185,7 +187,7 @@ pub(crate) async fn act(
         .await
         {
             Ok(post_action) => (
-                Some(post_action.observation),
+                Some(post_action.captured),
                 post_action.frame_state,
                 post_action.settle_deadline_reached,
                 None,
@@ -203,23 +205,23 @@ pub(crate) async fn act(
                 },
             ),
         };
-    let verification_results = if let Some(observation) = &observation {
-        match verification
-            .evaluate(observation, state, connection_id)
-            .await
-        {
+    let verification_results = if let Some(captured) = &observation {
+        match verification.evaluate(captured, state).await {
             Ok(results) => results,
             Err(error) => {
+                // A batch that already stopped keeps its own stop reason, but
+                // the verification failure is still reported beside it.
                 if stop_reason == waldo_protocol::StopReason::Completed {
                     stop_reason = waldo_protocol::StopReason::VerificationFailed;
-                    completion_error = Some(error);
                 }
+                completion_error = Some(error);
                 Vec::new()
             }
         }
     } else {
         Vec::new()
     };
+    let observation = observation.map(|captured| captured.observation);
     let verification_agreement = evidence_agreement(&verification_results);
     let application_outcome = application_outcome(
         stop_reason,
@@ -270,26 +272,19 @@ async fn capture_post_action_observation(
     let mut last_change = Instant::now();
     let mut changed = false;
     loop {
-        let observation =
+        let captured =
             capture_observation(source.clone(), include_accessibility, state, connection_id)
                 .await?;
         if !expect_visual_change {
             return Ok(PostActionObservation {
-                observation,
+                captured,
                 frame_state: ApplicationFrameState::Unchanged,
                 settle_deadline_reached: false,
             });
         }
         let now = Instant::now();
-        let Some((frame, application_frame)) =
-            observation_frame_fingerprints(state, connection_id, observation.id).await
-        else {
-            return Ok(PostActionObservation {
-                observation,
-                frame_state: ApplicationFrameState::Unchanged,
-                settle_deadline_reached: false,
-            });
-        };
+        let frame = captured.frame_fingerprint;
+        let application_frame = captured.application_frame_fingerprint;
         let composite_changed = frame != latest_frame;
         if composite_changed {
             latest_frame = frame;
@@ -301,14 +296,14 @@ async fn capture_post_action_observation(
         }
         if changed && now.duration_since(last_change) >= POST_ACTION_FRAME_QUIET_PERIOD {
             return Ok(PostActionObservation {
-                observation,
+                captured,
                 frame_state: ApplicationFrameState::Settled,
                 settle_deadline_reached: false,
             });
         }
         if now >= deadline {
             return Ok(PostActionObservation {
-                observation,
+                captured,
                 frame_state: if changed {
                     ApplicationFrameState::Changing
                 } else if composite_changed || frame != previous_frame {
@@ -323,26 +318,8 @@ async fn capture_post_action_observation(
     }
 }
 
-async fn observation_frame_fingerprints(
-    state: &ServiceState,
-    connection_id: ConnectionId,
-    observation_id: waldo_protocol::ObservationId,
-) -> Option<(u64, u64)> {
-    state
-        .controller
-        .lock()
-        .await
-        .observation(connection_id, observation_id)
-        .map(|grounding| {
-            (
-                grounding.frame_fingerprint,
-                grounding.application_frame_fingerprint,
-            )
-        })
-}
-
 struct PostActionObservation {
-    observation: waldo_protocol::Observation,
+    captured: CapturedObservation,
     frame_state: ApplicationFrameState,
     settle_deadline_reached: bool,
 }
@@ -408,14 +385,6 @@ impl ReadySignal {
 impl Drop for ReadySignal {
     fn drop(&mut self) {
         self.signal();
-    }
-}
-
-fn backend_error(message: String) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::BackendFailure,
-        message,
-        retryable: true,
     }
 }
 

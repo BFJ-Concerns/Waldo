@@ -6,6 +6,7 @@ use waldo_protocol::{
 
 use crate::{
     act::act,
+    error::backend_error,
     observe::observe,
     server::{ServiceState, enable_capture_capability},
 };
@@ -113,11 +114,7 @@ fn merge_controller_capabilities(
 fn inspection_error(request_id: RequestId, message: String) -> ServerMessage {
     ServerMessage::Error {
         request_id: Some(request_id),
-        error: ProtocolError {
-            code: ErrorCode::BackendFailure,
-            message,
-            retryable: true,
-        },
+        error: backend_error(message),
     }
 }
 
