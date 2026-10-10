@@ -117,7 +117,9 @@
     const entry = document.querySelector("#entry");
     const selectionControl = document.querySelector("#selection");
     marker.textContent = `ELECTRON-${descriptor.seed.toString(16).padStart(8, "0")}`;
-    surface.style.background = `rgb(${32 + descriptor.seed * 17 % 192}, ${32 + descriptor.seed * 29 % 192}, ${32 + descriptor.seed * 43 % 192})`;
+    // Reduce first: seed * 17 can exceed the integers a Number holds exactly.
+    const reducedSeed = descriptor.seed % 192;
+    surface.style.background = `rgb(${32 + reducedSeed * 17 % 192}, ${32 + reducedSeed * 29 % 192}, ${32 + reducedSeed * 43 % 192})`;
     fs.closeSync(fs.openSync(eventsPath, "a", 0o600));
     fs.chmodSync(eventsPath, 0o600);
 

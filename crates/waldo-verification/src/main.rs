@@ -13,6 +13,10 @@ mod outside_in;
 mod private_json;
 mod toolkit_preflight;
 
+/// Largest accepted seed. Seeds reach the Electron fixture as JavaScript
+/// numbers, exact only up to 2^53 - 1, after the campaign adds per-circuit
+/// offsets of up to 0x2000.
+const MAX_SEED: u64 = (1 << 53) - 1 - 0x2000;
 #[derive(Debug, Parser)]
 #[command(about = "Prepare and validate deterministic Waldo verification evidence")]
 struct Arguments {
@@ -38,7 +42,7 @@ enum Command {
         columns: u32,
         #[arg(long)]
         rows: u32,
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(..=MAX_SEED))]
         seed: u64,
         #[arg(long)]
         output: Option<PathBuf>,
@@ -72,7 +76,7 @@ enum Command {
         fixture: PathBuf,
         #[arg(long, default_value = "python3")]
         python: PathBuf,
-        #[arg(long, default_value_t = 0x9c2e)]
+        #[arg(long, default_value_t = 0x9c2e, value_parser = clap::value_parser!(u64).range(..=MAX_SEED))]
         seed: u64,
     },
     /// Exercise accessibility actions against a deterministic GTK accessibility oracle.
@@ -86,7 +90,7 @@ enum Command {
         fixture: PathBuf,
         #[arg(long, default_value = "python3")]
         python: PathBuf,
-        #[arg(long, default_value_t = 0xa3c7)]
+        #[arg(long, default_value_t = 0xa3c7, value_parser = clap::value_parser!(u64).range(..=MAX_SEED))]
         seed: u64,
     },
     /// Exercise clipboard offer, preservation, and final-consumer certainty.
@@ -100,7 +104,7 @@ enum Command {
         fixture: PathBuf,
         #[arg(long, default_value = "python3")]
         python: PathBuf,
-        #[arg(long, default_value_t = 0xc8e5)]
+        #[arg(long, default_value_t = 0xc8e5, value_parser = clap::value_parser!(u64).range(..=MAX_SEED))]
         seed: u64,
     },
     /// Preflight equivalent toolkit fixtures and emit provisional matrix admission evidence.
@@ -112,7 +116,7 @@ enum Command {
         python: PathBuf,
         #[arg(long, default_value = "electron")]
         electron: PathBuf,
-        #[arg(long, default_value_t = 0xd35c)]
+        #[arg(long, default_value_t = 0xd35c, value_parser = clap::value_parser!(u64).range(..=MAX_SEED))]
         seed: u64,
         #[arg(long)]
         probe_only: bool,
@@ -136,7 +140,7 @@ enum Command {
         python: PathBuf,
         #[arg(long, default_value = "electron")]
         electron: PathBuf,
-        #[arg(long, default_value_t = 0xf17a)]
+        #[arg(long, default_value_t = 0xf17a, value_parser = clap::value_parser!(u64).range(..=MAX_SEED))]
         seed: u64,
         /// Skip migrated legacy circuits for a non-acceptance diagnostic run.
         #[arg(long)]

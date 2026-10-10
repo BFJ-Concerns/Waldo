@@ -106,9 +106,9 @@ class GtkInteractionFixture(Gtk.Application):
     def draw_surface(self, _area, context, width, height):
         seed = self.options.seed
         context.set_source_rgb(
-            (32 + seed * 17 % 192) / 255,
-            (32 + seed * 29 % 192) / 255,
-            (32 + seed * 43 % 192) / 255,
+            (32 + seed % 192 * 17 % 192) / 255,
+            (32 + seed % 192 * 29 % 192) / 255,
+            (32 + seed % 192 * 43 % 192) / 255,
         )
         context.paint()
         context.set_source_rgb(1, 1, 1)

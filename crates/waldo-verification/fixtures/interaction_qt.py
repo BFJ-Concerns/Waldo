@@ -106,9 +106,9 @@ class QtInteractionFixture:
         self.surface.setMinimumSize(760, 340)
         self.surface.setMouseTracking(True)
         colour = QColor(
-            32 + options.seed * 17 % 192,
-            32 + options.seed * 29 % 192,
-            32 + options.seed * 43 % 192,
+            32 + options.seed % 192 * 17 % 192,
+            32 + options.seed % 192 * 29 % 192,
+            32 + options.seed % 192 * 43 % 192,
         )
         palette = self.surface.palette()
         palette.setColor(QPalette.ColorRole.Window, colour)

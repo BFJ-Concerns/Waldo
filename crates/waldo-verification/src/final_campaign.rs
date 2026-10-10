@@ -944,10 +944,13 @@ fn targets(
             entry: logical(entry.x + entry.width / 2.0, entry.y + entry.height / 2.0),
         });
     }
+    // The fixtures paint the same colour; reducing the seed first keeps the
+    // arithmetic exact in every language they are written in.
+    let reduced = seed % 192;
     let expected = [
-        (32 + seed * 17 % 192) as u8,
-        (32 + seed * 29 % 192) as u8,
-        (32 + seed * 43 % 192) as u8,
+        (32 + reduced * 17 % 192) as u8,
+        (32 + reduced * 29 % 192) as u8,
+        (32 + reduced * 43 % 192) as u8,
     ];
     let (min_x, min_y, max_x, max_y) = (0..=96)
         .step_by(8)
