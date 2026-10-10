@@ -81,7 +81,6 @@ resolve_installation() {
     # A marketplace that already exists keeps its own name, which is the
     # name its plugins are installed under.
     claude_marketplace_name="$(existing_marketplace_name "$claude_marketplace")" || return 1
-    codex_marketplace_name="$(existing_marketplace_name "$marketplace")" || return 1
 }
 
 existing_marketplace_name() {
@@ -240,8 +239,12 @@ write_marketplace() {
     rm -f -- "$manifest_tmp"
 }
 
+# The Codex marketplace's name is read here rather than at resolution, so an
+# unreadable Codex manifest fails only the best-effort Codex step, never the
+# Claude Code installation.
 write_codex_marketplace() {
     local marketplace_source entry
+    codex_marketplace_name="$(existing_marketplace_name "$marketplace")" || return 1
     if [[ "$plugin_home" == "$install_home"/* ]]; then
         marketplace_source="./${plugin_home#"$install_home"/}"
     else
@@ -456,7 +459,7 @@ codex_registration_and_proof() {
         auth_link="$auth_candidate"
     fi
     write_codex_marketplace || {
-        codex_diagnostic="could not write the Codex marketplace $marketplace"
+        codex_diagnostic="could not read or write the Codex marketplace $marketplace"
         return 1
     }
     run_codex codex plugin add "waldo@$codex_marketplace_name" || {

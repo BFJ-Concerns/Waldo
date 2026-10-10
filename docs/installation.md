@@ -37,9 +37,10 @@ unless you configured another; add it to your `PATH` or use the full path):
 waldo query --include-windows
 ```
 
-Run `./install-local` again to upgrade after pulling new changes. Existing
-marketplace manifests must be readable JSON or the install stops with a
-diagnostic. Marketplace updates preserve other plugins' entries and replace
+Run `./install-local` again to upgrade after pulling new changes. An existing
+Claude Code marketplace manifest must be readable JSON or the install stops
+with a diagnostic; an unreadable Codex manifest fails only the best-effort
+Codex registration. Marketplace updates preserve other plugins' entries and replace
 the manifest atomically.
 
 ## Rehearsal installs

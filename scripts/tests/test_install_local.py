@@ -502,24 +502,32 @@ class InstallerTests(unittest.TestCase):
                 if loaded.exists():
                     shutil.rmtree(loaded)
 
-    def test_corrupt_marketplace_is_refused_during_resolution(self):
-        for agent in ("claude", "codex"):
-            with self.subTest(agent=agent):
-                plugin_home = self.root / agent / "plugins/waldo"
-                codex_manifest = self.root / agent / "marketplace.json"
-                manifest = (plugin_home.parent / ".claude-plugin/marketplace.json" if agent == "claude"
-                            else codex_manifest)
-                manifest.parent.mkdir(parents=True, exist_ok=True)
-                manifest.write_text("{not json")
-                result = self.steps('if resolve_installation; then echo resolved; else echo refused; fi',
-                                    WALDO_PLUGIN_HOME=str(plugin_home),
-                                    WALDO_MARKETPLACE=str(codex_manifest))
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), "refused")
-                self.assertIn("Could not read marketplace manifest", result.stderr)
-                self.assertIn(str(manifest), result.stderr)
-                self.assertEqual(manifest.read_text(), "{not json")
-                manifest.unlink()
+    def test_corrupt_claude_marketplace_is_refused_during_resolution(self):
+        plugin_home = self.root / "plugins/waldo"
+        manifest = plugin_home.parent / ".claude-plugin/marketplace.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{not json")
+        result = self.steps('if resolve_installation; then echo resolved; else echo refused; fi',
+                            WALDO_PLUGIN_HOME=str(plugin_home))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "refused")
+        self.assertIn("Could not read marketplace manifest", result.stderr)
+        self.assertIn(str(manifest), result.stderr)
+        self.assertEqual(manifest.read_text(), "{not json")
+
+    def test_corrupt_codex_marketplace_fails_only_codex_registration(self):
+        candidate = self.candidate_plugin()
+        cache_home, _ = self.codex_cache(candidate)
+        manifest = self.root / "install/home/.agents/plugins/marketplace.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{not json")
+        result = self.codex_proof_steps(candidate, cache_home)
+        # resolve_installation runs first in the script; reaching the Codex
+        # verdict means resolution, and so the Claude installation, went on.
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "refused", result.stdout)
+        self.assertIn(f"could not read or write the Codex marketplace {manifest}", result.stdout)
+        self.assertEqual(manifest.read_text(), "{not json")
 
     def test_interrupted_marketplace_write_leaves_original_bytes(self):
         manifest = self.root / "marketplace.json"
