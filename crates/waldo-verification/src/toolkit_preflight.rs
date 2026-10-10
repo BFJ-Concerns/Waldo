@@ -1,6 +1,5 @@
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -183,7 +182,7 @@ pub fn run(options: Options) -> Result<PreflightSummary, Box<dyn std::error::Err
         &json!({
             "label": "generated-marker",
             "length": privacy_marker.len(),
-            "sha256": sha256_bytes(privacy_marker.as_bytes())?,
+            "sha256": crate::digest::sha256_bytes(privacy_marker.as_bytes())?,
         }),
     )?;
     let privacy_scan =
@@ -330,7 +329,7 @@ fn preflight_fixture(
             Ok(parsed_events) => {
                 result.event_log_valid = true;
                 result.event_count = parsed_events.len() as u64;
-                result.event_log_sha256 = Some(sha256_file(&events)?);
+                result.event_log_sha256 = Some(crate::digest::sha256_file(&events)?);
             }
             Err(error) => {
                 result.limitation = Some(format!("fixture event log is invalid: {error}"));
@@ -981,14 +980,14 @@ fn identity_evidence(options: &Options) -> Result<PreflightIdentity, Box<dyn std
             Ok(FileIdentity {
                 name: name.to_owned(),
                 path: path.display().to_string(),
-                sha256: sha256_file(&path)?,
+                sha256: crate::digest::sha256_file(&path)?,
             })
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
     Ok(PreflightIdentity {
         commit,
         working_tree_dirty: !verification_status.stdout.is_empty(),
-        verification_diff_sha256: sha256_bytes(&verification_diff.stdout)?,
+        verification_diff_sha256: crate::digest::sha256_bytes(&verification_diff.stdout)?,
         files,
     })
 }
@@ -1029,48 +1028,6 @@ fn program_path(
             })
         })
         .ok_or_else(|| format!("{} was not found on PATH", program.display()).into())
-}
-
-fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("sha256sum").arg(path).output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "sha256sum failed for {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    parse_sha256(&output.stdout)
-}
-
-fn sha256_bytes(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
-    let mut child = Command::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or("sha256sum stdin was unavailable")?
-        .write_all(bytes)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err("sha256sum failed for in-memory evidence".into());
-    }
-    parse_sha256(&output.stdout)
-}
-
-fn parse_sha256(output: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
-    let digest = String::from_utf8(output.to_vec())?
-        .split_whitespace()
-        .next()
-        .ok_or("sha256sum returned no digest")?
-        .to_owned();
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("sha256sum returned an invalid digest".into());
-    }
-    Ok(digest)
 }
 
 fn declared_available(name: &str) -> bool {

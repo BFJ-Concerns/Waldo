@@ -17,7 +17,7 @@ use waldo_verification::{PrivacyScan, scan_private_root};
 use crate::outside_in::{
     McpClient, Options, RuntimeHarness, accessibility_action, accessibility_handle_with_role,
     focused_output, observe_accessibility, observe_accessibility_transient,
-    observe_without_accessibility, sha256_bytes, write_json,
+    observe_without_accessibility, write_json,
 };
 
 const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
@@ -278,7 +278,7 @@ fn run_recoverable(
     );
     let initial_fixture = wait_for_fixture(&state_path, |_| true)?;
     let source_secret = read_and_remove_secret(&secret_path)?;
-    if sha256_bytes(&source_secret)? != initial_fixture.source_digest {
+    if crate::digest::sha256_bytes(&source_secret)? != initial_fixture.source_digest {
         return Err("fixture secret handoff did not match its published digest".into());
     }
     let output_id = focused_output()?;
@@ -385,7 +385,7 @@ fn run_recoverable(
     write_stage(&options.evidence_directory, "direct_values_verified")?;
 
     let maximum = vec![b'Z'; MAX_CLIPBOARD_BYTES];
-    let maximum_digest = sha256_bytes(&maximum)?;
+    let maximum_digest = crate::digest::sha256_bytes(&maximum)?;
     let maximum_exact = write_and_read_digest(
         &mut harness.mcp,
         &mut clipboard_observation_id,
@@ -573,7 +573,7 @@ fn run_recoverable(
     {
         let payload = format!("route-{scenario}-{:x}-{}", options.seed, index);
         generated_payloads.push(payload.as_bytes().to_vec());
-        let expected_digest = sha256_bytes(payload.as_bytes())?;
+        let expected_digest = crate::digest::sha256_bytes(payload.as_bytes())?;
         set_control(&control_path, index as u64 + 1, scenario, &expected_digest)?;
         let configured = wait_for_fixture(&state_path, |state| {
             state.control_sequence == index as u64 + 1 && state.scenario == scenario
@@ -652,7 +652,7 @@ fn run_recoverable(
     require_receipt(&cancellation_guard, "executed")?;
     let cancelled_payload = format!("cancelled-{:x}", options.seed);
     generated_payloads.push(cancelled_payload.as_bytes().to_vec());
-    let cancelled_digest = sha256_bytes(cancelled_payload.as_bytes())?;
+    let cancelled_digest = crate::digest::sha256_bytes(cancelled_payload.as_bytes())?;
     set_control(&control_path, 10, "blocked", &cancelled_digest)?;
     let configured = wait_for_fixture(&state_path, |state| state.control_sequence == 10)?;
     let observed = observe_accessibility(
@@ -1131,7 +1131,8 @@ fn write_and_read(
     mime_type: &str,
     data: &[u8],
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    Ok(write_and_read_digest(mcp, observation_id, mime_type, data)? == sha256_bytes(data)?)
+    Ok(write_and_read_digest(mcp, observation_id, mime_type, data)?
+        == crate::digest::sha256_bytes(data)?)
 }
 
 fn write_and_read_digest(
@@ -1167,7 +1168,7 @@ fn read_digest(
             .as_str()
             .ok_or("ClipboardRead returned no base64 data")?,
     )?;
-    sha256_bytes(&data)
+    crate::digest::sha256_bytes(&data)
 }
 
 fn read_representations(
@@ -1192,7 +1193,7 @@ fn read_representations(
         evidence.push(RepresentationEvidence {
             mime_type: (*mime_type).into(),
             bytes: data.len(),
-            sha256: sha256_bytes(&data)?,
+            sha256: crate::digest::sha256_bytes(&data)?,
         });
     }
     Ok(evidence)
@@ -1224,7 +1225,7 @@ fn clipboard_inventory(
         evidence.push(RepresentationEvidence {
             mime_type: mime_type.into(),
             bytes: output.stdout.len(),
-            sha256: sha256_bytes(&output.stdout)?,
+            sha256: crate::digest::sha256_bytes(&output.stdout)?,
         });
     }
     Ok(evidence)
@@ -1255,7 +1256,7 @@ fn evidence_for(
             Ok(RepresentationEvidence {
                 mime_type: (*mime_type).into(),
                 bytes: data.len(),
-                sha256: sha256_bytes(data)?,
+                sha256: crate::digest::sha256_bytes(data)?,
             })
         })
         .collect()

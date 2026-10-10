@@ -23,7 +23,7 @@ pub use private_root::{
 pub use run::{
     BinaryIdentity, CellOutcome, CellResult, CleanupCheck, CleanupOutcome, EvidenceArtifact,
     EvidenceDigest, EvidenceKind, FixtureIdentity, RunRecord, RunRecordError,
-    SensitiveEvidenceManifest, VerificationIdentity,
+    SensitiveEvidenceManifest, VerificationIdentity, is_sha256_digest,
 };
 pub use topology::{
     TopologyError, TopologyOutput, TopologyPixelSize, TopologyRect, TopologySnapshot,

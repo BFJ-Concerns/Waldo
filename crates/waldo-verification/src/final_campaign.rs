@@ -20,7 +20,7 @@ use crate::{
     clipboard_outside_in,
     outside_in::{
         self, ChildGuard, RuntimeHarness, ToolObservation, focus_niri_window,
-        observe_window_without_accessibility, parse_observation, sha256_bytes, write_json,
+        observe_window_without_accessibility, parse_observation, write_json,
         write_redacted_response,
     },
     toolkit_preflight,
@@ -641,7 +641,7 @@ fn run_fixture_segment(
         window_id,
         workspace_id,
     )?;
-    let digest = sha256_bytes(marker.as_bytes())?;
+    let digest = crate::digest::sha256_bytes(marker.as_bytes())?;
     let state = wait_for_fixture_state(&paths.state, |state| {
         state.text_sha256.as_deref() == Some(digest.as_str())
             && state.counters.drags >= 1
@@ -773,7 +773,7 @@ fn run_coherent_act(
     request["actions"][5]["source"] = observation.source.clone();
     let saved_document = "saved/v2/coherent-act-exact.json";
     let saved_path = harness.evidence().write_json(saved_document, &request)?;
-    let saved_document_sha256 = sha256_bytes(&fs::read(&saved_path)?)?;
+    let saved_document_sha256 = crate::digest::sha256_bytes(&fs::read(&saved_path)?)?;
 
     let response = harness
         .mcp
@@ -793,7 +793,7 @@ fn run_coherent_act(
         .join()
         .map_err(|_| "wait-process reaper thread panicked")??
         .success();
-    let text_digest = sha256_bytes(b"coherent-v2")?;
+    let text_digest = crate::digest::sha256_bytes(b"coherent-v2")?;
     let state = wait_for_fixture_state(&paths.state, |state| {
         state.text_sha256.as_deref() == Some(text_digest.as_str())
             && state.counters.drags >= 1
@@ -1137,7 +1137,7 @@ fn campaign_identity(options: &Options) -> Result<CampaignIdentity, Box<dyn std:
         saved_corpus: SavedCorpusIdentity {
             schema_major: manifest.schema_major,
             deferred: manifest.deferred,
-            manifest_sha256: sha256_bytes(&fs::read(&manifest_path)?)?,
+            manifest_sha256: crate::digest::sha256_bytes(&fs::read(&manifest_path)?)?,
             documents,
         },
     })
@@ -1147,7 +1147,7 @@ fn file_identity(name: &str, path: &Path) -> Result<FileIdentity, Box<dyn std::e
     Ok(FileIdentity {
         name: name.to_owned(),
         path: path.display().to_string(),
-        sha256: sha256_bytes(&fs::read(path)?)?,
+        sha256: crate::digest::sha256_bytes(&fs::read(path)?)?,
     })
 }
 

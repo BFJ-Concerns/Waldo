@@ -268,9 +268,24 @@ fn validate_commit(commit: &str) -> Result<(), RunRecordError> {
     Ok(())
 }
 
+/// Whether `value` is a SHA-256 digest: 64 hexadecimal characters.
+pub fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn validate_digest(digest: &EvidenceDigest) -> Result<(), RunRecordError> {
-    require_text("digest.algorithm", &digest.algorithm)?;
-    require_text("digest.value", &digest.value)
+    if digest.algorithm != "sha256" {
+        return Err(RunRecordError(format!(
+            "digest.algorithm {:?} is not supported; records use sha256",
+            digest.algorithm
+        )));
+    }
+    if !is_sha256_digest(&digest.value) {
+        return Err(RunRecordError(
+            "digest.value must be 64 hexadecimal characters".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn require_text(field: &str, value: &str) -> Result<(), RunRecordError> {

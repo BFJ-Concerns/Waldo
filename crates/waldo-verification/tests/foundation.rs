@@ -28,7 +28,7 @@ fn valid_record() -> RunRecord {
             binaries: vec![BinaryIdentity {
                 name: "waldod".to_owned(),
                 path: "/tmp/waldo-run/bin/waldod".to_owned(),
-                digest: digest("binary-digest"),
+                digest: digest(&"b".repeat(64)),
             }],
             plugin_manifest_version: "0.1.0".to_owned(),
         },
@@ -47,7 +47,7 @@ fn valid_record() -> RunRecord {
             id: "topology".to_owned(),
             kind: EvidenceKind::IndependentOracle,
             location: "/tmp/waldo-run/topology.json".to_owned(),
-            digest: Some(digest("topology-digest")),
+            digest: Some(digest(&"7".repeat(64))),
         }],
         cleanup: vec![CleanupCheck {
             name: "driving-lease".to_owned(),
@@ -70,6 +70,22 @@ fn run_record_round_trips_and_validates() {
     let json = serde_json::to_string_pretty(&record).unwrap();
     let decoded: RunRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded, record);
+}
+
+#[test]
+fn run_record_digests_must_be_sha256() {
+    for invalid in [
+        digest("binary-digest"),
+        digest(&"g".repeat(64)),
+        EvidenceDigest {
+            algorithm: "md5".to_owned(),
+            value: "b".repeat(64),
+        },
+    ] {
+        let mut record = valid_record();
+        record.identity.binaries[0].digest = invalid;
+        assert!(record.validate().is_err());
+    }
 }
 
 #[test]

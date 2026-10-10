@@ -1935,7 +1935,7 @@ pub(crate) fn parse_observation(
         .ok_or_else(|| format!("MCP {label} response has no image content"))?;
     let image_bytes = BASE64.decode(image_data)?;
     let image = image::load_from_memory_with_format(&image_bytes, ImageFormat::Png)?;
-    let image_digest = sha256_bytes(&image_bytes)?;
+    let image_digest = crate::digest::sha256_bytes(&image_bytes)?;
     let source_pixels: PixelSize =
         serde_json::from_value(observation["coordinates"]["source_pixels"].clone())?;
     let model_pixels: PixelSize =
@@ -2221,41 +2221,10 @@ fn release_from_complete_jsonl(contents: &str) -> Result<Option<FixtureEvent>, s
     Ok(None)
 }
 
-pub(crate) fn sha256_bytes(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
-    let mut child = Command::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or("sha256sum did not expose standard input")?
-        .write_all(bytes)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err("sha256sum failed".into());
-    }
-    let stdout = String::from_utf8(output.stdout)?;
-    Ok(stdout
-        .split_whitespace()
-        .next()
-        .ok_or("sha256sum returned no digest")?
-        .to_owned())
-}
-
 fn file_identity(path: &Path) -> Result<FileIdentity, Box<dyn std::error::Error>> {
-    let output = Command::new("sha256sum").arg(path).output()?;
-    if !output.status.success() {
-        return Err(format!("sha256sum failed for {}", path.display()).into());
-    }
-    let stdout = String::from_utf8(output.stdout)?;
     Ok(FileIdentity {
         path: path.to_owned(),
-        sha256: stdout
-            .split_whitespace()
-            .next()
-            .ok_or("sha256sum returned no digest")?
-            .to_owned(),
+        sha256: crate::digest::sha256_file(path)?,
     })
 }
 
@@ -2314,7 +2283,7 @@ fn redact_sensitive_evidence(
             Ok(json!({
                 "label": label,
                 "length": payload.len(),
-                "sha256": sha256_bytes(payload)?,
+                "sha256": crate::digest::sha256_bytes(payload)?,
                 "raw_retained": false,
                 "base64_retained": false
             }))

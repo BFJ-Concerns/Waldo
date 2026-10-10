@@ -6,6 +6,7 @@ use waldo_verification::{
 };
 
 mod clipboard_outside_in;
+mod digest;
 mod final_campaign;
 mod fixture_poll;
 mod outside_in;
