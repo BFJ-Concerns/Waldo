@@ -145,7 +145,7 @@ impl McpServer {
 
         let response = match self.controller().await {
             Ok(controller) => controller.request(message).await,
-            Err(error) => Err(error),
+            Err(error) => return Ok(crate::result::transport_failure(error)),
         };
         match response {
             Ok(response) => Ok(tool_response(response, self.model_image_max_edge)),
