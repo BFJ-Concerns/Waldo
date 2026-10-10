@@ -162,17 +162,7 @@ pub(crate) async fn capture_observation(
                 })
                 .await
                 {
-                    Ok(Ok(snapshot)) => {
-                        let limitation =
-                            (!snapshot.complete).then(|| INCOMPLETE_TREE_LIMITATION.to_owned());
-                        (
-                            snapshot.nodes,
-                            snapshot.focused,
-                            true,
-                            snapshot.complete,
-                            limitation,
-                        )
-                    }
+                    Ok(Ok(snapshot)) => snapshot_evidence(snapshot),
                     Ok(Err(error)) if error.code == ErrorCode::AmbiguousTarget => {
                         return Err(error);
                     }
@@ -230,6 +220,28 @@ pub(crate) async fn capture_observation(
         application_frame_fingerprint,
         accessibility_complete,
     })
+}
+
+/// The observation's accessibility evidence from a snapshot that was taken:
+/// nodes, focus, availability, completeness, and the limitation sentence
+/// that tells the agent when the tree was cut short.
+fn snapshot_evidence(
+    snapshot: waldo_accessibility::AccessibilitySnapshot,
+) -> (
+    Vec<waldo_protocol::AccessibilityNode>,
+    Option<waldo_protocol::ElementHandle>,
+    bool,
+    bool,
+    Option<String>,
+) {
+    let limitation = (!snapshot.complete).then(|| INCOMPLETE_TREE_LIMITATION.to_owned());
+    (
+        snapshot.nodes,
+        snapshot.focused,
+        true,
+        snapshot.complete,
+        limitation,
+    )
 }
 
 /// Tells the agent that elements missing from a cut-short tree may exist.
@@ -495,7 +507,33 @@ mod tests {
         SourceSelector, WindowId, WindowState, WorkspaceId, WorkspaceState,
     };
 
-    use super::{region_coordinates, resolve_capture_source};
+    use super::{
+        INCOMPLETE_TREE_LIMITATION, region_coordinates, resolve_capture_source, snapshot_evidence,
+    };
+
+    #[test]
+    fn a_cut_short_snapshot_is_marked_incomplete_and_explained_to_the_agent() {
+        let snapshot = |complete| waldo_accessibility::AccessibilitySnapshot {
+            nodes: Vec::new(),
+            focused: None,
+            complete,
+        };
+
+        let (_, _, available, complete, limitation) = snapshot_evidence(snapshot(false));
+        assert!(available);
+        assert!(!complete);
+        let limitation = limitation.expect("a cut-short tree must be explained");
+        assert_eq!(limitation, INCOMPLETE_TREE_LIMITATION);
+        assert!(
+            limitation.contains("too large to read whole"),
+            "{limitation}"
+        );
+
+        let (_, _, available, complete, limitation) = snapshot_evidence(snapshot(true));
+        assert!(available);
+        assert!(complete);
+        assert_eq!(limitation, None);
+    }
 
     const OUTPUT: LogicalRect = LogicalRect {
         origin: LogicalPoint { x: 2560.0, y: 0.0 },
