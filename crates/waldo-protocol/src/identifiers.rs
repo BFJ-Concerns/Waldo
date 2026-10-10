@@ -11,7 +11,12 @@ use serde::{Deserialize, Deserializer, Serialize};
 #[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct ClientId(String);
+pub struct ClientId(
+    /// At least one non-whitespace character, the rule [`ClientId::new`]
+    /// enforces on every decoded value.
+    #[schemars(regex(pattern = r"\S"))]
+    String,
+);
 
 impl ClientId {
     /// Creates a client identity after rejecting an empty or whitespace-only
@@ -65,12 +70,12 @@ macro_rules! numeric_identifier {
         pub struct $name(u64);
 
         impl $name {
-            /// Constructs an identifier from the controller's monotonic sequence.
-            pub const fn new(sequence: u64) -> Self {
-                Self(sequence)
+            /// Constructs an identifier from its wire value.
+            pub const fn new(value: u64) -> Self {
+                Self(value)
             }
 
-            /// Returns the sequence value used by machine-readable bindings.
+            /// Returns the wire value used by machine-readable bindings.
             pub const fn get(self) -> u64 {
                 self.0
             }
@@ -79,23 +84,28 @@ macro_rules! numeric_identifier {
 }
 
 numeric_identifier!(
-    /// Identity for one request on a controller connection.
+    /// Identity for one request on a controller connection, chosen by the
+    /// client that sends it.
     RequestId
 );
 numeric_identifier!(
-    /// Session-local identity for one controller connection.
+    /// Session-local identity for one controller connection, assigned by the
+    /// controller.
     ConnectionId
 );
 numeric_identifier!(
-    /// Session-local identity for one period of driving authority.
+    /// Session-local identity for one period of driving authority, assigned
+    /// by the controller.
     DrivingSessionId
 );
 numeric_identifier!(
-    /// Session-local identity for one captured desktop observation.
+    /// Session-local identity for one captured desktop observation, assigned
+    /// by the controller.
     ObservationId
 );
 numeric_identifier!(
-    /// Opaque identity for one driving-session clipboard preservation guard.
+    /// Opaque identity for one driving-session clipboard preservation guard,
+    /// assigned by the controller.
     ClipboardPreservationId
 );
 numeric_identifier!(
@@ -131,6 +141,14 @@ text_identifier!(
 #[cfg(test)]
 mod tests {
     use super::ClientId;
+
+    #[test]
+    fn the_published_client_identifier_schema_states_the_decoding_rule() {
+        let schema = serde_json::to_value(schemars::schema_for!(ClientId)).unwrap();
+
+        assert_eq!(schema["type"], "string");
+        assert_eq!(schema["pattern"], r"\S");
+    }
 
     #[test]
     fn client_identifiers_must_contain_visible_content() {

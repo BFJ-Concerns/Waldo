@@ -59,29 +59,16 @@ fn client_schema() -> Value {
     serde_json::to_value(published_schema().client_messages).expect("the schema serialises")
 }
 
-fn action_variant_tags() -> BTreeSet<String> {
-    client_schema()["$defs"]["Action"]["oneOf"]
+/// The `type` tags of one tagged-enum definition in the client schema.
+fn variant_tags(definition: &str) -> BTreeSet<String> {
+    client_schema()["$defs"][definition]["oneOf"]
         .as_array()
-        .expect("the Action definition is a oneOf over its variants")
+        .unwrap_or_else(|| panic!("the {definition} definition is a oneOf over its variants"))
         .iter()
         .map(|variant| {
             variant["properties"]["type"]["const"]
                 .as_str()
-                .expect("each Action variant carries a constant type tag")
-                .to_owned()
-        })
-        .collect()
-}
-
-fn predicate_variant_tags() -> BTreeSet<String> {
-    client_schema()["$defs"]["Predicate"]["oneOf"]
-        .as_array()
-        .expect("the Predicate definition is a oneOf over its variants")
-        .iter()
-        .map(|variant| {
-            variant["properties"]["type"]["const"]
-                .as_str()
-                .expect("each Predicate variant carries a constant type tag")
+                .unwrap_or_else(|| panic!("each {definition} variant carries a constant type tag"))
                 .to_owned()
         })
         .collect()
@@ -89,8 +76,8 @@ fn predicate_variant_tags() -> BTreeSet<String> {
 
 #[test]
 fn every_json_example_in_the_skill_decodes_as_a_wire_type() {
-    let actions = action_variant_tags();
-    let predicates = predicate_variant_tags();
+    let actions = variant_tags("Action");
+    let predicates = variant_tags("Predicate");
     let mut failures = Vec::new();
     for (line, example) in json_examples(&skill_text()) {
         let value: Value = match serde_json::from_str(&example) {
@@ -171,12 +158,12 @@ fn every_action_variant_has_a_literal_example_in_the_skill() {
             collect_tags(&value, &mut shown);
         }
     }
-    let missing: Vec<_> = action_variant_tags().difference(&shown).cloned().collect();
+    let missing: Vec<_> = variant_tags("Action").difference(&shown).cloned().collect();
     assert!(
         missing.is_empty(),
         "action variants the schema accepts but the skill never shows: {missing:?}"
     );
-    let missing: Vec<_> = predicate_variant_tags()
+    let missing: Vec<_> = variant_tags("Predicate")
         .difference(&shown)
         .cloned()
         .collect();
