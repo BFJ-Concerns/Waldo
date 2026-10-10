@@ -13,7 +13,7 @@ use std::{
 };
 
 use nix::poll::{PollFd, PollFlags, poll};
-use waldo_protocol::{ErrorCode, ProtocolError};
+use waldo_protocol::ProtocolError;
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, event_created_child,
     protocol::{
@@ -53,8 +53,9 @@ fn discover(
     deadline: Instant,
     purpose: &str,
 ) -> Result<Discovered, ProtocolError> {
-    let connection = Connection::connect_to_env()
-        .map_err(|error| backend_failure(format!("connect to Wayland: {error}"), true))?;
+    let connection = Connection::connect_to_env().map_err(|error| {
+        ProtocolError::backend_failure(format!("connect to Wayland: {error}"), true)
+    })?;
     let queue = connection.new_event_queue::<OfferState>();
     let qh = queue.handle();
     let registry = connection.display().get_registry(&qh, ());
@@ -134,7 +135,7 @@ impl Discovered {
     /// no longer reports the clipboard after that.
     fn require_live_device(&self, operation: &str) -> Result<(), ProtocolError> {
         if self.state.device_finished {
-            return Err(backend_failure(
+            return Err(ProtocolError::backend_failure(
                 format!("{operation}: the compositor ended Waldo's clipboard data control"),
                 true,
             ));
@@ -147,7 +148,7 @@ pub(crate) fn probe() -> Result<String, ProtocolError> {
     let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
     let discovered = discover(OfferState::default(), deadline, "for the clipboard")?;
     if !discovered.has_data_control() {
-        return Err(unsupported(
+        return Err(ProtocolError::unsupported_capability(
             "stable clipboard preservation requires a Wayland seat and ext-data-control or wlr-data-control",
         ));
     }
@@ -156,7 +157,11 @@ pub(crate) fn probe() -> Result<String, ProtocolError> {
         .seats
         .iter()
         .find_map(|seat| seat.name.clone())
-        .ok_or_else(|| unsupported("clipboard preservation requires a named Wayland seat"))
+        .ok_or_else(|| {
+            ProtocolError::unsupported_capability(
+                "clipboard preservation requires a named Wayland seat",
+            )
+        })
 }
 
 pub(crate) fn snapshot(
@@ -166,7 +171,7 @@ pub(crate) fn snapshot(
     let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
     let mut discovered = discover(OfferState::default(), deadline, "for the clipboard")?;
     let seat = discovered.seat(seat_name).ok_or_else(|| {
-        unsupported(format!(
+        ProtocolError::unsupported_capability(format!(
             "configured clipboard seat {seat_name:?} is no longer available"
         ))
     })?;
@@ -179,7 +184,7 @@ pub(crate) fn snapshot(
             manager.get_data_device(&seat, &qh, ());
         }
         None => {
-            return Err(unsupported(
+            return Err(ProtocolError::unsupported_capability(
                 "stable clipboard preservation requires ext-data-control or wlr-data-control",
             ));
         }
@@ -203,16 +208,21 @@ pub(crate) fn snapshot(
         .iter()
         .find(|offer| offer.proxy.id() == selection.id())
         .map(|offer| offer.mime_types.clone())
-        .ok_or_else(|| backend_failure("clipboard selection omitted its data offer", true))?;
+        .ok_or_else(|| {
+            ProtocolError::backend_failure("clipboard selection omitted its data offer", true)
+        })?;
     let mut representations = Vec::with_capacity(mime_types.len());
     let mut total = 0_usize;
     for mime_type in mime_types {
         let (reader, writer) = UnixStream::pair().map_err(|error| {
-            backend_failure(format!("create clipboard transfer pipe: {error}"), true)
+            ProtocolError::backend_failure(format!("create clipboard transfer pipe: {error}"), true)
         })?;
         selection.receive(mime_type.clone(), writer.as_fd());
         connection.flush().map_err(|error| {
-            backend_failure(format!("request clipboard representation: {error}"), true)
+            ProtocolError::backend_failure(
+                format!("request clipboard representation: {error}"),
+                true,
+            )
         })?;
         drop(writer);
 
@@ -220,7 +230,7 @@ pub(crate) fn snapshot(
         let data = read_representation(reader, remaining, deadline)?;
         total = total.saturating_add(data.len());
         if total > max_bytes {
-            return Err(unsupported(format!(
+            return Err(ProtocolError::unsupported_capability(format!(
                 "clipboard representations exceed Waldo's {max_bytes}-byte restoration limit"
             )));
         }
@@ -235,7 +245,7 @@ pub(crate) fn snapshot(
         "confirm stable clipboard offer generation",
     )?;
     if state.device_finished {
-        return Err(backend_failure(
+        return Err(ProtocolError::backend_failure(
             "confirm stable clipboard offer generation: the compositor ended Waldo's clipboard data control",
             true,
         ));
@@ -243,7 +253,7 @@ pub(crate) fn snapshot(
     if state.selection_generation != generation
         || state.selection.as_ref().map(ClipboardOffer::id) != Some(selection.id())
     {
-        return Err(backend_failure(
+        return Err(ProtocolError::backend_failure(
             "clipboard ownership changed while Waldo was preserving the offer",
             true,
         ));
@@ -333,12 +343,12 @@ where
         Ok(Ok(())) => {
             if accept_tx.send(()).is_err() {
                 worker.join().map_err(|_| {
-                    backend_failure(
+                    ProtocolError::backend_failure(
                         "prepare ordered clipboard publication: worker panicked",
                         true,
                     )
                 })?;
-                return Err(backend_failure(
+                return Err(ProtocolError::backend_failure(
                     "prepare ordered clipboard publication: worker exited before acceptance",
                     true,
                 ));
@@ -349,7 +359,7 @@ where
         Ok(Err(error)) => {
             drop(accept_tx);
             worker.join().map_err(|_| {
-                backend_failure(
+                ProtocolError::backend_failure(
                     "prepare ordered clipboard publication: worker panicked",
                     true,
                 )
@@ -359,12 +369,12 @@ where
         Err(error) => {
             drop(accept_tx);
             worker.join().map_err(|_| {
-                backend_failure(
+                ProtocolError::backend_failure(
                     "prepare ordered clipboard publication: worker panicked",
                     true,
                 )
             })?;
-            Err(backend_failure(
+            Err(ProtocolError::backend_failure(
                 format!("acknowledge ordered clipboard publication: {error}"),
                 true,
             ))
@@ -423,7 +433,7 @@ fn serve_owned_publication(
             return Ok(());
         }
         let dispatched = queue.dispatch_pending(state).map_err(|error| {
-            backend_failure(
+            ProtocolError::backend_failure(
                 format!("serve ordered clipboard publication: dispatch events: {error}"),
                 true,
             )
@@ -432,7 +442,7 @@ fn serve_owned_publication(
             continue;
         }
         queue.flush().map_err(|error| {
-            backend_failure(
+            ProtocolError::backend_failure(
                 format!("serve ordered clipboard publication: flush requests: {error}"),
                 true,
             )
@@ -443,7 +453,7 @@ fn serve_owned_publication(
         };
         if wait_for_publication_readable(read_guard.connection_fd(), Duration::from_secs(1))? {
             read_guard.read().map_err(|error| {
-                backend_failure(
+                ProtocolError::backend_failure(
                     format!("serve ordered clipboard publication: read events: {error}"),
                     true,
                 )
@@ -459,7 +469,7 @@ fn wait_for_publication_readable(
     let mut descriptors = [PollFd::new(descriptor, PollFlags::POLLIN)];
     let timeout_ms = timeout.as_millis().clamp(1, u128::from(u16::MAX)) as u16;
     let ready = poll(&mut descriptors, timeout_ms).map_err(|error| {
-        backend_failure(
+        ProtocolError::backend_failure(
             format!("serve ordered clipboard publication: wait for events: {error}"),
             true,
         )
@@ -469,13 +479,13 @@ fn wait_for_publication_readable(
     }
     let events = descriptors[0].revents().unwrap_or_else(PollFlags::empty);
     if events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
-        return Err(backend_failure(
+        return Err(ProtocolError::backend_failure(
             "serve ordered clipboard publication: Wayland connection became unavailable",
             true,
         ));
     }
     if !events.contains(PollFlags::POLLIN) {
-        return Err(backend_failure(
+        return Err(ProtocolError::backend_failure(
             "serve ordered clipboard publication: poll returned without readable events",
             true,
         ));
@@ -489,9 +499,11 @@ fn prepare_publication(
     deadline: Instant,
 ) -> Result<(EventQueue<OfferState>, OfferState), ProtocolError> {
     let mut discovered = discover(state, deadline, "for clipboard publication")?;
-    let seat = discovered
-        .seat(seat_name)
-        .ok_or_else(|| unsupported(format!("clipboard seat {seat_name:?} is unavailable")))?;
+    let seat = discovered.seat(seat_name).ok_or_else(|| {
+        ProtocolError::unsupported_capability(format!(
+            "clipboard seat {seat_name:?} is unavailable"
+        ))
+    })?;
     let qh = discovered.queue.handle();
     match discovered.data_control_manager() {
         Some(DataControlManager::Ext(manager)) => {
@@ -515,7 +527,7 @@ fn prepare_publication(
             discovered.state.owned_source = Some(ClipboardSource::Wlr { _proxy: source });
         }
         None => {
-            return Err(unsupported(
+            return Err(ProtocolError::unsupported_capability(
                 "ordered clipboard publication requires ext-data-control or wlr-data-control",
             ));
         }
@@ -534,7 +546,7 @@ fn require_deadline(deadline: Instant, operation: &str) -> Result<(), ProtocolEr
     if Instant::now() < deadline {
         Ok(())
     } else {
-        Err(backend_failure(
+        Err(ProtocolError::backend_failure(
             format!("{operation} exceeded the {SNAPSHOT_TIMEOUT:?} clipboard snapshot limit"),
             true,
         ))
@@ -894,7 +906,7 @@ fn serve_publication(
         .iter()
         .find(|(offered_mime, _)| offered_mime == mime_type)
         .ok_or_else(|| {
-            backend_failure(
+            ProtocolError::backend_failure(
                 format!("consumer requested unadvertised clipboard MIME type {mime_type:?}"),
                 false,
             )
@@ -912,7 +924,7 @@ fn serve_publication(
         {
             Ok(Transfer::Abandoned)
         }
-        Err(error) => Err(backend_failure(
+        Err(error) => Err(ProtocolError::backend_failure(
             format!("serve ordered clipboard representation to consumer: {error}"),
             true,
         )),
@@ -931,20 +943,20 @@ fn bounded_roundtrip(
     let mut total_dispatched = 0_usize;
     while !state.sync_done {
         if Instant::now() >= deadline {
-            return Err(backend_failure(
+            return Err(ProtocolError::backend_failure(
                 format!("{operation} exceeded the {SNAPSHOT_TIMEOUT:?} clipboard snapshot limit"),
                 true,
             ));
         }
         let dispatched = queue.dispatch_pending(state).map_err(|error| {
-            backend_failure(
+            ProtocolError::backend_failure(
                 format!("{operation}: dispatch Wayland events: {error}"),
                 true,
             )
         })?;
         total_dispatched = total_dispatched.saturating_add(dispatched);
         if total_dispatched > MAX_ROUNDTRIP_EVENTS {
-            return Err(backend_failure(
+            return Err(ProtocolError::backend_failure(
                 format!("{operation} exceeded the bounded Wayland event budget"),
                 true,
             ));
@@ -955,7 +967,7 @@ fn bounded_roundtrip(
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| {
-                backend_failure(
+                ProtocolError::backend_failure(
                     format!(
                         "{operation} exceeded the {SNAPSHOT_TIMEOUT:?} clipboard snapshot limit"
                     ),
@@ -963,7 +975,7 @@ fn bounded_roundtrip(
                 )
             })?;
         queue.flush().map_err(|error| {
-            backend_failure(
+            ProtocolError::backend_failure(
                 format!("{operation}: flush Wayland requests: {error}"),
                 true,
             )
@@ -976,7 +988,10 @@ fn bounded_roundtrip(
         };
         wait_for_readable(read_guard.connection_fd(), remaining, operation)?;
         read_guard.read().map_err(|error| {
-            backend_failure(format!("{operation}: read Wayland events: {error}"), true)
+            ProtocolError::backend_failure(
+                format!("{operation}: read Wayland events: {error}"),
+                true,
+            )
         })?;
     }
     Ok(())
@@ -990,26 +1005,26 @@ fn wait_for_readable(
     let mut descriptors = [PollFd::new(descriptor, PollFlags::POLLIN)];
     let timeout_ms = remaining.as_millis().clamp(1, u128::from(u16::MAX)) as u16;
     let ready = poll(&mut descriptors, timeout_ms).map_err(|error| {
-        backend_failure(
+        ProtocolError::backend_failure(
             format!("{operation}: wait for Wayland events: {error}"),
             true,
         )
     })?;
     if ready == 0 {
-        return Err(backend_failure(
+        return Err(ProtocolError::backend_failure(
             format!("{operation} exceeded the {SNAPSHOT_TIMEOUT:?} clipboard snapshot limit"),
             true,
         ));
     }
     let events = descriptors[0].revents().unwrap_or_else(PollFlags::empty);
     if events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
-        return Err(backend_failure(
+        return Err(ProtocolError::backend_failure(
             format!("{operation}: Wayland connection became unavailable while waiting for events"),
             true,
         ));
     }
     if !events.contains(PollFlags::POLLIN) {
-        return Err(backend_failure(
+        return Err(ProtocolError::backend_failure(
             format!("{operation}: Wayland poll returned without readable events"),
             true,
         ));
@@ -1026,7 +1041,7 @@ fn read_representation(
     let mut buffer = [0_u8; 16 * 1024];
     loop {
         let remaining_time = deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
-            backend_failure(
+            ProtocolError::backend_failure(
                 format!(
                     "receive clipboard representation exceeded the {SNAPSHOT_TIMEOUT:?} clipboard snapshot limit"
                 ),
@@ -1036,7 +1051,10 @@ fn read_representation(
         reader
             .set_read_timeout(Some(remaining_time))
             .map_err(|error| {
-                backend_failure(format!("bound clipboard transfer time: {error}"), true)
+                ProtocolError::backend_failure(
+                    format!("bound clipboard transfer time: {error}"),
+                    true,
+                )
             })?;
         let capacity = remaining_bytes.saturating_add(1).saturating_sub(data.len());
         let length = capacity.min(buffer.len());
@@ -1047,7 +1065,7 @@ fn read_representation(
             Ok(0) => return Ok(data),
             Ok(read) => data.extend_from_slice(&buffer[..read]),
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Err(backend_failure(
+                return Err(ProtocolError::backend_failure(
                     format!(
                         "receive clipboard representation exceeded the {SNAPSHOT_TIMEOUT:?} clipboard snapshot limit"
                     ),
@@ -1055,20 +1073,12 @@ fn read_representation(
                 ));
             }
             Err(error) => {
-                return Err(backend_failure(
+                return Err(ProtocolError::backend_failure(
                     format!("receive clipboard representation: {error}"),
                     true,
                 ));
             }
         }
-    }
-}
-
-fn unsupported(message: impl Into<String>) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::UnsupportedCapability,
-        message: message.into(),
-        retryable: false,
     }
 }
 
@@ -1080,14 +1090,6 @@ fn bind_seats(registry: &WlRegistry, qh: &QueueHandle<OfferState>, state: &mut O
     {
         let proxy: WlSeat = registry.bind(global.name, global.version.min(9), qh, ());
         state.seats.push(SeatRecord { proxy, name: None });
-    }
-}
-
-fn backend_failure(message: impl Into<String>, retryable: bool) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::BackendFailure,
-        message: message.into(),
-        retryable,
     }
 }
 

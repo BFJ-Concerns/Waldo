@@ -152,6 +152,10 @@ impl Screencopy {
 
 /// Dispatch available Wayland events without allowing a silent compositor to
 /// retain one of the service's blocking workers forever.
+fn poll_timeout_ms(remaining: Duration) -> u16 {
+    remaining.as_millis().clamp(1, u128::from(u16::MAX)) as u16
+}
+
 fn dispatch_until(
     queue: &mut wayland_client::EventQueue<State>,
     state: &mut State,
@@ -175,7 +179,7 @@ fn dispatch_until(
         return Ok(());
     };
     let mut descriptors = [PollFd::new(read_guard.connection_fd(), PollFlags::POLLIN)];
-    let timeout_ms = remaining.as_millis().clamp(1, u128::from(u16::MAX)) as u16;
+    let timeout_ms = poll_timeout_ms(remaining);
     let ready =
         poll(&mut descriptors, timeout_ms).map_err(|error| CaptureError::Io(error.into()))?;
     if ready == 0 {
@@ -425,7 +429,7 @@ mod tests {
     #[test]
     fn poll_timeout_never_exceeds_the_remaining_capture_budget() {
         let remaining = Duration::from_millis(37);
-        let timeout_ms = remaining.as_millis().clamp(1, u128::from(u16::MAX)) as u16;
+        let timeout_ms = poll_timeout_ms(remaining);
 
         assert_eq!(timeout_ms, 37);
     }
@@ -433,7 +437,7 @@ mod tests {
     #[test]
     fn sub_millisecond_capture_budget_still_gets_one_poll_tick() {
         let remaining = Duration::from_nanos(1);
-        let timeout_ms = remaining.as_millis().clamp(1, u128::from(u16::MAX)) as u16;
+        let timeout_ms = poll_timeout_ms(remaining);
 
         assert_eq!(timeout_ms, 1);
     }

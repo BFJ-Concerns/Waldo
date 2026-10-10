@@ -226,6 +226,32 @@ fn discovered_capabilities(version: &str, protocols: &[ProtocolAdvertisement]) -
         physical_input_detection: BackendCapability::unavailable(
             "physical device distinction has not been verified",
         ),
-        driving_indicator: pending("zwlr_layer_shell_v1", "indicator backend"),
+        driving_indicator: BackendCapability::unavailable(
+            "no driving-indicator backend is implemented",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::{ProtocolAdvertisement, discovered_capabilities};
+
+    #[test]
+    fn layer_shell_advertisement_does_not_imply_an_indicator_backend() {
+        for protocols in [
+            vec![],
+            vec![ProtocolAdvertisement {
+                interface: "zwlr_layer_shell_v1".into(),
+                version: 1,
+            }],
+        ] {
+            let indicator = discovered_capabilities("test", &protocols).driving_indicator;
+            assert!(!indicator.available);
+            assert_eq!(indicator.version, None);
+            assert_eq!(
+                indicator.limitation.as_deref(),
+                Some("no driving-indicator backend is implemented")
+            );
+        }
     }
 }

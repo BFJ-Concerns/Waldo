@@ -12,7 +12,7 @@ use std::{
 };
 
 use nix::sys::memfd::{MFdFlags, memfd_create};
-use waldo_protocol::{ErrorCode, ProtocolError};
+use waldo_protocol::ProtocolError;
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
     globals::{GlobalListContents, registry_queue_init},
@@ -65,28 +65,34 @@ impl Device {
     /// keyboard. Returns the compositor's keymap text when the seat
     /// reported one.
     pub(crate) fn connect() -> Result<(Self, Option<String>), ProtocolError> {
-        let connection = Connection::connect_to_env()
-            .map_err(|error| backend_failure(format!("connect to Wayland: {error}"), true))?;
-        let (globals, mut queue) = registry_queue_init::<WaylandState>(&connection)
-            .map_err(|error| backend_failure(format!("read Wayland globals: {error}"), true))?;
+        let connection = Connection::connect_to_env().map_err(|error| {
+            ProtocolError::backend_failure(format!("connect to Wayland: {error}"), true)
+        })?;
+        let (globals, mut queue) =
+            registry_queue_init::<WaylandState>(&connection).map_err(|error| {
+                ProtocolError::backend_failure(format!("read Wayland globals: {error}"), true)
+            })?;
         let qh = queue.handle();
         let manager: ZwpVirtualKeyboardManagerV1 =
             globals.bind(&qh, 1..=1, ()).map_err(|error| {
-                backend_failure(format!("bind virtual-keyboard manager: {error}"), false)
+                ProtocolError::backend_failure(
+                    format!("bind virtual-keyboard manager: {error}"),
+                    false,
+                )
             })?;
-        let seat: wl_seat::WlSeat = globals
-            .bind(&qh, 1..=9, ())
-            .map_err(|error| backend_failure(format!("bind Wayland seat: {error}"), false))?;
+        let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=9, ()).map_err(|error| {
+            ProtocolError::backend_failure(format!("bind Wayland seat: {error}"), false)
+        })?;
 
         let mut state = WaylandState::default();
-        queue
-            .roundtrip(&mut state)
-            .map_err(|error| backend_failure(format!("read seat capabilities: {error}"), true))?;
+        queue.roundtrip(&mut state).map_err(|error| {
+            ProtocolError::backend_failure(format!("read seat capabilities: {error}"), true)
+        })?;
         let seat_keyboard = state.has_keyboard.then(|| seat.get_keyboard(&qh, ()));
         if seat_keyboard.is_some() {
-            queue
-                .roundtrip(&mut state)
-                .map_err(|error| backend_failure(format!("read seat keymap: {error}"), true))?;
+            queue.roundtrip(&mut state).map_err(|error| {
+                ProtocolError::backend_failure(format!("read seat keymap: {error}"), true)
+            })?;
         }
         let compositor_keymap = state.pending_keymap.take().transpose()?;
 
@@ -108,27 +114,28 @@ impl Device {
         let mut bytes = text.as_bytes().to_vec();
         bytes.push(0);
         let size = u32::try_from(bytes.len())
-            .map_err(|_| backend_failure("keymap exceeds protocol size", false))?;
+            .map_err(|_| ProtocolError::backend_failure("keymap exceeds protocol size", false))?;
         let fd =
             memfd_create("waldo-virtual-keyboard", MFdFlags::MFD_CLOEXEC).map_err(|error| {
-                backend_failure(format!("create keymap memory file: {error}"), true)
+                ProtocolError::backend_failure(format!("create keymap memory file: {error}"), true)
             })?;
         let mut file = File::from(fd);
-        file.write_all(&bytes)
-            .map_err(|error| backend_failure(format!("write virtual keymap: {error}"), true))?;
+        file.write_all(&bytes).map_err(|error| {
+            ProtocolError::backend_failure(format!("write virtual keymap: {error}"), true)
+        })?;
         self.keyboard
             .keymap(KEYMAP_FORMAT_XKB_V1, file.as_fd(), size);
-        self.connection
-            .flush()
-            .map_err(|error| backend_failure(format!("upload virtual keymap: {error}"), true))
+        self.connection.flush().map_err(|error| {
+            ProtocolError::backend_failure(format!("upload virtual keymap: {error}"), true)
+        })
     }
 
     /// Reads any events the compositor has sent since the last call and
     /// returns a keymap the seat reported in the meantime.
     pub(crate) fn poll_keymap(&mut self) -> Result<Option<String>, ProtocolError> {
-        self.connection
-            .flush()
-            .map_err(|error| backend_failure(format!("flush Wayland connection: {error}"), true))?;
+        self.connection.flush().map_err(|error| {
+            ProtocolError::backend_failure(format!("flush Wayland connection: {error}"), true)
+        })?;
         if let Some(guard) = self.queue.prepare_read() {
             // Nothing to read is the ordinary case; any other failure means
             // the connection is gone and the keyboard state is stale.
@@ -137,7 +144,7 @@ impl Device {
                 Err(wayland_client::backend::WaylandError::Io(error))
                     if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => {
-                    return Err(backend_failure(
+                    return Err(ProtocolError::backend_failure(
                         format!("read Wayland events: {error}"),
                         true,
                     ));
@@ -146,7 +153,9 @@ impl Device {
         }
         self.queue
             .dispatch_pending(&mut self.state)
-            .map_err(|error| backend_failure(format!("dispatch Wayland events: {error}"), true))?;
+            .map_err(|error| {
+                ProtocolError::backend_failure(format!("dispatch Wayland events: {error}"), true)
+            })?;
         self.state.pending_keymap.take().transpose()
     }
 
@@ -166,12 +175,12 @@ impl Device {
     /// delivery is unknown.
     pub(crate) fn settle(&mut self) -> Result<(), ProtocolError> {
         self.connection.flush().map_err(|error| {
-            backend_failure(format!("flush virtual-keyboard action: {error}"), true)
+            ProtocolError::backend_failure(format!("flush virtual-keyboard action: {error}"), true)
         })?;
         self.queue
             .dispatch_pending(&mut self.state)
             .map_err(|error| {
-                backend_failure(
+                ProtocolError::backend_failure(
                     format!("dispatch virtual-keyboard protocol state: {error}"),
                     true,
                 )
@@ -196,26 +205,19 @@ const MAX_KEYMAP_BYTES: u32 = 4 * 1024 * 1024;
 /// offset rather than trusting the shared position.
 fn read_keymap(fd: OwnedFd, size: u32) -> Result<String, ProtocolError> {
     if size == 0 || size > MAX_KEYMAP_BYTES {
-        return Err(backend_failure(
+        return Err(ProtocolError::backend_failure(
             format!("the compositor keymap size {size} is outside 1..={MAX_KEYMAP_BYTES} bytes"),
             false,
         ));
     }
     let file = File::from(fd);
     let mut bytes = vec![0; size as usize];
-    file.read_exact_at(&mut bytes, 0)
-        .map_err(|error| backend_failure(format!("read the compositor keymap: {error}"), true))?;
+    file.read_exact_at(&mut bytes, 0).map_err(|error| {
+        ProtocolError::backend_failure(format!("read the compositor keymap: {error}"), true)
+    })?;
     let text = String::from_utf8(bytes)
-        .map_err(|_| backend_failure("the compositor keymap is not UTF-8", false))?;
+        .map_err(|_| ProtocolError::backend_failure("the compositor keymap is not UTF-8", false))?;
     Ok(text.trim_end_matches('\0').to_owned())
-}
-
-pub(crate) fn backend_failure(message: impl Into<String>, retryable: bool) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::BackendFailure,
-        message: message.into(),
-        retryable,
-    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandState {
@@ -260,11 +262,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
         if let wl_keyboard::Event::Keymap { format, fd, size } = event {
             state.pending_keymap = Some(match format {
                 WEnum::Value(wl_keyboard::KeymapFormat::XkbV1) => read_keymap(fd, size),
-                other => Err(ProtocolError {
-                    code: ErrorCode::UnsupportedCapability,
-                    message: format!("the compositor keymap format {other:?} is not XKB v1"),
-                    retryable: false,
-                }),
+                other => Err(ProtocolError::unsupported_capability(format!(
+                    "the compositor keymap format {other:?} is not XKB v1"
+                ))),
             });
         }
     }

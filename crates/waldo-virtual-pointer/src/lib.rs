@@ -6,8 +6,7 @@ use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor, inpu
 use waldo_controller::ExecutionToken;
 use waldo_niri::NiriInspector;
 use waldo_protocol::{
-    Action, ActionRoute, ErrorCode, InputState, LogicalPoint, OutputTransform, PointerButton,
-    ProtocolError,
+    Action, ActionRoute, InputState, LogicalPoint, OutputTransform, PointerButton, ProtocolError,
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle,
@@ -32,7 +31,7 @@ const PATH_STEP: Duration = Duration::from_millis(8);
 /// Longest drag accepted. A drag's path is prepared before dispatch, one
 /// point per step, so the bound keeps a long duration from exhausting memory.
 const MAX_DRAG_DURATION_MS: u32 = 60_000;
-/// Largest magnitude a Wayland fixed-point (signed 24.8) argument carries.
+/// Conservative supported magnitude for Wayland signed 24.8 arguments.
 const MAX_FIXED_MAGNITUDE: f64 = 8_388_607.0;
 /// The first wl_output version that reports output names, which every
 /// output lookup here depends on.
@@ -56,7 +55,7 @@ impl VirtualPointerExecutor {
         operation: impl FnOnce(&mut PointerState) -> Result<T, ActionExecutionFailure>,
     ) -> Result<T, ActionExecutionFailure> {
         let mut guard = self.state.lock().map_err(|_| {
-            ActionExecutionFailure::not_executed(backend_failure(
+            ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                 "virtual-pointer state lock is poisoned",
                 false,
             ))
@@ -116,15 +115,18 @@ struct PointerState {
 
 impl PointerState {
     fn connect() -> Result<Self, ProtocolError> {
-        let connection = Connection::connect_to_env()
-            .map_err(|error| backend_failure(format!("connect to Wayland: {error}"), true))?;
-        let (globals, mut queue) = registry_queue_init::<WaylandState>(&connection)
-            .map_err(|error| backend_failure(format!("read Wayland globals: {error}"), true))?;
+        let connection = Connection::connect_to_env().map_err(|error| {
+            ProtocolError::backend_failure(format!("connect to Wayland: {error}"), true)
+        })?;
+        let (globals, mut queue) =
+            registry_queue_init::<WaylandState>(&connection).map_err(|error| {
+                ProtocolError::backend_failure(format!("read Wayland globals: {error}"), true)
+            })?;
         let qh = queue.handle();
         // Version 2 is the first that can bind a pointer to an output.
         let manager: ZwlrVirtualPointerManagerV1 =
             globals.bind(&qh, 2..=2, ()).map_err(|error| {
-                backend_failure(
+                ProtocolError::backend_failure(
                     format!("bind virtual-pointer manager version 2: {error}"),
                     false,
                 )
@@ -151,7 +153,7 @@ impl PointerState {
             }
         });
         if let Some(version) = too_old {
-            return Err(backend_failure(
+            return Err(ProtocolError::backend_failure(
                 format!(
                     "the compositor offers wl_output version {version}; the virtual pointer needs version {OUTPUT_NAME_VERSION} for output names"
                 ),
@@ -159,12 +161,12 @@ impl PointerState {
             ));
         }
         queue.roundtrip(&mut wayland_state).map_err(|error| {
-            backend_failure(format!("read Wayland output names: {error}"), true)
+            ProtocolError::backend_failure(format!("read Wayland output names: {error}"), true)
         })?;
         let pointer = manager.create_virtual_pointer(None, &qh, ());
-        connection
-            .flush()
-            .map_err(|error| backend_failure(format!("create virtual pointer: {error}"), true))?;
+        connection.flush().map_err(|error| {
+            ProtocolError::backend_failure(format!("create virtual pointer: {error}"), true)
+        })?;
         Ok(Self {
             connection,
             globals,
@@ -240,7 +242,7 @@ impl PointerState {
             .map_err(|error| {
                 ActionExecutionFailure::indeterminate(
                     ActionRoute::VirtualPointer,
-                    backend_failure(
+                    ProtocolError::backend_failure(
                         format!("dispatch virtual-pointer protocol state: {error}"),
                         true,
                     ),
@@ -265,7 +267,10 @@ impl PointerState {
             .map_err(|error| {
                 ActionExecutionFailure::indeterminate(
                     ActionRoute::VirtualPointer,
-                    backend_failure(format!("read Wayland output changes: {error}"), true),
+                    ProtocolError::backend_failure(
+                        format!("read Wayland output changes: {error}"),
+                        true,
+                    ),
                 )
             })?;
         let known = self
@@ -287,7 +292,7 @@ impl PointerState {
         *self = refreshed;
         Err(ActionExecutionFailure::indeterminate(
             ActionRoute::VirtualPointer,
-            backend_failure(
+            ProtocolError::backend_failure(
                 "output topology changed while a pointer button was held; Waldo released the virtual device before refusing further dispatch",
                 true,
             ),
@@ -314,7 +319,7 @@ impl PointerState {
         if !self.held_buttons.is_empty() {
             return Err(ActionExecutionFailure::indeterminate(
                 ActionRoute::VirtualPointer,
-                invalid("a pointer drag cannot cross an output boundary"),
+                ProtocolError::invalid_request("a pointer drag cannot cross an output boundary"),
             ));
         }
         let output = self
@@ -323,7 +328,7 @@ impl PointerState {
             .find(|output| output.name.as_deref() == Some(output_name))
             .map(|output| output.output.clone())
             .ok_or_else(|| {
-                ActionExecutionFailure::not_executed(backend_failure(
+                ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                     format!("Wayland output {output_name} is no longer available"),
                     true,
                 ))
@@ -380,7 +385,7 @@ impl PointerState {
         self.connection.flush().map_err(|error| {
             ActionExecutionFailure::indeterminate(
                 ActionRoute::VirtualPointer,
-                backend_failure(format!("{context}: {error}"), true),
+                ProtocolError::backend_failure(format!("{context}: {error}"), true),
             )
         })
     }
@@ -441,7 +446,9 @@ impl PreparedAction {
                 count,
             } => {
                 if *count == 0 {
-                    return Err(invalid("pointer click count must be greater than zero"));
+                    return Err(ProtocolError::invalid_request(
+                        "pointer click count must be greater than zero",
+                    ));
                 }
                 let point = PreparedPoint::new(*position, &DesktopGeometry::inspect()?)?;
                 Ok(Self::Click {
@@ -457,7 +464,7 @@ impl PreparedAction {
                 duration_ms,
             } => {
                 if *duration_ms > MAX_DRAG_DURATION_MS {
-                    return Err(invalid(
+                    return Err(ProtocolError::invalid_request(
                         "pointer drag duration must be at most 60000 milliseconds",
                     ));
                 }
@@ -486,7 +493,9 @@ impl PreparedAction {
                 duration_ms,
             } => {
                 if points.is_empty() {
-                    return Err(invalid("pointer path must contain at least one point"));
+                    return Err(ProtocolError::invalid_request(
+                        "pointer path must contain at least one point",
+                    ));
                 }
                 let geometry = DesktopGeometry::inspect()?;
                 let points = points
@@ -507,11 +516,9 @@ impl PreparedAction {
                     y: delta.y,
                 })
             }
-            _ => Err(ProtocolError {
-                code: ErrorCode::UnsupportedCapability,
-                message: "this action has no virtual-pointer route".into(),
-                retryable: false,
-            }),
+            _ => Err(ProtocolError::unsupported_capability(
+                "this action has no virtual-pointer route",
+            )),
         }
     }
 }
@@ -528,7 +535,9 @@ struct PreparedPoint {
 impl PreparedPoint {
     fn new(point: LogicalPoint, geometry: &DesktopGeometry) -> Result<Self, ProtocolError> {
         let output = geometry.output_at(point).ok_or_else(|| {
-            invalid("pointer position lies outside every active output in the desktop layout")
+            ProtocolError::invalid_request(
+                "pointer position lies outside every active output in the desktop layout",
+            )
         })?;
         let bounds = output.logical_bounds;
         let (width, height) = (bounds.width, bounds.height);
@@ -641,11 +650,14 @@ struct DesktopGeometry {
 
 impl DesktopGeometry {
     fn inspect() -> Result<Self, ProtocolError> {
-        let snapshot = NiriInspector
-            .inspect(false)
-            .map_err(|error| backend_failure(format!("inspect desktop geometry: {error}"), true))?;
+        let snapshot = NiriInspector.inspect(false).map_err(|error| {
+            ProtocolError::backend_failure(format!("inspect desktop geometry: {error}"), true)
+        })?;
         if snapshot.outputs.is_empty() {
-            return Err(backend_failure("desktop has no active outputs", true));
+            return Err(ProtocolError::backend_failure(
+                "desktop has no active outputs",
+                true,
+            ));
         }
         Ok(Self {
             outputs: snapshot.outputs,
@@ -662,7 +674,9 @@ impl DesktopGeometry {
 fn coordinate(value: f64, extent: u32, name: &str) -> Result<u32, ProtocolError> {
     finite(value, name)?;
     if value < 0.0 || value > f64::from(extent) {
-        return Err(invalid(format!("{name} lies outside the desktop layout")));
+        return Err(ProtocolError::invalid_request(format!(
+            "{name} lies outside the desktop layout"
+        )));
     }
     Ok(value.round() as u32)
 }
@@ -670,7 +684,7 @@ fn coordinate(value: f64, extent: u32, name: &str) -> Result<u32, ProtocolError>
 fn extent(value: f64, name: &str) -> Result<u32, ProtocolError> {
     finite(value, name)?;
     if value <= 0.0 || value > f64::from(u32::MAX) {
-        return Err(invalid(format!(
+        return Err(ProtocolError::invalid_request(format!(
             "{name} cannot be represented by the pointer protocol"
         )));
     }
@@ -681,7 +695,9 @@ fn finite(value: f64, name: &str) -> Result<(), ProtocolError> {
     if value.is_finite() {
         Ok(())
     } else {
-        Err(invalid(format!("{name} must be finite")))
+        Err(ProtocolError::invalid_request(format!(
+            "{name} must be finite"
+        )))
     }
 }
 
@@ -690,7 +706,7 @@ fn finite(value: f64, name: &str) -> Result<(), ProtocolError> {
 fn wire_fixed(value: f64, name: &str) -> Result<(), ProtocolError> {
     finite(value, name)?;
     if value.abs() > MAX_FIXED_MAGNITUDE {
-        return Err(invalid(format!(
+        return Err(ProtocolError::invalid_request(format!(
             "{name} must be within ±{MAX_FIXED_MAGNITUDE} logical pixels"
         )));
     }
@@ -740,39 +756,15 @@ fn cancellation_boundary(
     if dispatched {
         Err(ActionExecutionFailure::indeterminate(
             ActionRoute::VirtualPointer,
-            ProtocolError {
-                code: ErrorCode::Cancelled,
-                message: "the pointer action was cancelled after partial dispatch".into(),
-                retryable: false,
-            },
+            ProtocolError::cancelled("the pointer action was cancelled after partial dispatch"),
         ))
     } else {
         Err(ActionExecutionFailure::not_executed(cancelled()))
     }
 }
 
-fn invalid(message: impl Into<String>) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::InvalidRequest,
-        message: message.into(),
-        retryable: false,
-    }
-}
-
 fn cancelled() -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::Cancelled,
-        message: "the action batch was cancelled before virtual-pointer dispatch".into(),
-        retryable: false,
-    }
-}
-
-fn backend_failure(message: impl Into<String>, retryable: bool) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::BackendFailure,
-        message: message.into(),
-        retryable,
-    }
+    ProtocolError::cancelled("the action batch was cancelled before virtual-pointer dispatch")
 }
 
 #[cfg(test)]

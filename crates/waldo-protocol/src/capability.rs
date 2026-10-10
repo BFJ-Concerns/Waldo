@@ -32,6 +32,7 @@ pub struct Capabilities {
     pub accessibility: BackendCapability,
     pub clipboard: BackendCapability,
     pub physical_input_detection: BackendCapability,
+    /// Unavailable: no driving-indicator backend is implemented.
     pub driving_indicator: BackendCapability,
 }
 
@@ -53,7 +54,9 @@ impl Capabilities {
             accessibility: limitation(),
             clipboard: limitation(),
             physical_input_detection: limitation(),
-            driving_indicator: limitation(),
+            driving_indicator: BackendCapability::unavailable(
+                "no driving-indicator backend is implemented",
+            ),
         }
     }
 }
@@ -122,4 +125,25 @@ pub struct CompatibilityProfile {
     pub niri_version: Option<String>,
     pub wayland_display: Option<String>,
     pub protocols: Vec<ProtocolAdvertisement>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Capabilities;
+
+    #[test]
+    fn an_unimplemented_indicator_does_not_claim_an_initialisation_failure() {
+        for capabilities in [
+            Capabilities::unavailable(),
+            Capabilities::unavailable_because("no display"),
+        ] {
+            let indicator = capabilities.driving_indicator;
+            assert!(!indicator.available);
+            assert_eq!(indicator.version, None);
+            assert_eq!(
+                indicator.limitation.as_deref(),
+                Some("no driving-indicator backend is implemented")
+            );
+        }
+    }
 }

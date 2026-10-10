@@ -33,20 +33,14 @@ const MAX_TEXT_CHARACTERS: usize = 65_536;
 fn require_typeable_length(text: &str) -> Result<(), ProtocolError> {
     let length = text.chars().count();
     if length > MAX_TEXT_CHARACTERS {
-        return Err(ProtocolError {
-            code: ErrorCode::InvalidRequest,
-            message: format!(
-                "text of {length} characters exceeds the virtual keyboard's {MAX_TEXT_CHARACTERS}-character limit; paste longer text through the clipboard"
-            ),
-            retryable: false,
-        });
+        return Err(ProtocolError::invalid_request(format!(
+            "text of {length} characters exceeds the virtual keyboard's {MAX_TEXT_CHARACTERS}-character limit; paste longer text through the clipboard"
+        )));
     }
     Ok(())
 }
 use waldo_controller::ExecutionToken;
-use waldo_protocol::{
-    Action, ActionRoute, ErrorCode, InputState, ProtocolError, TextRoutePreference,
-};
+use waldo_protocol::{Action, ActionRoute, InputState, ProtocolError, TextRoutePreference};
 
 /// The compositor's currently active layout: the group index into the
 /// keymap and, where the compositor names it, the layout's name.
@@ -124,7 +118,7 @@ impl VirtualKeyboardExecutor {
         operation: impl FnOnce(&mut KeyboardState) -> Result<T, ActionExecutionFailure>,
     ) -> Result<T, ActionExecutionFailure> {
         let mut guard = self.state.lock().map_err(|_| {
-            ActionExecutionFailure::not_executed(wayland::backend_failure(
+            ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                 "virtual-keyboard state lock is poisoned",
                 false,
             ))
@@ -310,7 +304,9 @@ impl KeyboardState {
             }),
             Action::KeyChord { keys } => {
                 if keys.is_empty() {
-                    return Err(invalid("key chord must contain at least one key"));
+                    return Err(ProtocolError::invalid_request(
+                        "key chord must contain at least one key",
+                    ));
                 }
                 Ok(PreparedKeyboardAction::Chord(
                     keys.iter()
@@ -320,25 +316,21 @@ impl KeyboardState {
             }
             Action::Text { text, route } => {
                 if !matches!(route, TextRoutePreference::VirtualKeyboard) {
-                    return Err(ProtocolError {
-                        code: ErrorCode::UnsupportedCapability,
-                        message: format!("requested text route {route:?} is not initialised"),
-                        retryable: false,
-                    });
+                    return Err(ProtocolError::unsupported_capability(format!(
+                        "requested text route {route:?} is not initialised"
+                    )));
                 }
                 Ok(PreparedKeyboardAction::Text(self.resolve_text(text)?))
             }
-            _ => Err(ProtocolError {
-                code: ErrorCode::UnsupportedCapability,
-                message: "this action has no virtual-keyboard route".into(),
-                retryable: false,
-            }),
+            _ => Err(ProtocolError::unsupported_capability(
+                "this action has no virtual-keyboard route",
+            )),
         }
     }
 
     fn resolve_key(&self, name: &str) -> Result<u32, ProtocolError> {
         let keysym = named_keysym(name).ok_or_else(|| {
-            invalid(format!(
+            ProtocolError::invalid_request(format!(
                 "key name {name:?} is not recognised by the virtual keyboard"
             ))
         })?;
@@ -347,13 +339,11 @@ impl KeyboardState {
             .named_keycodes
             .get(&keysym.raw())
             .copied()
-            .ok_or_else(|| ProtocolError {
-                code: ErrorCode::UnsupportedCapability,
-                message: format!(
+            .ok_or_else(|| {
+                ProtocolError::unsupported_capability(format!(
                     "key {name:?} is absent from the active keyboard layout {:?}",
                     table.name
-                ),
-                retryable: false,
+                ))
             })
     }
 
@@ -363,14 +353,10 @@ impl KeyboardState {
             .sequences
             .get(&text_keysym(character).raw())
             .cloned()
-            .ok_or_else(|| ProtocolError {
-                code: ErrorCode::UnsupportedCapability,
-                message: format!(
+            .ok_or_else(|| ProtocolError::unsupported_capability(format!(
                     "character {character:?} cannot be typed exactly on the active keyboard layout {:?}",
                     table.name
-                ),
-                retryable: false,
-            })
+                )))
     }
 
     fn resolve_text(&self, text: &str) -> Result<Vec<KeySequence>, ProtocolError> {
@@ -467,47 +453,27 @@ fn active_group(
     if (active.index as usize) < groups {
         return Ok(active.index);
     }
-    Err(ProtocolError {
-        code: ErrorCode::UnsupportedCapability,
-        message: format!(
-            "the active keyboard layout (index {}{}) is outside the {groups} layout(s) of the keymap in use; the keymap and the compositor disagree",
-            active.index,
-            active
-                .name
-                .as_deref()
-                .map(|name| format!(", {name:?}"))
-                .unwrap_or_default()
-        ),
-        retryable: true,
-    })
+    Err(ProtocolError::unsupported_capability(format!(
+        "the active keyboard layout (index {}{}) is outside the {groups} layout(s) of the keymap in use; the keymap and the compositor disagree",
+        active.index,
+        active
+            .name
+            .as_deref()
+            .map(|name| format!(", {name:?}"))
+            .unwrap_or_default()
+    )))
 }
 
 fn unsupported_layout(limitation: impl Into<String>) -> KeyboardUnavailable {
     let limitation = limitation.into();
     KeyboardUnavailable {
-        error: ProtocolError {
-            code: ErrorCode::UnsupportedCapability,
-            message: limitation.clone(),
-            retryable: false,
-        },
+        error: ProtocolError::unsupported_capability(limitation.clone()),
         limitation,
     }
 }
 
 fn cancelled() -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::Cancelled,
-        message: "the action batch was cancelled before virtual-keyboard dispatch".into(),
-        retryable: false,
-    }
-}
-
-fn invalid(message: impl Into<String>) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::InvalidRequest,
-        message: message.into(),
-        retryable: false,
-    }
+    ProtocolError::cancelled("the action batch was cancelled before virtual-keyboard dispatch")
 }
 
 #[cfg(test)]

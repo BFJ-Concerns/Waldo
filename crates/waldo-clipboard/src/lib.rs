@@ -99,7 +99,7 @@ impl ClipboardExecutor {
                 seat,
                 preservation: Mutex::new(PreservationState::default()),
             }),
-            Err(error) => Err(backend_failure(
+            Err(error) => Err(ProtocolError::backend_failure(
                 format!("initialise Wayland clipboard: {error}"),
                 false,
             )),
@@ -132,7 +132,7 @@ impl ClipboardExecutor {
             stable_offer::publish_once(&self.seat, representations).map_err(|error| {
                 ActionExecutionFailure::indeterminate(
                     ActionRoute::Clipboard,
-                    backend_failure(
+                    ProtocolError::backend_failure(
                         format!("offer temporary paste text: {}", error.message),
                         error.retryable,
                     ),
@@ -145,16 +145,15 @@ impl ClipboardExecutor {
     /// Whether the temporary paste offer has delivered its text: false while
     /// it waits, an error when serving it failed.
     pub fn temporary_paste_delivered(&self) -> Result<bool, ProtocolError> {
-        let state = self
-            .preservation
-            .lock()
-            .map_err(|_| internal("clipboard preservation state lock is poisoned"))?;
+        let state = self.preservation.lock().map_err(|_| {
+            ProtocolError::internal("clipboard preservation state lock is poisoned")
+        })?;
         let publication = state
             .publication
             .as_ref()
-            .ok_or_else(|| internal("no temporary paste offer is active"))?;
+            .ok_or_else(|| ProtocolError::internal("no temporary paste offer is active"))?;
         match publication.failure() {
-            Some(error) => Err(backend_failure(
+            Some(error) => Err(ProtocolError::backend_failure(
                 format!("serve temporary paste text: {}", error.message),
                 error.retryable,
             )),
@@ -172,14 +171,17 @@ impl ClipboardExecutor {
                 CopySeat::Specific(snapshot.seat.clone()),
             )
             .map_err(|error| {
-                backend_failure(format!("restore empty Wayland clipboard: {error}"), true)
+                ProtocolError::backend_failure(
+                    format!("restore empty Wayland clipboard: {error}"),
+                    true,
+                )
             })?;
             return Ok(None);
         }
         stable_offer::publish(&snapshot.seat, snapshot.sources.clone())
             .map(Some)
             .map_err(|error| {
-                backend_failure(
+                ProtocolError::backend_failure(
                     format!(
                         "restore ordered Wayland clipboard contents: {}",
                         error.message
@@ -197,7 +199,7 @@ impl ClipboardExecutor {
             PasteMimeType::Specific(mime_type),
         )
         .map_err(|error| {
-            ActionExecutionFailure::not_executed(backend_failure(
+            ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
                 format!("read Wayland clipboard as {mime_type}: {error}"),
                 true,
             ))
@@ -209,17 +211,18 @@ impl ClipboardExecutor {
             .map_err(|error| {
                 ActionExecutionFailure::indeterminate(
                     ActionRoute::Clipboard,
-                    backend_failure(format!("receive Wayland clipboard data: {error}"), true),
+                    ProtocolError::backend_failure(
+                        format!("receive Wayland clipboard data: {error}"),
+                        true,
+                    ),
                 )
             })?;
         if data.len() > MAX_CLIPBOARD_BYTES {
-            return Err(ActionExecutionFailure::not_executed(ProtocolError {
-                code: ErrorCode::UnsupportedCapability,
-                message: format!(
+            return Err(ActionExecutionFailure::not_executed(
+                ProtocolError::unsupported_capability(format!(
                     "clipboard value exceeds Waldo's {MAX_CLIPBOARD_BYTES}-byte transfer limit"
-                ),
-                retryable: false,
-            }));
+                )),
+            ));
         }
 
         Ok(ActionExecution {
@@ -240,26 +243,22 @@ impl ClipboardExecutor {
             .map_err(ActionExecutionFailure::not_executed)?;
         validate_mime_type(mime_type).map_err(ActionExecutionFailure::not_executed)?;
         let data = BASE64.decode(data_base64).map_err(|error| {
-            ActionExecutionFailure::not_executed(ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                message: format!("clipboard data is not valid base64: {error}"),
-                retryable: false,
-            })
+            ActionExecutionFailure::not_executed(ProtocolError::invalid_request(format!(
+                "clipboard data is not valid base64: {error}"
+            )))
         })?;
         if data.len() > MAX_CLIPBOARD_BYTES {
-            return Err(ActionExecutionFailure::not_executed(ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                message: format!(
+            return Err(ActionExecutionFailure::not_executed(
+                ProtocolError::invalid_request(format!(
                     "clipboard value exceeds Waldo's {MAX_CLIPBOARD_BYTES}-byte transfer limit"
-                ),
-                retryable: false,
-            }));
+                )),
+            ));
         }
         let publication = stable_offer::publish(&self.seat, vec![(mime_type.to_owned(), data)])
             .map_err(|error| {
                 ActionExecutionFailure::indeterminate(
                     ActionRoute::Clipboard,
-                    backend_failure(
+                    ProtocolError::backend_failure(
                         format!("write Wayland clipboard: {}", error.message),
                         error.retryable,
                     ),
@@ -283,7 +282,7 @@ impl ClipboardExecutor {
         let publication = stable_offer::publish(&self.seat, representations).map_err(|error| {
             ActionExecutionFailure::indeterminate(
                 ActionRoute::Clipboard,
-                backend_failure(
+                ProtocolError::backend_failure(
                     format!(
                         "write ordered atomic Wayland clipboard offer: {}",
                         error.message
@@ -308,7 +307,7 @@ impl ClipboardExecutor {
         }
         {
             let state = self.preservation.lock().map_err(|_| {
-                ActionExecutionFailure::not_executed(internal(
+                ActionExecutionFailure::not_executed(ProtocolError::internal(
                     "clipboard preservation state lock is poisoned",
                 ))
             })?;
@@ -318,9 +317,11 @@ impl ClipboardExecutor {
                 )));
             }
             if state.guard.is_some() {
-                return Err(ActionExecutionFailure::not_executed(invalid_request(
-                    "this driving session already owns a clipboard preservation guard",
-                )));
+                return Err(ActionExecutionFailure::not_executed(
+                    ProtocolError::invalid_request(
+                        "this driving session already owns a clipboard preservation guard",
+                    ),
+                ));
             }
         }
 
@@ -331,17 +332,19 @@ impl ClipboardExecutor {
             return Err(ActionExecutionFailure::not_executed(cancelled()));
         }
         let mut state = self.preservation.lock().map_err(|_| {
-            ActionExecutionFailure::not_executed(internal(
+            ActionExecutionFailure::not_executed(ProtocolError::internal(
                 "clipboard preservation state lock is poisoned",
             ))
         })?;
         if state.guard.is_some() {
-            return Err(ActionExecutionFailure::not_executed(invalid_request(
-                "this driving session already owns a clipboard preservation guard",
-            )));
+            return Err(ActionExecutionFailure::not_executed(
+                ProtocolError::invalid_request(
+                    "this driving session already owns a clipboard preservation guard",
+                ),
+            ));
         }
         state.next_id = state.next_id.checked_add(1).ok_or_else(|| {
-            ActionExecutionFailure::not_executed(internal(
+            ActionExecutionFailure::not_executed(ProtocolError::internal(
                 "clipboard preservation identifier space exhausted",
             ))
         })?;
@@ -377,12 +380,12 @@ impl ClipboardExecutor {
         ) -> Result<Option<stable_offer::Publication>, ProtocolError>,
     ) -> Result<ActionExecution, ActionExecutionFailure> {
         let mut state = self.preservation.lock().map_err(|_| {
-            ActionExecutionFailure::not_executed(internal(
+            ActionExecutionFailure::not_executed(ProtocolError::internal(
                 "clipboard preservation state lock is poisoned",
             ))
         })?;
         let guard = state.guard.as_ref().ok_or_else(|| {
-            ActionExecutionFailure::not_executed(invalid_request(
+            ActionExecutionFailure::not_executed(ProtocolError::invalid_request(
                 "no clipboard preservation guard is active",
             ))
         })?;
@@ -422,13 +425,13 @@ impl ClipboardExecutor {
         cancellation: &ExecutionToken,
     ) -> Result<ActionExecution, ActionExecutionFailure> {
         let mut state = self.preservation.lock().map_err(|_| {
-            ActionExecutionFailure::not_executed(internal(
+            ActionExecutionFailure::not_executed(ProtocolError::internal(
                 "clipboard preservation state lock is poisoned",
             ))
         })?;
         Self::promote_publication_failure(&mut state);
         let guard = state.guard.as_ref().ok_or_else(|| {
-            ActionExecutionFailure::not_executed(invalid_request(
+            ActionExecutionFailure::not_executed(ProtocolError::invalid_request(
                 "no clipboard preservation guard is active",
             ))
         })?;
@@ -488,10 +491,9 @@ impl ClipboardExecutor {
             &ClipboardSnapshot,
         ) -> Result<Option<stable_offer::Publication>, ProtocolError>,
     ) -> Result<(), ProtocolError> {
-        let mut state = self
-            .preservation
-            .lock()
-            .map_err(|_| internal("clipboard preservation state lock is poisoned"))?;
+        let mut state = self.preservation.lock().map_err(|_| {
+            ProtocolError::internal("clipboard preservation state lock is poisoned")
+        })?;
         Self::promote_publication_failure(&mut state);
         let snapshot = state
             .guard
@@ -535,10 +537,9 @@ impl ClipboardExecutor {
     }
 
     fn ensure_mutation_allowed(&self) -> Result<(), ProtocolError> {
-        let mut state = self
-            .preservation
-            .lock()
-            .map_err(|_| internal("clipboard preservation state lock is poisoned"))?;
+        let mut state = self.preservation.lock().map_err(|_| {
+            ProtocolError::internal("clipboard preservation state lock is poisoned")
+        })?;
         Self::promote_publication_failure(&mut state);
         match &state.failure {
             Some(error) => Err(blocked_by_restore(error)),
@@ -551,10 +552,9 @@ impl ClipboardExecutor {
         publication: Option<stable_offer::Publication>,
         published_restore: Option<ClipboardSnapshot>,
     ) -> Result<(), ProtocolError> {
-        let mut state = self
-            .preservation
-            .lock()
-            .map_err(|_| internal("clipboard preservation state lock is poisoned"))?;
+        let mut state = self.preservation.lock().map_err(|_| {
+            ProtocolError::internal("clipboard preservation state lock is poisoned")
+        })?;
         Self::promote_publication_failure(&mut state);
         if let Some(error) = &state.failure {
             return Err(blocked_by_restore(error));
@@ -615,11 +615,9 @@ impl ActionExecutor for ClipboardExecutor {
             Action::ClipboardKeep { preservation_id } => {
                 self.keep_guard(*preservation_id, cancellation)
             }
-            _ => Err(ActionExecutionFailure::not_executed(ProtocolError {
-                code: ErrorCode::UnsupportedCapability,
-                message: "this action has no clipboard route".into(),
-                retryable: false,
-            })),
+            _ => Err(ActionExecutionFailure::not_executed(
+                ProtocolError::unsupported_capability("this action has no clipboard route"),
+            )),
         }
     }
 
@@ -651,7 +649,7 @@ fn decode_representations(
     max_bytes: usize,
 ) -> Result<Vec<(String, Vec<u8>)>, ProtocolError> {
     if representations.is_empty() {
-        return Err(invalid_request(
+        return Err(ProtocolError::invalid_request(
             "an atomic clipboard offer requires at least one MIME representation",
         ));
     }
@@ -661,7 +659,7 @@ fn decode_representations(
     for representation in representations {
         validate_mime_type(&representation.mime_type)?;
         if !mime_types.insert(representation.mime_type.as_str()) {
-            return Err(invalid_request(format!(
+            return Err(ProtocolError::invalid_request(format!(
                 "atomic clipboard offer repeats MIME type {}",
                 representation.mime_type
             )));
@@ -669,14 +667,14 @@ fn decode_representations(
         let data = BASE64
             .decode(&representation.data_base64)
             .map_err(|error| {
-                invalid_request(format!(
+                ProtocolError::invalid_request(format!(
                     "clipboard data for {} is not valid base64: {error}",
                     representation.mime_type
                 ))
             })?;
         total = total.saturating_add(data.len());
         if total > max_bytes {
-            return Err(invalid_request(format!(
+            return Err(ProtocolError::invalid_request(format!(
                 "clipboard representations exceed Waldo's {max_bytes}-byte transfer limit"
             )));
         }
@@ -687,45 +685,15 @@ fn decode_representations(
 
 fn validate_mime_type(mime_type: &str) -> Result<(), ProtocolError> {
     if mime_type.is_empty() || mime_type.contains('\0') {
-        return Err(ProtocolError {
-            code: ErrorCode::InvalidRequest,
-            message: "clipboard MIME type must be non-empty and contain no NUL byte".into(),
-            retryable: false,
-        });
+        return Err(ProtocolError::invalid_request(
+            "clipboard MIME type must be non-empty and contain no NUL byte",
+        ));
     }
     Ok(())
 }
 
 fn cancelled() -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::Cancelled,
-        message: "the action batch was cancelled before clipboard dispatch".into(),
-        retryable: false,
-    }
-}
-
-fn backend_failure(message: impl Into<String>, retryable: bool) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::BackendFailure,
-        message: message.into(),
-        retryable,
-    }
-}
-
-fn invalid_request(message: impl Into<String>) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::InvalidRequest,
-        message: message.into(),
-        retryable: false,
-    }
-}
-
-fn internal(message: impl Into<String>) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::Internal,
-        message: message.into(),
-        retryable: true,
-    }
+    ProtocolError::cancelled("the action batch was cancelled before clipboard dispatch")
 }
 
 /// Payload-free marker for a restoration failure the clipboard is blocked on.
@@ -737,14 +705,10 @@ fn restoration_limitation(error: &ProtocolError) -> String {
 }
 
 fn blocked_by_restore(error: &ProtocolError) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::UnsupportedCapability,
-        message: format!(
-            "clipboard mutation is blocked by an unresolved exact-restoration failure: {}",
-            error.message
-        ),
-        retryable: true,
-    }
+    ProtocolError::unsupported_capability(format!(
+        "clipboard mutation is blocked by an unresolved exact-restoration failure: {}",
+        error.message
+    ))
 }
 
 #[cfg(test)]
@@ -763,12 +727,12 @@ mod tests {
     use waldo_controller::Controller;
     use waldo_protocol::{
         Action, ClipboardPreservationId, ClipboardRepresentation, ConnectionId, DrivingSessionId,
-        ErrorCode,
+        ErrorCode, ProtocolError,
     };
 
     use super::{
         ClipboardExecutor, ClipboardSnapshot, PreservationGuard, PreservationState,
-        backend_failure, decode_representations, validate_mime_type,
+        decode_representations, validate_mime_type,
     };
 
     #[test]
@@ -927,7 +891,7 @@ mod tests {
         let executor = guarded_executor(ConnectionId::new(1), DrivingSessionId::new(1));
         let failure = executor
             .cleanup_with(|_| {
-                Err(backend_failure(
+                Err(ProtocolError::backend_failure(
                     "deliberate restoration acknowledgement loss",
                     true,
                 ))
@@ -953,10 +917,9 @@ mod tests {
         {
             let mut state = executor.preservation.lock().unwrap();
             state.guard = None;
-            state.publication = Some(super::stable_offer::Publication::failed(backend_failure(
-                "consumer descriptor rejected the write",
-                true,
-            )));
+            state.publication = Some(super::stable_offer::Publication::failed(
+                ProtocolError::backend_failure("consumer descriptor rejected the write", true),
+            ));
         }
 
         assert!(executor.ensure_mutation_allowed().is_ok());
@@ -979,10 +942,9 @@ mod tests {
             let mut state = executor.preservation.lock().unwrap();
             let snapshot = state.guard.take().unwrap().snapshot;
             state.published_restore = Some(snapshot.clone());
-            state.publication = Some(super::stable_offer::Publication::failed(backend_failure(
-                "ordered publication connection closed",
-                true,
-            )));
+            state.publication = Some(super::stable_offer::Publication::failed(
+                ProtocolError::backend_failure("ordered publication connection closed", true),
+            ));
             snapshot
         };
 
@@ -1007,10 +969,9 @@ mod tests {
             let mut state = executor.preservation.lock().unwrap();
             let snapshot = state.guard.take().unwrap().snapshot;
             state.published_restore = Some(snapshot.clone());
-            state.publication = Some(super::stable_offer::Publication::failed(backend_failure(
-                "ordered publication connection closed",
-                true,
-            )));
+            state.publication = Some(super::stable_offer::Publication::failed(
+                ProtocolError::backend_failure("ordered publication connection closed", true),
+            ));
             snapshot.sources
         };
 
