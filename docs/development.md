@@ -51,6 +51,7 @@ GTK 4.
 
 `waldo-verification` runs the real Waldo binaries against disposable
 application fixtures and checks what each application actually received.
-Its fixtures need GTK 4, Qt through PySide6, wxPython and Electron.
+Its fixtures need GTK 4, Qt through PySide6, wxPython and Electron; the
+clipboard circuit also needs wl-clipboard (`wl-copy` and `wl-paste`).
 `scripts/verify-transformed-output.py` starts a disposable nested Niri to
 check captures and pointer input on a transformed output.
