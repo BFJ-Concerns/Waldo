@@ -147,7 +147,7 @@ write_service_file() {
     service_parent="$(dirname -- "$service_file")" || return 1
     # Redirected runtime parents have already been created or validated private.
     if [[ "$install_mode" != redirected ]] \
-        || [[ "$service_parent" != "$redirected_runtime" && "$service_parent" != "$(dirname -- "$WALDO_SOCKET_PATH")" ]]; then
+        || [[ ! "$service_parent" -ef "$redirected_runtime" && ! "$service_parent" -ef "$(dirname -- "$WALDO_SOCKET_PATH")" ]]; then
         install -d -m 0755 "$service_parent" || return 1
     fi
     while IFS= read -r line; do

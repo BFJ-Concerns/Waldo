@@ -155,7 +155,7 @@ class InstallerTests(unittest.TestCase):
             'for event in events: print(json.dumps(event))\n')
         install_root = root / "installation"
         runtime = runtime or root / "runtime"
-        socket_parent = socket_parent or runtime / "waldo"
+        socket_parent = socket_parent or Path(runtime) / "waldo"
         profile_file = profile_file or install_root / "state/waldo/environment.json"
         result = subprocess.run([BASH, str(REPO / "install-local")], text=True,
                                 capture_output=True, timeout=30, env=self.env | {
@@ -187,15 +187,17 @@ class InstallerTests(unittest.TestCase):
                 shutil.rmtree(self.root / "entry")
 
     def test_rehearsal_adopts_private_directories_and_removes_only_created_ones(self):
-        for target in ("runtime", "socket", "service"):
+        for target in ("runtime", "socket", "service", "service-spelling"):
             with self.subTest(target=target):
                 directory = self.root / ("existing-" + target)
                 directory.mkdir(mode=0o700)
                 (directory / "keep").write_text("operator-owned")
                 result, profile, _ = self.rehearsal_entry(
-                    runtime=directory if target == "runtime" else None,
-                    socket_parent=directory if target in ("socket", "service") else None,
-                    service_file=directory / "waldod.service" if target == "service" else None)
+                    runtime=(str(directory) + "/." if target == "service-spelling" else
+                             directory if target == "runtime" else None),
+                    socket_parent=(self.root / "entry/other-socket" if target == "service-spelling" else
+                                   directory if target in ("socket", "service") else None),
+                    service_file=directory / "waldod.service" if target.startswith("service") else None)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(profile["installation"]["available"])
                 self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
