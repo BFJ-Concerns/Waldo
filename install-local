@@ -42,12 +42,34 @@ resolve_installation() {
         cargo_root="${WALDO_CARGO_INSTALL_ROOT:-${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$operator_home/.cargo}}}"
         plugin_home="${WALDO_PLUGIN_HOME:-${XDG_DATA_HOME:-$operator_home/.local/share}/waldo/plugins/waldo}"
         marketplace="${WALDO_MARKETPLACE:-$operator_home/.agents/plugins/marketplace.json}"
-        service_file="${WALDO_SERVICE_FILE:-$operator_home/.config/systemd/user/waldod.service}"
+        # The user manager searches $XDG_CONFIG_HOME/systemd/user when that
+        # is an absolute path, and ~/.config/systemd/user otherwise.
+        local config_home="$operator_home/.config"
+        if [[ "${XDG_CONFIG_HOME:-}" == /* ]]; then
+            config_home="$XDG_CONFIG_HOME"
+        fi
+        service_file="${WALDO_SERVICE_FILE:-$config_home/systemd/user/waldod.service}"
         profile_file="${WALDO_PROFILE_FILE:-${XDG_STATE_HOME:-$operator_home/.local/state}/waldo/environment.json}"
         codex_home="$operator_codex_home"
         redirected_runtime=""
     fi
     cargo_root="$(realpath -m -- "$cargo_root")"
+    # The rehearsal proof runs from its own directory, so a relative plugin
+    # home would name a different place there.
+    plugin_home="$(realpath -m -- "$plugin_home")"
+    service_file="$(realpath -m -- "$service_file")"
+    # The installer enables and restarts waldod.service by name, so the file
+    # it writes must be the unit with that name.
+    if [[ "$(basename -- "$service_file")" != waldod.service ]]; then
+        printf 'WALDO_SERVICE_FILE must name a file called waldod.service: %s\n' "$service_file" >&2
+        return 1
+    fi
+    # Every Waldo binary refuses a relative socket path, which would resolve
+    # differently from the service, the readiness check and an agent.
+    if [[ -v WALDO_SOCKET_PATH && "$WALDO_SOCKET_PATH" != /* ]]; then
+        printf 'WALDO_SOCKET_PATH must be an absolute path: %s\n' "$WALDO_SOCKET_PATH" >&2
+        return 1
+    fi
     bin_dir="$cargo_root/bin"
     waldod_bin="$bin_dir/waldod"
     waldo_bin="$bin_dir/waldo"
@@ -524,6 +546,14 @@ else
     systemctl --user import-environment \
         XDG_RUNTIME_DIR WAYLAND_DISPLAY NIRI_SOCKET DBUS_SESSION_BUS_ADDRESS
     systemctl --user daemon-reload
+    # A unit of the same name elsewhere on the search path would be the one
+    # started, leaving the file just written unused.
+    managed_unit="$(systemctl --user show --property=FragmentPath --value waldod.service)"
+    if [[ "$(realpath -m -- "$managed_unit")" != "$service_file" ]]; then
+        printf 'The user manager resolves waldod.service to %s, not the unit written to %s; WALDO_SERVICE_FILE must be on its unit search path and no other waldod.service may precede it.\n' \
+            "${managed_unit:-nothing}" "$service_file" >&2
+        exit 1
+    fi
     systemctl --user enable waldod.service
     systemctl --user restart waldod.service
 fi

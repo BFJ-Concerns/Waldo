@@ -100,6 +100,26 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
+    def test_paths_every_binding_must_agree_on_are_made_absolute_or_refused(self):
+        relative_socket = self.steps("resolve_installation", WALDO_SOCKET_PATH="relative/controller.sock")
+        self.assertNotEqual(relative_socket.returncode, 0)
+        self.assertIn("WALDO_SOCKET_PATH must be an absolute path", relative_socket.stderr)
+
+        other_unit = self.steps("resolve_installation",
+                                WALDO_SERVICE_FILE=str(self.root / "units/other.service"))
+        self.assertNotEqual(other_unit.returncode, 0)
+        self.assertIn("waldod.service", other_unit.stderr)
+
+        plugin_home = self.successful_steps('resolve_installation\nprintf %s "$plugin_home"',
+                                            WALDO_PLUGIN_HOME="relative/plugin")
+        self.assertTrue(Path(plugin_home).is_absolute(), plugin_home)
+
+    def test_the_canonical_unit_follows_an_absolute_config_home(self):
+        config_home = self.root / "config"
+        service = self.successful_steps('resolve_installation\nprintf %s "$service_file"',
+                                        XDG_CONFIG_HOME=str(config_home))
+        self.assertEqual(Path(service), config_home / "systemd/user/waldod.service")
+
     def stub_commands(self, label, *names):
         """A PATH holding only executables of the given names."""
         stubs = self.root / f"stubs-{label}"
