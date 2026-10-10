@@ -365,6 +365,14 @@ impl Controller {
         Ok(())
     }
 
+    /// Ends a session cleanup that will not be followed by a handover or stop,
+    /// so the retained lease can execute again and idle expiry resumes.
+    pub fn abandon_session_cleanup(&mut self, connection: ConnectionId) {
+        if self.cleanup_in_progress == Some(connection) {
+            self.cleanup_in_progress = None;
+        }
+    }
+
     /// Rolls back provisional authority when pre-dispatch validation fails.
     pub fn abort_execution(&mut self, connection: ConnectionId, release_lease: bool) {
         if self
@@ -771,6 +779,28 @@ mod tests {
                 .begin_execution(target, Duration::from_secs(1))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn abandoned_cleanup_lets_the_retained_lease_execute_and_expire() {
+        let mut controller = Controller::new(IDLE_TIMEOUT);
+        let owner = controller.connect();
+        let other = controller.connect();
+        controller
+            .acquire_driving_lease(owner, Duration::ZERO)
+            .unwrap();
+        controller.begin_session_cleanup(owner).unwrap();
+        assert!(!controller.idle_lease_expired(IDLE_TIMEOUT));
+
+        controller.abandon_session_cleanup(other);
+        assert!(matches!(
+            controller.begin_execution(owner, Duration::ZERO),
+            Err(LeaseError::CleanupInProgress)
+        ));
+
+        controller.abandon_session_cleanup(owner);
+        assert!(controller.idle_lease_expired(IDLE_TIMEOUT));
+        assert!(controller.begin_execution(owner, Duration::ZERO).is_ok());
     }
 
     #[test]

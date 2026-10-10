@@ -10,7 +10,10 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::json;
-use tokio::{io::AsyncWriteExt, sync::oneshot};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::oneshot,
+};
 use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
 use waldo_controller::ExecutionToken;
 use waldo_niri::{NiriSnapshot, SessionInspector, UnavailableInspector};
@@ -2237,6 +2240,181 @@ impl ActionExecutor for UnrestoredCleanupExecutor {
     fn release_all(&self) -> Option<String> {
         Some("clipboard restoration failed".into())
     }
+}
+
+/// Holds its first action past cancellation until the test lets it finish,
+/// and reports every release as having left state unrestored.
+struct HeldCancellationExecutor {
+    started: mpsc::Sender<()>,
+    cancelled: mpsc::Sender<()>,
+    proceed: Mutex<mpsc::Receiver<()>>,
+    held: AtomicBool,
+}
+
+impl ActionExecutor for HeldCancellationExecutor {
+    fn execute(
+        &self,
+        _action: &Action,
+        cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        if !self.held.swap(true, Ordering::SeqCst) {
+            let _ = self.started.send(());
+            while !cancellation.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = self.cancelled.send(());
+            let _ = self.proceed.lock().unwrap().recv();
+        }
+        Ok(ActionRoute::NiriIpc.into())
+    }
+
+    fn release_all(&self) -> Option<String> {
+        Some("clipboard restoration failed".into())
+    }
+}
+
+#[tokio::test]
+async fn a_failed_handover_leaves_the_session_executable_and_reports_its_cleanup() {
+    let path = test_socket();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (cancelled_tx, cancelled_rx) = mpsc::channel();
+    let (proceed_tx, proceed_rx) = mpsc::channel();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(HeldCancellationExecutor {
+            started: started_tx,
+            cancelled: cancelled_tx,
+            proceed: Mutex::new(proceed_rx),
+            held: AtomicBool::new(false),
+        }),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut target = tokio::net::UnixStream::connect(&path).await.unwrap();
+    write_message(
+        &mut target,
+        &ClientMessage::Hello {
+            request_id: RequestId::new(1),
+            schema_major: SCHEMA_MAJOR_VERSION,
+            client_id: ClientId::new("handover-target").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let ServerMessage::Connected {
+        connection_id: target_id,
+        ..
+    } = read_message(&mut target).await.unwrap()
+    else {
+        panic!("the target must connect")
+    };
+    let mut owner = connect_and_start_blocking_act(&path, "handover-owner").await;
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .expect("the batch must start executing");
+
+    write_message(
+        &mut owner,
+        &ClientMessage::Handover {
+            request_id: RequestId::new(4),
+            request: HandoverRequest { target: target_id },
+        },
+    )
+    .await
+    .unwrap();
+    // The handover has validated the target and begun cleanup once it
+    // cancels the running batch.
+    tokio::task::spawn_blocking(move || cancelled_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .expect("the handover must cancel the running batch");
+    // The target leaves while cleanup runs, so the handover then fails. The
+    // controller forgets a connection that holds no lease before closing
+    // its side.
+    target.shutdown().await.unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), target.read_to_end(&mut rest))
+        .await
+        .expect("the controller must close the departed target")
+        .unwrap();
+    proceed_tx.send(()).unwrap();
+
+    let mut handover_error = None;
+    for _ in 0..2 {
+        let response: ServerMessage =
+            tokio::time::timeout(Duration::from_secs(5), read_message(&mut owner))
+                .await
+                .expect("the batch and the handover must both answer")
+                .unwrap();
+        if let ServerMessage::Error {
+            request_id: Some(request_id),
+            error,
+        } = response
+            && request_id == RequestId::new(4)
+        {
+            handover_error = Some(error);
+        }
+    }
+    let error = handover_error.expect("the handover to a departed target must fail");
+    assert!(
+        error.message.contains("clipboard restoration failed"),
+        "the failed handover must keep its cleanup limitation: {}",
+        error.message
+    );
+
+    write_message(
+        &mut owner,
+        &ClientMessage::Observe {
+            request_id: RequestId::new(5),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let ServerMessage::Observed { observation, .. } = read_message(&mut owner).await.unwrap()
+    else {
+        panic!("test observation failed")
+    };
+    write_message(
+        &mut owner,
+        &ClientMessage::Act {
+            request_id: RequestId::new(6),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: Vec::new(),
+                verification: Vec::new(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let acted: ServerMessage =
+        tokio::time::timeout(Duration::from_secs(5), read_message(&mut owner))
+            .await
+            .expect("the session must answer an Act after the failed handover")
+            .unwrap();
+    assert!(
+        matches!(acted, ServerMessage::Acted { .. }),
+        "the session must execute after the failed handover: {acted:?}"
+    );
+
+    drop(owner);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
 }
 
 #[tokio::test]

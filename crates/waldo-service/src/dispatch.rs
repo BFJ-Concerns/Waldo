@@ -98,7 +98,16 @@ pub(crate) async fn dispatch(
                         cleanup_limitation,
                     },
                 },
-                Err(error) => lease_error(request_id, error),
+                Err(error) => {
+                    controller.abandon_session_cleanup(connection_id);
+                    let mut response = lease_error(request_id, error);
+                    if let (ServerMessage::Error { error, .. }, Some(limitation)) =
+                        (&mut response, cleanup_limitation)
+                    {
+                        error.message = format!("{}; {limitation}", error.message);
+                    }
+                    response
+                }
             }
         }
     }
