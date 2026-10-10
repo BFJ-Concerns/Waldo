@@ -70,6 +70,12 @@ impl ActionExecutionFailure {
     pub fn indeterminate(route: ActionRoute, error: ProtocolError) -> Self {
         Self::Indeterminate { route, error }
     }
+
+    pub fn error(&self) -> &ProtocolError {
+        match self {
+            Self::NotExecuted { error } | Self::Indeterminate { error, .. } => error,
+        }
+    }
 }
 
 /// Explicit fail-closed executor used until a live action route passes its gate.

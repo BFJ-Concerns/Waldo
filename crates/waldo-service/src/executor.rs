@@ -412,15 +412,33 @@ fn as_clipboard_paste_failure(failure: ActionExecutionFailure) -> ActionExecutio
     }
 }
 
+/// Restores the operator's clipboard after a failed paste. When restoration
+/// fails too, the clipboard has been mutated, so the result is indeterminate,
+/// but it keeps the paste failure's code and message ahead of the restoration
+/// failure so the caller can still tell what happened to the text.
 fn restore_after_failure<C: PasteClipboard>(
     clipboard: &C,
     snapshot: C::Snapshot,
     failure: ActionExecutionFailure,
 ) -> Result<ActionExecution, ActionExecutionFailure> {
-    clipboard.restore_temporary(snapshot).map_err(|error| {
-        ActionExecutionFailure::indeterminate(ActionRoute::ClipboardPaste, error)
-    })?;
-    Err(as_clipboard_paste_failure(failure))
+    let failure = as_clipboard_paste_failure(failure);
+    match clipboard.restore_temporary(snapshot) {
+        Ok(()) => Err(failure),
+        Err(restoration) => {
+            let original = failure.error();
+            Err(ActionExecutionFailure::indeterminate(
+                ActionRoute::ClipboardPaste,
+                ProtocolError {
+                    code: original.code,
+                    message: format!(
+                        "{}; restoring the clipboard afterwards also failed: {}",
+                        original.message, restoration.message
+                    ),
+                    retryable: false,
+                },
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -433,7 +451,9 @@ mod tests {
     use super::automatic_text;
 
     #[derive(Default)]
-    struct TestClipboard;
+    struct TestClipboard {
+        restore_failure: Option<ProtocolError>,
+    }
 
     impl waldo_action::ActionExecutor for TestClipboard {
         fn execute(
@@ -457,7 +477,7 @@ mod tests {
             Ok(true)
         }
         fn restore_temporary(&self, _: ()) -> Result<(), ProtocolError> {
-            Ok(())
+            self.restore_failure.clone().map_or(Ok(()), Err)
         }
         fn clipboard_limitation(&self) -> Option<String> {
             None
@@ -528,7 +548,7 @@ mod tests {
                     observed: observed.clone(),
                     refusal: failure.clone(),
                 }),
-                Ok(TestClipboard),
+                Ok(TestClipboard::default()),
             )
             .unwrap();
             let result = executor.execute(
@@ -552,6 +572,59 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn a_failed_restoration_keeps_the_paste_failure_it_followed() {
+        use waldo_action::ActionExecutor;
+        let settings = waldo_settings::Settings::from_sources(None, [], None).unwrap();
+        let mut controller = waldo_controller::Controller::new(std::time::Duration::from_secs(30));
+        let connection = controller.connect(waldo_protocol::ClientId::new("paste-test").unwrap());
+        let authority = controller
+            .begin_execution(connection, std::time::Duration::ZERO)
+            .unwrap();
+        let executor = super::DesktopActionExecutor::with_backends(
+            None,
+            std::sync::Arc::new(|| panic!("the injected keyboard needs no layout discovery")),
+            &settings,
+            Err(ProtocolError {
+                code: ErrorCode::BackendFailure,
+                message: "the paste test needs no pointer".into(),
+                retryable: false,
+            }),
+            Ok(TestKeyboard {
+                observed: Default::default(),
+                refusal: Some(ActionExecutionFailure::not_executed(ProtocolError {
+                    code: ErrorCode::UnsupportedCapability,
+                    message: "key Insert is absent from active layout".into(),
+                    retryable: false,
+                })),
+            }),
+            Ok(TestClipboard {
+                restore_failure: Some(ProtocolError {
+                    code: ErrorCode::BackendFailure,
+                    message: "selection owner vanished".into(),
+                    retryable: true,
+                }),
+            }),
+        )
+        .unwrap();
+
+        let result = executor.execute(
+            &waldo_protocol::Action::Text {
+                text: "paste me".into(),
+                route: waldo_protocol::TextRoutePreference::ClipboardPaste,
+            },
+            authority.cancellation(),
+        );
+
+        let Err(ActionExecutionFailure::Indeterminate { route, error }) = result else {
+            panic!("an unrestored clipboard must make the paste indeterminate: {result:?}")
+        };
+        assert_eq!(route, ActionRoute::ClipboardPaste);
+        assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+        assert!(error.message.contains("absent from active layout"));
+        assert!(error.message.contains("selection owner vanished"));
     }
 
     #[test]
