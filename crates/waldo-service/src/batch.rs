@@ -338,7 +338,9 @@ fn action_grounding_invalidation(action: &Action) -> Option<GroundingFailure> {
 fn cancelled() -> ProtocolError {
     ProtocolError {
         code: ErrorCode::Cancelled,
-        message: "the action batch was cancelled during a controller wait".into(),
+        message:
+            "the action batch was cancelled before this controller-owned wait or capture completed"
+                .into(),
         retryable: false,
     }
 }

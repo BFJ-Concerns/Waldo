@@ -58,8 +58,10 @@ async fn sigterm_removes_the_bound_controller_socket() {
             .unwrap(),
     );
     wait_for_socket(&socket, Duration::from_secs(5));
-    // A bound socket precedes backend initialisation and signal registration.
-    // A completed handshake proves the daemon is serving before we stop it.
+    // Backends initialise before the socket is bound, but signal registration
+    // follows binding, so a visible socket does not yet mean SIGTERM is
+    // handled. A completed handshake proves the daemon is serving, with its
+    // signals registered, before we stop it.
     let client = tokio::time::timeout(
         Duration::from_secs(5),
         ControllerClient::connect(&socket, ClientId::new("shutdown-test").unwrap()),

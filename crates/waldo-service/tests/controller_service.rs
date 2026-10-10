@@ -525,7 +525,10 @@ fn test_socket() -> PathBuf {
         .join("controller.sock")
 }
 
-async fn connect_and_start_capture(path: &PathBuf, client_name: &str) -> tokio::net::UnixStream {
+async fn connect_and_start_blocking_act(
+    path: &PathBuf,
+    client_name: &str,
+) -> tokio::net::UnixStream {
     let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
     write_message(
         &mut stream,
@@ -816,7 +819,7 @@ async fn invalid_request_does_not_cancel_an_active_batch() {
     let task = tokio::spawn(service.run_until(async {
         let _ = shutdown_rx.await;
     }));
-    let mut stream = connect_and_start_capture(&path, "invalid-during-act-test").await;
+    let mut stream = connect_and_start_blocking_act(&path, "invalid-during-act-test").await;
     tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
         .await
         .unwrap()
@@ -1518,8 +1521,8 @@ async fn pipelined_act_then_stop_never_executes_after_stop_completion() {
             request_id: RequestId::new(3),
             request: waldo_protocol::ActRequest {
                 observation_id: observation.id,
-                actions: vec![Action::Capture {
-                    source: observation.source,
+                actions: vec![Action::KeyChord {
+                    keys: vec!["test".into()],
                 }],
                 verification: Vec::new(),
             },
@@ -1557,6 +1560,9 @@ async fn pipelined_act_then_stop_never_executes_after_stop_completion() {
         acted.observation.as_ref().unwrap().stable_output_id.0,
         "DP-1"
     );
+    // The keyboard action is routed to the blocking desktop executor. Stop may
+    // cancel the batch before or after its dispatch began; either way nothing
+    // may still be executing once Stop has answered.
     let backend_started = started_rx.try_recv().is_ok();
     assert!(!backend_started || finished.load(Ordering::Acquire));
 
@@ -1586,7 +1592,7 @@ async fn stop_response_waits_for_an_active_executor_to_quiesce() {
     let task = tokio::spawn(service.run_until(async {
         let _ = shutdown_rx.await;
     }));
-    let mut stream = connect_and_start_capture(&path, "stop-quiescence-test").await;
+    let mut stream = connect_and_start_blocking_act(&path, "stop-quiescence-test").await;
     tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
         .await
         .unwrap()
@@ -1639,7 +1645,7 @@ async fn handover_response_waits_for_the_old_executor_to_quiesce() {
     let target = ControllerClient::connect(&path, ClientId::new("handover-target").unwrap())
         .await
         .unwrap();
-    let mut owner = connect_and_start_capture(&path, "handover-owner").await;
+    let mut owner = connect_and_start_blocking_act(&path, "handover-owner").await;
     tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
         .await
         .unwrap()
@@ -1695,7 +1701,7 @@ async fn service_shutdown_waits_for_blocking_executor_quiescence() {
     let task = tokio::spawn(service.run_until(async {
         let _ = shutdown_rx.await;
     }));
-    let stream = connect_and_start_capture(&path, "shutdown-test").await;
+    let stream = connect_and_start_blocking_act(&path, "shutdown-test").await;
     tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
         .await
         .unwrap()
@@ -1754,7 +1760,7 @@ async fn abnormal_client_disconnect_waits_for_executor_quiescence() {
     let task = tokio::spawn(service.run_until(async {
         let _ = shutdown_rx.await;
     }));
-    let mut stream = connect_and_start_capture(&path, "disconnect-test").await;
+    let mut stream = connect_and_start_blocking_act(&path, "disconnect-test").await;
     tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
         .await
         .unwrap()
