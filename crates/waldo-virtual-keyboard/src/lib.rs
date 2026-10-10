@@ -165,13 +165,23 @@ impl ActionExecutor for VirtualKeyboardExecutor {
     }
 
     fn release_all(&self) -> Option<String> {
-        // A poisoned lock still holds the device, and dropping it is the
-        // release, so recover the guard rather than leave keys held.
-        self.state
+        // A poisoned lock still holds the device, so recover the guard
+        // rather than leave keys held. The keys are released explicitly,
+        // not through Drop, so a flush that fails is reported rather than
+        // lost: the compositor may still see those keys as down.
+        let mut guard = self
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        None
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = guard.take()?;
+        let released = state.release_held();
+        drop(state);
+        released.err().map(|error| {
+            format!(
+                "virtual-keyboard release did not complete, so keys may still be held: {}",
+                error.message
+            )
+        })
     }
 }
 
@@ -248,7 +258,10 @@ impl KeyboardState {
             };
             // The old tables are the only record of what is held down, so
             // release everything through them before they are replaced.
-            self.release_held();
+            // The new tables are adopted whether or not that release
+            // flushed, so they match the compositor either way; a failed
+            // flush is reported once the keymap is in place.
+            let released = self.release_held();
             self.device.upload_keymap(&keymap.text)?;
             self.model = KeyboardModel::new(
                 keymap.modifiers_by_keycode.clone(),
@@ -257,6 +270,7 @@ impl KeyboardState {
             );
             self.keymap = keymap;
             self.stale = None;
+            released?;
         }
         if let Some(error) = &self.stale {
             return Err(error.clone());
@@ -390,8 +404,10 @@ impl KeyboardState {
 
 impl KeyboardState {
     /// Releases every key the model records as held and clears modifier
-    /// and lock state on the compositor.
-    fn release_held(&mut self) {
+    /// and lock state on the compositor. The model forgets the keys as
+    /// their releases are planned, so the error names a flush that did not
+    /// complete: the compositor may still hold what was released.
+    fn release_held(&mut self) -> Result<(), ProtocolError> {
         for keycode in self.model.held_keys() {
             let transitions = self
                 .model
@@ -407,13 +423,15 @@ impl KeyboardState {
         if let Some(transition) = self.model.clear_modifier_state() {
             self.emit(transition);
         }
-        let _ = self.device.settle();
+        self.device.settle()
     }
 }
 
 impl Drop for KeyboardState {
+    /// Best effort only: a caller that needs to know whether the release
+    /// reached the compositor calls `release_held` before dropping.
     fn drop(&mut self) {
-        self.release_held();
+        let _ = self.release_held();
     }
 }
 

@@ -366,21 +366,32 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
     }
 
     fn release_all(&self) -> Option<String> {
-        if let Ok(pointer) = &self.pointer {
-            pointer.release_all();
-        }
-        if let Ok(keyboard) = &*self
+        let pointer = self
+            .pointer
+            .as_ref()
+            .ok()
+            .and_then(|pointer| pointer.release_all());
+        let keyboard = self
             .keyboard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
-            keyboard.release_all();
-        }
-        self.clipboard
             .as_ref()
             .ok()
-            .and_then(|clipboard| clipboard.release_all())
+            .and_then(|keyboard| keyboard.release_all());
+        let clipboard = self
+            .clipboard
+            .as_ref()
+            .ok()
+            .and_then(|clipboard| clipboard.release_all());
+        combined_limitation([pointer, keyboard, clipboard])
     }
+}
+
+/// Every backend releases on its own, so one limitation carries each
+/// backend's report rather than the last one's only.
+fn combined_limitation(limitations: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let limitations: Vec<String> = limitations.into_iter().flatten().collect();
+    (!limitations.is_empty()).then(|| limitations.join("; "))
 }
 
 fn initialisation_failed(backend: &str, error: &ProtocolError) -> String {
@@ -460,6 +471,7 @@ mod tests {
     #[derive(Default)]
     struct TestClipboard {
         restore_failure: Option<ProtocolError>,
+        release_limitation: Option<String>,
     }
 
     impl waldo_action::ActionExecutor for TestClipboard {
@@ -469,6 +481,10 @@ mod tests {
             _: &waldo_controller::ExecutionToken,
         ) -> Result<ActionExecution, ActionExecutionFailure> {
             panic!("clipboard paste must use its transport operations")
+        }
+
+        fn release_all(&self) -> Option<String> {
+            self.release_limitation.clone()
         }
     }
 
@@ -494,6 +510,7 @@ mod tests {
     struct TestKeyboard {
         observed: std::sync::Arc<std::sync::Mutex<Vec<waldo_protocol::Action>>>,
         refusal: Option<ActionExecutionFailure>,
+        release_limitation: Option<String>,
     }
 
     impl waldo_action::ActionExecutor for TestKeyboard {
@@ -507,6 +524,10 @@ mod tests {
                 Some(refusal) => Err(refusal.clone()),
                 None => Ok(ActionRoute::VirtualKeyboard.into()),
             }
+        }
+
+        fn release_all(&self) -> Option<String> {
+            self.release_limitation.clone()
         }
     }
 
@@ -554,6 +575,7 @@ mod tests {
                 Ok(TestKeyboard {
                     observed: observed.clone(),
                     refusal: failure.clone(),
+                    release_limitation: None,
                 }),
                 Ok(TestClipboard::default()),
             )
@@ -584,7 +606,12 @@ mod tests {
     #[test]
     fn a_failed_restoration_keeps_the_paste_failure_it_followed() {
         use waldo_action::ActionExecutor;
-        let settings = waldo_settings::Settings::from_sources(None, [], None).unwrap();
+        let settings = waldo_settings::Settings::from_sources(
+            None,
+            std::iter::empty::<(std::ffi::OsString, std::ffi::OsString)>(),
+            None,
+        )
+        .unwrap();
         let mut controller = waldo_controller::Controller::new(std::time::Duration::from_secs(30));
         let connection = controller.connect();
         let authority = controller
@@ -606,6 +633,7 @@ mod tests {
                     message: "key Insert is absent from active layout".into(),
                     retryable: false,
                 })),
+                release_limitation: None,
             }),
             Ok(TestClipboard {
                 restore_failure: Some(ProtocolError {
@@ -613,6 +641,7 @@ mod tests {
                     message: "selection owner vanished".into(),
                     retryable: true,
                 }),
+                release_limitation: None,
             }),
         )
         .unwrap();
@@ -632,6 +661,52 @@ mod tests {
         assert_eq!(error.code, ErrorCode::UnsupportedCapability);
         assert!(error.message.contains("absent from active layout"));
         assert!(error.message.contains("selection owner vanished"));
+    }
+
+    #[test]
+    fn release_reports_every_backend_that_could_not_release() {
+        use waldo_action::ActionExecutor;
+        let settings = waldo_settings::Settings::from_sources(
+            None,
+            std::iter::empty::<(std::ffi::OsString, std::ffi::OsString)>(),
+            None,
+        )
+        .unwrap();
+        let build = |keyboard: Option<&str>, clipboard: Option<&str>| {
+            super::DesktopActionExecutor::with_backends(
+                None,
+                std::sync::Arc::new(|| panic!("the injected keyboard needs no layout discovery")),
+                &settings,
+                Err(ProtocolError::backend_failure(
+                    "the release test needs no pointer",
+                    false,
+                )),
+                Ok(TestKeyboard {
+                    observed: Default::default(),
+                    refusal: None,
+                    release_limitation: keyboard.map(str::to_owned),
+                }),
+                Ok(TestClipboard {
+                    restore_failure: None,
+                    release_limitation: clipboard.map(str::to_owned),
+                }),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(build(None, None).release_all(), None);
+        assert_eq!(
+            build(Some("keys may still be held"), None).release_all(),
+            Some("keys may still be held".into())
+        );
+        assert_eq!(
+            build(
+                Some("keys may still be held"),
+                Some("clipboard mutation is blocked")
+            )
+            .release_all(),
+            Some("keys may still be held; clipboard mutation is blocked".into())
+        );
     }
 
     #[test]
