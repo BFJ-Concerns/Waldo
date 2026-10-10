@@ -11,6 +11,7 @@ mod final_campaign;
 mod fixture_poll;
 mod outside_in;
 mod private_json;
+mod toolkit_fixtures;
 mod toolkit_preflight;
 
 /// Largest accepted seed. Seeds reach the Electron fixture as JavaScript

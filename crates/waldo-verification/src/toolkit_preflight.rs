@@ -9,6 +9,8 @@ use std::{
 use niri_ipc::{Request, Response, socket::Socket};
 use serde::Serialize;
 use serde_json::json;
+
+use crate::toolkit_fixtures::{FixtureSpec, SPECS};
 use waldo_verification::{
     AdmissionOutcome, CONFORMANCE_SCHEMA_VERSION, DisplayRoute, EvidenceMaturity,
     FixtureDescriptor, FixtureState, FixtureToolkit, MatrixAdmissionRecord, MatrixCellAdmission,
@@ -81,21 +83,6 @@ struct FileIdentity {
     sha256: String,
 }
 
-#[derive(Clone, Copy)]
-struct FixtureSpec {
-    name: &'static str,
-    toolkit: FixtureToolkit,
-    display_route: DisplayRoute,
-    script: &'static str,
-    runner: Runner,
-}
-
-#[derive(Clone, Copy)]
-enum Runner {
-    Python,
-    Electron,
-}
-
 struct ChildGuard(Child);
 
 impl ChildGuard {
@@ -120,48 +107,32 @@ pub fn run(options: Options) -> Result<PreflightSummary, Box<dyn std::error::Err
     let identity = identity_evidence(&options)?;
     evidence.write_json("identity.json", &identity)?;
 
-    let topology = capture_niri_topology().ok();
-    evidence.write_json("topology.json", &topology)?;
-    let keyboard_layouts = capture_keyboard_layouts().ok();
-    evidence.write_json("keyboard-layouts.json", &keyboard_layouts)?;
-
-    let specs = [
-        FixtureSpec {
-            name: "gtk",
-            toolkit: FixtureToolkit::Gtk,
-            display_route: DisplayRoute::NativeWayland,
-            script: "interaction_gtk.py",
-            runner: Runner::Python,
-        },
-        FixtureSpec {
-            name: "qt",
-            toolkit: FixtureToolkit::Qt,
-            display_route: DisplayRoute::NativeWayland,
-            script: "interaction_qt.py",
-            runner: Runner::Python,
-        },
-        FixtureSpec {
-            name: "electron",
-            toolkit: FixtureToolkit::Electron,
-            display_route: DisplayRoute::NativeWayland,
-            script: "interaction_electron.js",
-            runner: Runner::Electron,
-        },
-        FixtureSpec {
-            name: "xwayland",
-            toolkit: FixtureToolkit::Xwayland,
-            display_route: DisplayRoute::Xwayland,
-            script: "interaction_qt.py",
-            runner: Runner::Python,
-        },
-    ];
+    // A failed discovery is retained with its reason, so an unavailable
+    // cell says why rather than looking like a missing environment.
+    let topology = capture_niri_topology().map_err(|error| error.to_string());
+    evidence.write_json("topology.json", &discovery_evidence(&topology))?;
+    let keyboard_layouts = capture_keyboard_layouts();
+    evidence.write_json(
+        "keyboard-layouts.json",
+        &discovery_evidence(&keyboard_layouts),
+    )?;
 
     let mut toolkits = Vec::new();
-    for spec in specs {
+    for spec in SPECS {
         toolkits.push(preflight_fixture(&options, &evidence, &scratch, spec)?);
     }
 
-    let cells = matrix_cells(&toolkits, topology.as_ref(), keyboard_layouts.as_deref());
+    let mut cells = matrix_cells(
+        &toolkits,
+        topology.as_ref().ok(),
+        keyboard_layouts.as_deref().ok(),
+    );
+    explain_failed_discovery(&mut cells, "topology.json", topology.as_ref().err());
+    explain_failed_discovery(
+        &mut cells,
+        "keyboard-layouts.json",
+        keyboard_layouts.as_ref().err(),
+    );
     let matrix_admission = MatrixAdmissionRecord {
         schema_version: CONFORMANCE_SCHEMA_VERSION,
         evidence_maturity: EvidenceMaturity::Final,
@@ -173,7 +144,7 @@ pub fn run(options: Options) -> Result<PreflightSummary, Box<dyn std::error::Err
     };
     matrix_admission.validate()?;
     evidence.write_json("matrix-admission.json", &matrix_admission)?;
-    let scenario_readiness = scenario_readiness(&toolkits, topology.is_some())?;
+    let scenario_readiness = scenario_readiness(&toolkits, topology.is_ok())?;
     evidence.write_json("scenario-readiness.json", &scenario_readiness)?;
 
     let privacy_marker = format!("waldo-private-marker-{:016x}", options.seed);
@@ -212,7 +183,6 @@ fn preflight_fixture(
     scratch: &PrivateRoot,
     spec: FixtureSpec,
 ) -> Result<ToolkitPreflight, Box<dyn std::error::Error>> {
-    let script = options.fixture_directory.join(spec.script);
     let evidence_prefix = format!("toolkits/{}", spec.name);
     let scratch_prefix = format!("toolkits/{}", spec.name);
     scratch.create_directory(&scratch_prefix)?;
@@ -221,15 +191,31 @@ fn preflight_fixture(
     let control_relative = format!("{scratch_prefix}/control.json");
     let control = scratch.write_json(&control_relative, &json!({"sequence": 0}))?;
 
-    let probe = probe_descriptor(options, spec, &script);
+    let probe = probe_descriptor(options, spec);
     evidence.write_json(format!("{evidence_prefix}/probe.json"), &probe)?;
     let (descriptor, probe_error) = match probe {
         Ok(descriptor) => (Some(descriptor), None),
         Err(error) => (None, Some(error)),
     };
-    let descriptor_valid = descriptor
-        .as_ref()
-        .is_some_and(|descriptor| descriptor.validate().is_ok());
+    // The probe must describe a valid fixture, and the one requested: a
+    // descriptor for another toolkit or route is not credited to this one.
+    let descriptor_problem = match &descriptor {
+        Some(descriptor) => match descriptor.validate() {
+            Err(error) => Some(format!("probe descriptor is invalid: {error}")),
+            Ok(())
+                if descriptor.toolkit != spec.toolkit
+                    || descriptor.display_route != spec.display_route =>
+            {
+                Some(format!(
+                    "probe describes {:?} on {:?}, not the requested {:?} on {:?}",
+                    descriptor.toolkit, descriptor.display_route, spec.toolkit, spec.display_route
+                ))
+            }
+            Ok(()) => None,
+        },
+        None => None,
+    };
+    let descriptor_valid = descriptor.is_some() && descriptor_problem.is_none();
     let mut result = ToolkitPreflight {
         toolkit: spec.toolkit,
         display_route: spec.display_route,
@@ -243,7 +229,7 @@ fn preflight_fixture(
         compositor_window_seen: false,
         x11_root_window_seen: (spec.display_route == DisplayRoute::Xwayland).then_some(false),
         cleanup_complete: true,
-        limitation: probe_error,
+        limitation: probe_error.or(descriptor_problem),
         evidence: vec![
             "identity.json".to_owned(),
             format!("{evidence_prefix}/probe.json"),
@@ -271,7 +257,7 @@ fn preflight_fixture(
     }
 
     result.graphical_launch_attempted = true;
-    let mut child = match launch_fixture(options, spec, &script, &state, &events, &control) {
+    let mut child = match launch_fixture(options, spec, &state, &events, &control) {
         Ok(child) => ChildGuard(child),
         Err(error) => {
             result.limitation = Some(format!("fixture launch failed: {error}"));
@@ -295,13 +281,20 @@ fn preflight_fixture(
             } else if fixture_state.ready {
                 result.runtime_backend = Some(fixture_state.runtime_backend.clone());
                 result.final_consumer_ready = true;
-                result.compositor_window_seen =
-                    wait_for_niri_window(&fixture_state.descriptor.title, Duration::from_secs(2));
+                let title = &fixture_state.descriptor.title;
+                match wait_for_window(|| niri_window_seen(title)) {
+                    Ok(seen) => result.compositor_window_seen = seen,
+                    Err(error) => {
+                        result.limitation = Some(format!("Niri window probe failed: {error}"));
+                    }
+                }
                 if spec.display_route == DisplayRoute::Xwayland {
-                    result.x11_root_window_seen = Some(wait_for_x11_window(
-                        &fixture_state.descriptor.title,
-                        Duration::from_secs(2),
-                    ));
+                    match wait_for_window(|| x11_window_seen(title)) {
+                        Ok(seen) => result.x11_root_window_seen = Some(seen),
+                        Err(error) => {
+                            result.limitation = Some(format!("X11 window probe failed: {error}"));
+                        }
+                    }
                 }
                 evidence.write_json(format!("{evidence_prefix}/state.json"), &fixture_state)?;
                 result
@@ -358,17 +351,17 @@ fn preflight_fixture(
     Ok(result)
 }
 
-fn probe_descriptor(
-    options: &Options,
-    spec: FixtureSpec,
-    script: &Path,
-) -> Result<FixtureDescriptor, String> {
-    let mut command = runner_command(options, spec.runner, script);
-    command.args(["--probe-api", "--seed", &options.seed.to_string()]);
-    if spec.display_route == DisplayRoute::Xwayland {
-        command.args(["--display-route", "xwayland"]);
-    }
-    let output = command
+fn probe_descriptor(options: &Options, spec: FixtureSpec) -> Result<FixtureDescriptor, String> {
+    let output = spec
+        .command(
+            &options.fixture_directory,
+            &options.python,
+            &options.electron,
+            options.seed,
+        )
+        .arg("--probe-api")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|error| format!("could not run API probe: {error}"))?;
     if !output.status.success() {
@@ -384,39 +377,20 @@ fn probe_descriptor(
 fn launch_fixture(
     options: &Options,
     spec: FixtureSpec,
-    script: &Path,
     state: &Path,
     events: &Path,
     control: &Path,
 ) -> Result<Child, std::io::Error> {
-    let mut command = runner_command(options, spec.runner, script);
-    command
-        .args(["--state", state.to_string_lossy().as_ref()])
-        .args(["--events", events.to_string_lossy().as_ref()])
-        .args(["--control", control.to_string_lossy().as_ref()])
-        .args(["--seed", &options.seed.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-    if spec.display_route == DisplayRoute::NativeWayland && spec.toolkit == FixtureToolkit::Gtk {
-        command.env("GDK_BACKEND", "wayland");
-    }
-    if spec.display_route == DisplayRoute::Xwayland {
-        command.args(["--display-route", "xwayland"]);
-    }
-    command.spawn()
-}
-
-fn runner_command(options: &Options, runner: Runner, script: &Path) -> Command {
-    let mut command = match runner {
-        Runner::Python => {
-            let mut command = Command::new(&options.python);
-            command.env("PYTHONDONTWRITEBYTECODE", "1");
-            command
-        }
-        Runner::Electron => Command::new(&options.electron),
-    };
-    command.arg(script);
-    command
+    spec.command(
+        &options.fixture_directory,
+        &options.python,
+        &options.electron,
+        options.seed,
+    )
+    .args(["--state", state.to_string_lossy().as_ref()])
+    .args(["--events", events.to_string_lossy().as_ref()])
+    .args(["--control", control.to_string_lossy().as_ref()])
+    .spawn()
 }
 
 fn wait_for_state(path: &Path, timeout: Duration) -> Result<FixtureState, String> {
@@ -428,71 +402,91 @@ fn wait_for_state(path: &Path, timeout: Duration) -> Result<FixtureState, String
     )
 }
 
-fn wait_for_niri_window(title: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
+/// Polls a window probe for two seconds. A probe that finds the window
+/// ends the wait; one that keeps failing reports its last error, so a
+/// broken discovery channel is not mistaken for an absent window.
+fn wait_for_window(probe: impl Fn() -> Result<bool, String>) -> Result<bool, String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last_error = None;
     while Instant::now() < deadline {
-        if niri_window_seen(title) {
-            return true;
+        match probe() {
+            Ok(true) => return Ok(true),
+            Ok(false) => last_error = None,
+            Err(error) => last_error = Some(error),
         }
         thread::sleep(Duration::from_millis(25));
     }
-    false
+    last_error.map_or(Ok(false), Err)
 }
 
-fn niri_window_seen(title: &str) -> bool {
-    let Ok(mut socket) = Socket::connect() else {
-        return false;
+fn niri_window_seen(title: &str) -> Result<bool, String> {
+    let mut socket = Socket::connect().map_err(|error| format!("connect to Niri: {error}"))?;
+    let Response::Windows(windows) = socket
+        .send(Request::Windows)
+        .map_err(|error| format!("ask Niri for windows: {error}"))??
+    else {
+        return Err("Niri returned an unexpected response to Windows".to_owned());
     };
-    let Ok(Ok(Response::Windows(windows))) = socket.send(Request::Windows) else {
-        return false;
-    };
-    windows
+    Ok(windows
         .iter()
         .filter(|window| window.title.as_deref() == Some(title))
         .count()
-        == 1
+        == 1)
 }
 
-fn wait_for_x11_window(title: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if x11_window_seen(title) {
-            return true;
+/// Runs an X11 query tool, failing when it cannot run or reports failure.
+fn x11_query(program: &str, arguments: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("could not run {program}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{program} {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn x11_window_seen(title: &str) -> Result<bool, String> {
+    let root = x11_query("xprop", &["-root", "_NET_CLIENT_LIST"])?;
+    for window in root
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|value| value.starts_with("0x"))
+    {
+        if x11_query("xprop", &["-id", window, "_NET_WM_NAME", "WM_NAME"])?.contains(title) {
+            return Ok(true);
         }
-        thread::sleep(Duration::from_millis(25));
     }
-    false
+    Ok(x11_query("xwininfo", &["-root", "-tree"])?.contains(title))
 }
 
-fn x11_window_seen(title: &str) -> bool {
-    let Ok(root) = Command::new("xprop")
-        .args(["-root", "_NET_CLIENT_LIST"])
-        .output()
-    else {
-        return false;
-    };
-    let root_list_contains_title = root.status.success()
-        && String::from_utf8_lossy(&root.stdout)
-            .split(|character: char| character == ',' || character.is_whitespace())
-            .filter(|value| value.starts_with("0x"))
-            .any(|window| {
-                Command::new("xprop")
-                    .args(["-id", window, "_NET_WM_NAME", "WM_NAME"])
-                    .output()
-                    .is_ok_and(|properties| {
-                        properties.status.success()
-                            && String::from_utf8_lossy(&properties.stdout).contains(title)
-                    })
-            });
-    if root_list_contains_title {
-        return true;
+/// The retained record of a discovery: its value, or why it failed.
+fn discovery_evidence<T: Serialize>(discovery: &Result<T, String>) -> serde_json::Value {
+    match discovery {
+        Ok(value) => json!({"value": value}),
+        Err(error) => json!({"error": error}),
     }
-    Command::new("xwininfo")
-        .args(["-root", "-tree"])
-        .output()
-        .is_ok_and(|tree| {
-            tree.status.success() && String::from_utf8_lossy(&tree.stdout).contains(title)
-        })
+}
+
+/// Gives every unavailable cell resting on a failed discovery that
+/// discovery's error as its reason.
+fn explain_failed_discovery(
+    cells: &mut [MatrixCellAdmission],
+    evidence: &str,
+    error: Option<&String>,
+) {
+    let Some(error) = error else {
+        return;
+    };
+    for cell in cells
+        .iter_mut()
+        .filter(|cell| cell.outcome == AdmissionOutcome::Unavailable && cell.evidence == [evidence])
+    {
+        cell.reason = Some(format!("{evidence} discovery failed: {error}"));
+    }
 }
 
 fn matrix_cells(
@@ -503,13 +497,7 @@ fn matrix_cells(
     let mut cells = toolkits
         .iter()
         .map(|toolkit| {
-            let available = toolkit.descriptor_valid
-                && toolkit.final_consumer_ready
-                && toolkit.event_log_valid
-                && toolkit.compositor_window_seen
-                && toolkit.cleanup_complete
-                && (toolkit.display_route != DisplayRoute::Xwayland
-                    || toolkit.runtime_backend.as_deref() == Some("xcb"));
+            let available = toolkit.admitted();
             MatrixCellAdmission {
                 dimension: "toolkit".to_owned(),
                 value: format!("{:?}", toolkit.toolkit).to_lowercase(),
@@ -648,15 +636,7 @@ fn scenario_readiness(
 ) -> Result<ScenarioReadinessRecord, Box<dyn std::error::Error>> {
     let available = toolkits
         .iter()
-        .filter(|toolkit| {
-            toolkit.descriptor_valid
-                && toolkit.final_consumer_ready
-                && toolkit.event_log_valid
-                && toolkit.compositor_window_seen
-                && toolkit.cleanup_complete
-                && (toolkit.display_route != DisplayRoute::Xwayland
-                    || toolkit.runtime_backend.as_deref() == Some("xcb"))
-        })
+        .filter(|toolkit| toolkit.admitted())
         .map(|toolkit| toolkit.toolkit)
         .collect::<std::collections::BTreeSet<_>>();
     let any_fixture = !available.is_empty();

@@ -23,10 +23,9 @@ def arguments():
 
 OPTIONS = arguments()
 TOOLKIT = "xwayland" if OPTIONS.display_route == "xwayland" else "qt"
-os.environ.setdefault(
-    "QT_QPA_PLATFORM",
-    "xcb" if OPTIONS.display_route == "xwayland" else "wayland",
-)
+# The requested route decides the platform; an inherited QT_QPA_PLATFORM
+# must not run the native cell through XWayland or the reverse.
+os.environ["QT_QPA_PLATFORM"] = "xcb" if OPTIONS.display_route == "xwayland" else "wayland"
 
 from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPalette, QWheelEvent  # noqa: E402

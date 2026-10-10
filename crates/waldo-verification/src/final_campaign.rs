@@ -11,8 +11,8 @@ use niri_ipc::{Action as NiriAction, Request, Response, socket::Socket};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use waldo_verification::{
-    AdmissionOutcome, CONFORMANCE_SCHEMA_VERSION, CampaignCell, CampaignOutcome, DisplayRoute,
-    EvidenceMaturity, FinalCampaignRecord, FixtureState, FixtureToolkit, PrivacyScan, PrivateRoot,
+    AdmissionOutcome, CONFORMANCE_SCHEMA_VERSION, CampaignCell, CampaignOutcome, EvidenceMaturity,
+    FinalCampaignRecord, FixtureState, FixtureToolkit, PrivacyScan, PrivateRoot,
     complete_fixture_events, scan_private_root,
 };
 
@@ -23,6 +23,7 @@ use crate::{
         observe_window_without_accessibility, parse_observation, write_json,
         write_redacted_response,
     },
+    toolkit_fixtures::{FixtureSpec, SPECS},
     toolkit_preflight,
 };
 
@@ -126,21 +127,6 @@ struct CorpusDocument {
 }
 
 #[derive(Clone, Copy)]
-struct FixtureSpec {
-    name: &'static str,
-    toolkit: FixtureToolkit,
-    display_route: DisplayRoute,
-    script: &'static str,
-    runner: Runner,
-}
-
-#[derive(Clone, Copy)]
-enum Runner {
-    Python,
-    Electron,
-}
-
-#[derive(Clone, Copy)]
 struct LogicalTargets {
     boundary_a: (f64, f64),
     boundary_b: (f64, f64),
@@ -161,37 +147,6 @@ struct FixtureSegmentEvidence {
     workspace_focused: bool,
     fixture_process_removed: bool,
 }
-
-const SPECS: [FixtureSpec; 4] = [
-    FixtureSpec {
-        name: "gtk",
-        toolkit: FixtureToolkit::Gtk,
-        display_route: DisplayRoute::NativeWayland,
-        script: "interaction_gtk.py",
-        runner: Runner::Python,
-    },
-    FixtureSpec {
-        name: "qt",
-        toolkit: FixtureToolkit::Qt,
-        display_route: DisplayRoute::NativeWayland,
-        script: "interaction_qt.py",
-        runner: Runner::Python,
-    },
-    FixtureSpec {
-        name: "electron",
-        toolkit: FixtureToolkit::Electron,
-        display_route: DisplayRoute::NativeWayland,
-        script: "interaction_electron.js",
-        runner: Runner::Electron,
-    },
-    FixtureSpec {
-        name: "xwayland",
-        toolkit: FixtureToolkit::Xwayland,
-        display_route: DisplayRoute::Xwayland,
-        script: "interaction_qt.py",
-        runner: Runner::Python,
-    },
-];
 
 pub fn run(options: Options) -> Result<FinalCampaignSummary, Box<dyn std::error::Error>> {
     let evidence = PrivateRoot::create_retained(&options.evidence_directory)?;
@@ -235,13 +190,7 @@ pub fn run(options: Options) -> Result<FinalCampaignSummary, Box<dyn std::error:
             .toolkits
             .iter()
             .find(|toolkit| toolkit.toolkit == spec.toolkit)
-            .is_some_and(|toolkit| {
-                toolkit.descriptor_valid
-                    && toolkit.final_consumer_ready
-                    && toolkit.event_log_valid
-                    && toolkit.compositor_window_seen
-                    && toolkit.cleanup_complete
-            });
+            .is_some_and(|toolkit| toolkit.admitted());
         if !admitted {
             cells.push(CampaignCell {
                 id: format!("toolkit-{}-journey", spec.name),
@@ -878,30 +827,18 @@ fn launch_fixture(
     seed: u64,
     paths: &FixturePaths,
 ) -> Result<ChildGuard, Box<dyn std::error::Error>> {
-    let script = options.fixture_directory.join(spec.script);
-    let mut command = match spec.runner {
-        Runner::Python => {
-            let mut command = Command::new(&options.python);
-            command.env("PYTHONDONTWRITEBYTECODE", "1");
-            command
-        }
-        Runner::Electron => Command::new(&options.electron),
-    };
-    command
-        .arg(script)
+    let child = spec
+        .command(
+            &options.fixture_directory,
+            &options.python,
+            &options.electron,
+            seed,
+        )
         .args(["--state", path_text(&paths.state)?])
         .args(["--events", path_text(&paths.events)?])
         .args(["--control", path_text(&paths.control)?])
-        .args(["--seed", &seed.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-    if spec.toolkit == FixtureToolkit::Gtk {
-        command.env("GDK_BACKEND", "wayland");
-    }
-    if spec.display_route == DisplayRoute::Xwayland {
-        command.args(["--display-route", "xwayland"]);
-    }
-    Ok(ChildGuard(command.spawn()?))
+        .spawn()?;
+    Ok(ChildGuard(child))
 }
 
 fn wait_for_fixture_state(
