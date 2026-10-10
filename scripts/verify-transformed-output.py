@@ -30,10 +30,17 @@ def verify(root, binaries, processes):
 
     runtime = root / "runtime"
     runtime.mkdir(mode=0o700)
-    env = dict(os.environ)
-    for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET", "NIRI_SOCKET", "WALDO_SOCKET_PATH"):
+    config_home = root / "config"
+    config_home.mkdir(mode=0o700)
+    # The nested session must not reach the operator's desktop or read the
+    # operator's Waldo settings: every Waldo override is dropped, the
+    # configuration home is private and empty, and the socket is named.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("WALDO_")}
+    for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET", "NIRI_SOCKET"):
         env.pop(key, None)
-    env.update(XDG_RUNTIME_DIR=str(runtime), WINIT_UNIX_BACKEND="x11", GDK_BACKEND="wayland")
+    socket = runtime / "waldo/controller.sock"
+    env.update(XDG_RUNTIME_DIR=str(runtime), XDG_CONFIG_HOME=str(config_home),
+               WALDO_SOCKET_PATH=str(socket), WINIT_UNIX_BACKEND="x11", GDK_BACKEND="wayland")
 
     def launch(name, command, **kwargs):
         with (root / f"{name}.log").open("w") as log:
@@ -59,7 +66,7 @@ def verify(root, binaries, processes):
         raise RuntimeError("this regression requires the nested backend's Flipped180 output")
     output_name = output["name"]
     launch("waldod", [str(binaries / "waldod")])
-    wait_for(lambda: (runtime / "waldo/controller.sock").is_socket(), "Waldo controller")
+    wait_for(lambda: socket.is_socket(), "Waldo controller")
     fixture = Path(__file__).resolve().parents[1] / "crates/waldo-verification/fixtures/wx_button.py"
     events = root / "events.jsonl"
     launch("fixture", ["python3", str(fixture), "--events", str(events)])
