@@ -8,9 +8,7 @@ use std::{
 use niri_ipc::{Action as NiriAction, Reply, Request, Response, SizeChange, WorkspaceReferenceArg};
 use waldo_action::{ActionExecution, ActionExecutionFailure, ActionExecutor};
 use waldo_controller::ExecutionToken;
-use waldo_protocol::{
-    Action, ActionRoute, ErrorCode, ProtocolError, WindowOperation, WorkspaceOperation,
-};
+use waldo_protocol::{Action, ActionRoute, ProtocolError, WindowOperation, WorkspaceOperation};
 
 /// Executes the Waldo actions Niri can target positively: window actions by
 /// window ID and workspace actions by workspace ID.
@@ -37,11 +35,7 @@ fn execute_with(
     mut send: impl FnMut(Request, &ExecutionToken) -> Result<Reply, ActionExecutionFailure>,
 ) -> Result<ActionExecution, ActionExecutionFailure> {
     if cancellation.is_cancelled() {
-        return Err(ActionExecutionFailure::not_executed(ProtocolError {
-            code: ErrorCode::Cancelled,
-            message: "the action batch was cancelled before Niri dispatch".into(),
-            retryable: false,
-        }));
+        return Err(ActionExecutionFailure::not_executed(cancelled()));
     }
     let requests = translate(action).map_err(ActionExecutionFailure::not_executed)?;
     for (index, request) in requests.into_iter().enumerate() {
@@ -65,22 +59,24 @@ fn execute_with(
             Ok(_) => {
                 return Err(ActionExecutionFailure::indeterminate(
                     ActionRoute::NiriIpc,
-                    backend_failure(
+                    ProtocolError::backend_failure(
                         "Niri returned an unexpected response after action dispatch",
                         false,
                     ),
                 ));
             }
             Err(message) if index == 0 => {
-                return Err(ActionExecutionFailure::not_executed(backend_failure(
-                    format!("Niri rejected the action: {message}"),
-                    false,
-                )));
+                return Err(ActionExecutionFailure::not_executed(
+                    ProtocolError::backend_failure(
+                        format!("Niri rejected the action: {message}"),
+                        false,
+                    ),
+                ));
             }
             Err(message) => {
                 return Err(ActionExecutionFailure::indeterminate(
                     ActionRoute::NiriIpc,
-                    backend_failure(
+                    ProtocolError::backend_failure(
                         format!(
                             "Niri rejected a later resize step after changing the window: {message}"
                         ),
@@ -115,7 +111,7 @@ fn send_to_niri(
     cancellation: &ExecutionToken,
 ) -> Result<Reply, ActionExecutionFailure> {
     let path = env::var_os(niri_ipc::socket::SOCKET_PATH_ENV).ok_or_else(|| {
-        ActionExecutionFailure::not_executed(backend_failure(
+        ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
             format!(
                 "{} is not set; Niri IPC is unavailable",
                 niri_ipc::socket::SOCKET_PATH_ENV
@@ -135,7 +131,7 @@ fn send_to_niri(
             ))
         })?;
     let mut message = serde_json::to_vec(&request).map_err(|error| {
-        ActionExecutionFailure::not_executed(backend_failure(
+        ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
             format!("could not encode Niri action: {error}"),
             false,
         ))
@@ -169,7 +165,7 @@ fn read_dispatched_reply(
         if Instant::now() >= deadline {
             return Err(ActionExecutionFailure::indeterminate(
                 ActionRoute::NiriIpc,
-                backend_failure(
+                ProtocolError::backend_failure(
                     "Niri did not acknowledge the dispatched action before the reply deadline",
                     true,
                 ),
@@ -179,7 +175,7 @@ fn read_dispatched_reply(
             Ok(0) => {
                 return Err(ActionExecutionFailure::indeterminate(
                     ActionRoute::NiriIpc,
-                    backend_failure(
+                    ProtocolError::backend_failure(
                         "Niri IPC closed after dispatch without returning an action response",
                         true,
                     ),
@@ -190,7 +186,7 @@ fn read_dispatched_reply(
                 if reply.len() > MAX_REPLY_BYTES {
                     return Err(ActionExecutionFailure::indeterminate(
                         ActionRoute::NiriIpc,
-                        backend_failure(
+                        ProtocolError::backend_failure(
                             "Niri IPC returned an oversized action response after dispatch",
                             false,
                         ),
@@ -200,7 +196,7 @@ fn read_dispatched_reply(
                     return serde_json::from_slice(&reply[..end]).map_err(|error| {
                         ActionExecutionFailure::indeterminate(
                             ActionRoute::NiriIpc,
-                            backend_failure(
+                            ProtocolError::backend_failure(
                                 format!("Niri returned an invalid action response: {error}"),
                                 false,
                             ),
@@ -229,10 +225,10 @@ fn translate(action: &Action) -> Result<Vec<Request>, ProtocolError> {
             window_id,
             operation,
         } => {
-            let id = window_id.0.parse::<u64>().map_err(|_| ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                message: "window IDs supplied to Niri must be unsigned integers".into(),
-                retryable: false,
+            let id = window_id.0.parse::<u64>().map_err(|_| {
+                ProtocolError::invalid_request(
+                    "window IDs supplied to Niri must be unsigned integers",
+                )
             })?;
             match operation {
                 WindowOperation::Focus => vec![NiriAction::FocusWindow { id }],
@@ -280,44 +276,28 @@ fn translate(action: &Action) -> Result<Vec<Request>, ProtocolError> {
                 }]
             }
         },
-        _ => return Err(unsupported("this action has no Niri IPC route")),
+        _ => {
+            return Err(ProtocolError::unsupported_capability(
+                "this action has no Niri IPC route",
+            ));
+        }
     };
     Ok(actions.into_iter().map(Request::Action).collect())
 }
 
 fn fixed_size(value: u32) -> Result<i32, ProtocolError> {
     if value == 0 {
-        return Err(ProtocolError {
-            code: ErrorCode::InvalidRequest,
-            message: "window dimensions must be greater than zero".into(),
-            retryable: false,
-        });
+        return Err(ProtocolError::invalid_request(
+            "window dimensions must be greater than zero",
+        ));
     }
-    i32::try_from(value).map_err(|_| ProtocolError {
-        code: ErrorCode::InvalidRequest,
-        message: "window dimension exceeds Niri's supported range".into(),
-        retryable: false,
+    i32::try_from(value).map_err(|_| {
+        ProtocolError::invalid_request("window dimension exceeds Niri's supported range")
     })
 }
 
-fn unsupported(message: &str) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::UnsupportedCapability,
-        message: message.into(),
-        retryable: false,
-    }
-}
-
-fn backend_failure(message: impl Into<String>, retryable: bool) -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::BackendFailure,
-        message: message.into(),
-        retryable,
-    }
-}
-
 fn transport_failure(operation: &str, error: io::Error) -> ProtocolError {
-    backend_failure(
+    ProtocolError::backend_failure(
         format!("Niri IPC failed while trying to {operation}: {error}"),
         true,
     )
@@ -328,11 +308,7 @@ fn indeterminate_transport_failure(operation: &str, error: io::Error) -> ActionE
 }
 
 fn cancelled() -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::Cancelled,
-        message: "the action batch was cancelled before Niri dispatch".into(),
-        retryable: false,
-    }
+    ProtocolError::cancelled("the action batch was cancelled before Niri dispatch")
 }
 
 #[cfg(test)]

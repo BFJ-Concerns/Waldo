@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Action, Capabilities, ClientId, CompatibilityProfile, ConnectionId, DrivingSessionId,
-    ErrorCode, Observation, ObservationId, OutputState, Predicate, ProtocolError, RequestId,
-    SourceSelector, WindowState, WorkspaceState,
+    Observation, ObservationId, OutputState, Predicate, ProtocolError, RequestId, SourceSelector,
+    WindowState, WorkspaceState,
 };
 
 /// Parameters for a fresh or continued visual observation.
@@ -299,19 +299,6 @@ impl ServerMessage {
             | Self::Stopped { request_id, .. }
             | Self::HandedOver { request_id, .. } => Some(*request_id),
             Self::Error { request_id, .. } => *request_id,
-        }
-    }
-}
-
-impl ProtocolError {
-    /// Constructs the error returned when a client uses another major schema.
-    pub fn incompatible_schema(expected: u16, received: u16) -> Self {
-        Self {
-            code: ErrorCode::IncompatibleSchema,
-            message: format!(
-                "incompatible schema major version: controller uses {expected}, client sent {received}"
-            ),
-            retryable: false,
         }
     }
 }
