@@ -8,9 +8,10 @@ skill's JSON examples to the schema.
 - **The control loop.** Query, then Observe, then one coherent Act batch that
   cites the observation it was planned from, then inspect every receipt and
   the returned image, then ground the next batch on fresh evidence — the
-  settled observation Act returned when it shows the needed source, otherwise
-  a new Observe — then Stop when the
+  fresh post-action observation Act returned from bounded sampling when it
+  shows the needed source, otherwise a new Observe — then Stop when the
   desktop work is finished, abandoned or handed back to the user.
+  `completion_evidence` says whether the application settled.
 - **Exact action shapes.** Agents invent variants and fields: a `focus_window`
   action, a generic `pointer` action with a nested operation, `target`,
   `handle` or `condition` fields. The skill carries literal JSON examples of

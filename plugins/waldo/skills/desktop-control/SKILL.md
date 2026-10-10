@@ -155,9 +155,10 @@ already authorised — so the approval can be obtained before that step runs.
    failed or unverifiable action and does not roll back earlier ones. Where a
    trustworthy non-visual check exists — a file, process state, an
    accessibility value — read it alongside the screenshot.
-5. Ground the next batch in fresh evidence. The Act result's own settled
-   observation is fresh grounding when it is present and shows the source the
-   next batch needs; otherwise Observe again. Grounding goes stale: changed
+5. Ground the next batch in fresh evidence. The Act result's own fresh
+   post-action observation comes from bounded sampling and is grounding when
+   it is present and shows the source the next batch needs; otherwise Observe
+   again. `completion_evidence` says whether the application settled. Grounding goes stale: changed
    output layout, geometry or relevant focus, or a wait, invalidates
    coordinates planned before it, as does a Waldo report of stale geometry,
    focus or target state. Plan the next batch from the fresh observation

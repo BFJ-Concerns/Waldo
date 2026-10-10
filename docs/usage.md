@@ -37,7 +37,8 @@ the authority on every action and predicate variant.
 command's options. Each prints the controller's JSON response and exits with
 status 1 when that response is an error, a batch that did not complete, or a
 composed result with a failed part; a batch cut short by `--stop-after-ms`
-counts as succeeding. `waldod` serves
+counts as succeeding only when it carries no `completion_error`; with one,
+the CLI exits 1. `waldod` serves
 `$XDG_RUNTIME_DIR/waldo/controller.sock` unless the `WALDO_SOCKET_PATH`
 setting names another socket, and both `waldod` and `waldo` accept
 `--socket PATH`.
