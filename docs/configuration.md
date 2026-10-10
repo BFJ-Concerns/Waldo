@@ -6,7 +6,10 @@ needs a source edit.
 ## Runtime settings
 
 Waldo's binaries read their settings from
-`${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`, one `NAME=VALUE` per line:
+`${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`, one `NAME=VALUE` per line.
+As the XDG base directory specification requires, a relative or empty
+`XDG_CONFIG_HOME` is ignored, and when neither it nor `HOME` is an absolute
+path no settings file is read:
 
 ```sh
 # Paste with Ctrl+Shift+V, as terminals expect
@@ -22,7 +25,7 @@ launched. Restart `waldod` after changing a value it reads.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `WALDO_SOCKET_PATH` | `$XDG_RUNTIME_DIR/waldo/controller.sock` | The private controller socket `waldod` serves and both clients connect to. |
+| `WALDO_SOCKET_PATH` | `$XDG_RUNTIME_DIR/waldo/controller.sock` | The private controller socket `waldod` serves and both clients connect to. An absolute path; a relative one is refused, and a relative `XDG_RUNTIME_DIR` counts as unset. |
 | `WALDO_LEASE_IDLE_TIMEOUT_SECONDS` | `30` | Seconds after the driver's last action before a driving lease lapses and held input is released. Query and Observe do not count as activity, and a lease is never lapsed while a batch is running. Whole seconds, at least 1; the timeout cannot be disabled. |
 | `WALDO_CLIPBOARD_PASTE_CHORD` | `ctrl+v` | Clipboard-paste key names separated by `+`; whitespace around each name is trimmed and empty names are refused at start-up. Key names use the virtual keyboard vocabulary and are checked against the active layout at paste time; an unavailable key fails without a default-chord fallback. |
 | `WALDO_MODEL_IMAGE_MAX_EDGE` | `2048` | Maximum longest edge in pixels for MCP images. A positive whole number; smaller images are delivered unscaled. Restart the MCP process after changing it. |

@@ -7,7 +7,10 @@
 //! `docs/configuration.md`, which a test in this crate enforces. Tuning internals (poll intervals, quiet periods,
 //! deadlines, resource caps) are not settings and do not belong here.
 //!
-//! The settings file is `${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`:
+//! The settings file is `${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`,
+//! where a relative or empty base directory is ignored, as the XDG base
+//! directory specification requires, and no file is read when neither base
+//! is usable:
 //! one `NAME=VALUE` per line, `#` comments, no quoting or expansion. It
 //! exists so the operator sets a value once for every Waldo binary, however
 //! each is launched — the controller under systemd, the MCP server under the
@@ -39,8 +42,9 @@ pub const SOCKET_PATH: SettingSpec = SettingSpec {
     default: None,
 };
 
-/// Seconds without a request or running batch after which a driving lease
-/// lapses. It has a default and cannot be disabled.
+/// Seconds after the driver's last action — Query and Observe do not count —
+/// after which a driving lease lapses; never while a batch is running. It has
+/// a default and cannot be disabled.
 pub const LEASE_IDLE_TIMEOUT_SECONDS: SettingSpec = SettingSpec {
     name: "WALDO_LEASE_IDLE_TIMEOUT_SECONDS",
     default: Some("30"),
@@ -135,8 +139,9 @@ impl fmt::Display for SettingsError {
                 formatter,
                 "{name}={value:?} (from {source}) is invalid: {reason}"
             ),
-            Self::RuntimeDirectoryMissing => formatter
-                .write_str("XDG_RUNTIME_DIR is not set and WALDO_SOCKET_PATH names no socket"),
+            Self::RuntimeDirectoryMissing => formatter.write_str(
+                "XDG_RUNTIME_DIR is not an absolute path and WALDO_SOCKET_PATH names no socket",
+            ),
         }
     }
 }
@@ -162,18 +167,19 @@ pub struct Settings {
 impl Settings {
     /// Reads the settings file (when present) and the process environment.
     pub fn load() -> Result<Self, SettingsError> {
-        let path = settings_file_path();
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => Some(contents),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(SettingsError::UnreadableFile { path, error }),
+        let file = match settings_file_path() {
+            Some(path) => match fs::read_to_string(&path) {
+                Ok(contents) => Some((path, contents)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(SettingsError::UnreadableFile { path, error }),
+            },
+            None => None,
         };
         Self::from_sources(
-            contents
-                .as_deref()
-                .map(|contents| (path.as_path(), contents)),
+            file.as_ref()
+                .map(|(path, contents)| (path.as_path(), contents.as_str())),
             env::vars_os(),
-            env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+            absolute_directory(env::var_os("XDG_RUNTIME_DIR")),
         )
     }
 
@@ -247,13 +253,25 @@ impl Settings {
     }
 
     /// The controller socket: `WALDO_SOCKET_PATH`, or
-    /// `$XDG_RUNTIME_DIR/waldo/controller.sock`.
+    /// `$XDG_RUNTIME_DIR/waldo/controller.sock`. An explicit path must be
+    /// absolute, so every binary resolves it to the same socket whatever its
+    /// working directory; a relative runtime directory counts as unset.
     pub fn socket_path(&self) -> Result<PathBuf, SettingsError> {
-        if let Some((value, _)) = self.raw(SOCKET_PATH) {
-            return Ok(PathBuf::from(value));
+        if let Some((value, source)) = self.raw(SOCKET_PATH) {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(SettingsError::InvalidValue {
+                    name: SOCKET_PATH.name,
+                    source: source.clone(),
+                    value: value.to_string_lossy().into_owned(),
+                    reason: "expected an absolute path".into(),
+                });
+            }
+            return Ok(path);
         }
         self.runtime_directory
             .as_ref()
+            .filter(|runtime| runtime.is_absolute())
             .map(|runtime| runtime.join("waldo/controller.sock"))
             .ok_or(SettingsError::RuntimeDirectoryMissing)
     }
@@ -338,14 +356,26 @@ impl Settings {
     }
 }
 
-/// `${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`.
-pub fn settings_file_path() -> PathBuf {
-    let config_home = env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"));
-    config_home.join("waldo/settings")
+/// `${XDG_CONFIG_HOME:-$HOME/.config}/waldo/settings`, or `None` when
+/// neither base is an absolute path, so the file is never looked for
+/// relative to the working directory.
+pub fn settings_file_path() -> Option<PathBuf> {
+    settings_file_path_from(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME"))
+}
+
+fn settings_file_path_from(
+    config_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    absolute_directory(config_home)
+        .or_else(|| absolute_directory(home).map(|home| home.join(".config")))
+        .map(|config_home| config_home.join("waldo/settings"))
+}
+
+/// An environment directory, ignored unless absolute, as the XDG base
+/// directory specification requires of its variables.
+fn absolute_directory(value: Option<OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|path| path.is_absolute())
 }
 
 fn declared(name: &str) -> Option<SettingSpec> {
@@ -597,6 +627,57 @@ mod tests {
         assert!(
             matches!(timeout, SettingsError::InvalidValue { ref reason, .. } if reason == "expected UTF-8 text")
         );
+    }
+
+    #[test]
+    fn socket_paths_resolve_the_same_from_any_working_directory() {
+        for relative in ["", "relative.sock"] {
+            let settings = Settings::from_sources(
+                None,
+                [(
+                    OsString::from("WALDO_SOCKET_PATH"),
+                    OsString::from(relative),
+                )],
+                Some("/run/user/1000".into()),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    settings.socket_path(),
+                    Err(SettingsError::InvalidValue { .. })
+                ),
+                "{relative:?}"
+            );
+        }
+        for runtime in ["", "run"] {
+            let settings = Settings::from_sources(None, Vec::new(), Some(runtime.into())).unwrap();
+            assert!(
+                matches!(
+                    settings.socket_path(),
+                    Err(SettingsError::RuntimeDirectoryMissing)
+                ),
+                "{runtime:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_settings_file_is_never_looked_for_in_the_working_directory() {
+        let path = |config: Option<&str>, home: Option<&str>| {
+            super::settings_file_path_from(config.map(OsString::from), home.map(OsString::from))
+        };
+
+        assert_eq!(
+            path(Some("/cfg"), Some("/home/a")),
+            Some("/cfg/waldo/settings".into())
+        );
+        assert_eq!(
+            path(Some("relative"), Some("/home/a")),
+            Some("/home/a/.config/waldo/settings".into())
+        );
+        assert_eq!(path(Some(""), Some("")), None);
+        assert_eq!(path(None, Some("home")), None);
+        assert_eq!(path(None, None), None);
     }
 
     #[test]

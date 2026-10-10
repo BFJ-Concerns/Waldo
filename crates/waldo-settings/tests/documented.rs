@@ -66,11 +66,15 @@ fn runtime_sources() -> Vec<std::path::PathBuf> {
     files
 }
 
+/// Every directory the walk is promised is read, so a missing or unreadable
+/// one fails the test instead of quietly shrinking what it checks.
+fn read_dir(directory: &Path) -> fs::ReadDir {
+    fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()))
+}
+
 fn collect_rust_files(directory: &Path, files: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries {
+    for entry in read_dir(directory) {
         let path = entry.expect("source entry").path();
         if path.is_dir() {
             collect_rust_files(&path, files);
@@ -81,10 +85,7 @@ fn collect_rust_files(directory: &Path, files: &mut Vec<std::path::PathBuf>) {
 }
 
 fn collect_files(directory: &Path, files: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries {
+    for entry in read_dir(directory) {
         let path = entry.expect("plugin entry").path();
         if path.is_dir() {
             collect_files(&path, files);
@@ -113,9 +114,8 @@ fn every_waldo_name_the_runtime_or_installer_reads_is_documented() {
     let documented = names_in(&configuration_reference());
     let mut undocumented = BTreeSet::new();
     for file in runtime_sources() {
-        let Ok(text) = fs::read_to_string(&file) else {
-            continue;
-        };
+        let text = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", file.display()));
         for name in names_in(&text) {
             if !documented.contains(&name) {
                 undocumented.insert(format!(
