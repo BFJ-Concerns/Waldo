@@ -441,9 +441,10 @@ impl ClipboardExecutor {
         }
     }
 
-    /// Attempts restoration at every driving-session cleanup boundary.
-    pub fn cleanup_preservation(&self) {
-        self.cleanup_with(Self::restore_snapshot);
+    /// Attempts restoration at every driving-session cleanup boundary, and
+    /// returns the restoration failure the clipboard is still blocked on.
+    pub fn cleanup_preservation(&self) -> Result<(), ProtocolError> {
+        self.cleanup_with(Self::restore_snapshot)
     }
 
     fn cleanup_with(
@@ -451,10 +452,11 @@ impl ClipboardExecutor {
         restore: impl FnOnce(
             &ClipboardSnapshot,
         ) -> Result<Option<stable_offer::Publication>, ProtocolError>,
-    ) {
-        let Ok(mut state) = self.preservation.lock() else {
-            return;
-        };
+    ) -> Result<(), ProtocolError> {
+        let mut state = self
+            .preservation
+            .lock()
+            .map_err(|_| internal("clipboard preservation state lock is poisoned"))?;
         Self::promote_publication_failure(&mut state);
         let snapshot = state
             .guard
@@ -462,7 +464,7 @@ impl ClipboardExecutor {
             .map(|guard| &guard.snapshot)
             .or(state.fallback_restore.as_ref());
         let Some(snapshot) = snapshot.cloned() else {
-            return;
+            return Ok(());
         };
         match restore(&snapshot) {
             Ok(publication) => {
@@ -471,8 +473,12 @@ impl ClipboardExecutor {
                 state.published_restore = publication.as_ref().map(|_| snapshot);
                 state.publication = publication;
                 state.failure = None;
+                Ok(())
             }
-            Err(error) => state.failure = Some(error),
+            Err(error) => {
+                state.failure = Some(error.clone());
+                Err(error)
+            }
         }
     }
 
@@ -480,12 +486,7 @@ impl ClipboardExecutor {
     pub fn limitation(&self) -> Option<String> {
         let mut state = self.preservation.lock().ok()?;
         Self::promote_publication_failure(&mut state);
-        state.failure.as_ref().map(|error| {
-            format!(
-                "clipboard mutation is blocked until exact restoration succeeds: {}",
-                error.message
-            )
-        })
+        state.failure.as_ref().map(restoration_limitation)
     }
 
     fn ensure_mutation_allowed(&self) -> Result<(), ProtocolError> {
@@ -577,8 +578,10 @@ impl ActionExecutor for ClipboardExecutor {
             .flatten()
     }
 
-    fn release_all(&self) {
-        self.cleanup_preservation();
+    fn release_all(&self) -> Option<String> {
+        self.cleanup_preservation()
+            .err()
+            .map(|error| restoration_limitation(&error))
     }
 }
 
@@ -662,6 +665,14 @@ fn internal(message: impl Into<String>) -> ProtocolError {
         message: message.into(),
         retryable: true,
     }
+}
+
+/// Payload-free marker for a restoration failure the clipboard is blocked on.
+fn restoration_limitation(error: &ProtocolError) -> String {
+    format!(
+        "clipboard mutation is blocked until exact restoration succeeds: {}",
+        error.message
+    )
 }
 
 fn blocked_by_restore(error: &ProtocolError) -> ProtocolError {
@@ -853,12 +864,15 @@ mod tests {
     #[test]
     fn cleanup_failure_retains_the_guard_blocks_mutation_and_surfaces_a_limitation() {
         let executor = guarded_executor(ConnectionId::new(1), DrivingSessionId::new(1));
-        executor.cleanup_with(|_| {
-            Err(backend_failure(
-                "deliberate restoration acknowledgement loss",
-                true,
-            ))
-        });
+        let failure = executor
+            .cleanup_with(|_| {
+                Err(backend_failure(
+                    "deliberate restoration acknowledgement loss",
+                    true,
+                ))
+            })
+            .unwrap_err();
+        assert!(failure.message.contains("acknowledgement loss"));
 
         assert!(executor.ensure_mutation_allowed().is_err());
         let limitation = executor.limitation().unwrap();
@@ -866,7 +880,7 @@ mod tests {
         assert!(!limitation.contains("payload"));
         assert!(executor.preservation.lock().unwrap().guard.is_some());
 
-        executor.cleanup_with(|_| Ok(None));
+        executor.cleanup_with(|_| Ok(None)).unwrap();
         assert!(executor.ensure_mutation_allowed().is_ok());
         assert!(executor.limitation().is_none());
         assert!(executor.preservation.lock().unwrap().guard.is_none());
@@ -914,10 +928,12 @@ mod tests {
             snapshot.sources
         };
 
-        executor.cleanup_with(|snapshot| {
-            assert_eq!(snapshot.sources, expected);
-            Ok(None)
-        });
+        executor
+            .cleanup_with(|snapshot| {
+                assert_eq!(snapshot.sources, expected);
+                Ok(None)
+            })
+            .unwrap();
 
         let state = executor.preservation.lock().unwrap();
         assert!(state.failure.is_none());
@@ -995,7 +1011,9 @@ mod tests {
         };
 
         executor.execute(&keep, authority.cancellation()).unwrap();
-        executor.cleanup_with(|_| panic!("a kept clipboard must not be restored at cleanup"));
+        executor
+            .cleanup_with(|_| panic!("a kept clipboard must not be restored at cleanup"))
+            .unwrap();
 
         assert!(matches!(
             executor.execute(&keep, authority.cancellation()),

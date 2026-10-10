@@ -124,7 +124,7 @@ impl ServiceState {
         let Some(owner) = owner else {
             return;
         };
-        self.executor.release_all();
+        report_unfinished_cleanup("expired driving lease", self.executor.release_all());
         let _ = self.controller.lock().await.stop(owner);
     }
 }
@@ -299,9 +299,17 @@ impl ControllerService {
         }
         self.state.shutdown.send_replace(true);
         while connections.join_next().await.is_some() {}
-        self.state.executor.release_all();
+        report_unfinished_cleanup("controller shutdown", self.state.executor.release_all());
         self.state.controller.lock().await.terminate();
         result
+    }
+}
+
+/// Cleanup with no client left to answer goes to the service log, so a
+/// clipboard the operator must restore by hand is never lost silently.
+fn report_unfinished_cleanup(boundary: &str, limitation: Option<String>) {
+    if let Some(limitation) = limitation {
+        eprintln!("Waldo controller cleanup after {boundary} left state unrestored: {limitation}");
     }
 }
 
@@ -603,7 +611,7 @@ async fn quiesce_connection(
     // An unexpected request-task panic must not leave the exclusion marker set.
     state.finish_execution(connection_id).await;
     if owned_driving_session {
-        state.executor.release_all();
+        report_unfinished_cleanup("disconnected driver", state.executor.release_all());
         let _ = state.controller.lock().await.disconnect(connection_id);
     }
 }

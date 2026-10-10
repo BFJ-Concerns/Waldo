@@ -450,8 +450,9 @@ impl ActionExecutor for ReleaseTrackingExecutor {
         Ok(ActionRoute::Screencopy.into())
     }
 
-    fn release_all(&self) {
+    fn release_all(&self) -> Option<String> {
         self.releases.fetch_add(1, Ordering::SeqCst);
+        None
     }
 }
 
@@ -465,8 +466,9 @@ impl ActionExecutor for SideEffectTrackingExecutor {
         Ok(ActionRoute::NiriIpc.into())
     }
 
-    fn release_all(&self) {
+    fn release_all(&self) -> Option<String> {
         self.releases.fetch_add(1, Ordering::SeqCst);
+        None
     }
 }
 
@@ -2058,6 +2060,92 @@ async fn service_queries_enforce_the_configured_idle_lease_expiry() {
     assert!(
         releases.load(Ordering::SeqCst) >= 1,
         "idle lease expiry must release backend-held input"
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// An executor whose cleanup leaves the operator's clipboard unrestored.
+struct UnrestoredCleanupExecutor;
+
+impl ActionExecutor for UnrestoredCleanupExecutor {
+    fn execute(
+        &self,
+        _action: &Action,
+        _cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        Ok(ActionRoute::NiriIpc.into())
+    }
+
+    fn release_all(&self) -> Option<String> {
+        Some("clipboard restoration failed".into())
+    }
+}
+
+#[tokio::test]
+async fn stop_reports_cleanup_that_left_state_unrestored() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(UnrestoredCleanupExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = ControllerClient::connect(&path, ClientId::new("cleanup-test").unwrap())
+        .await
+        .unwrap();
+    let observed = client
+        .request(&ClientMessage::Observe {
+            request_id: RequestId::new(2),
+            request: ObserveRequest {
+                source: SourceSelector::Output {
+                    output_id: OutputId("DP-1".into()),
+                },
+                continue_from: None,
+                include_accessibility: false,
+            },
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Observed { observation, .. } = observed else {
+        panic!("test observation failed")
+    };
+    let acted = client
+        .request(&ClientMessage::Act {
+            request_id: RequestId::new(3),
+            request: waldo_protocol::ActRequest {
+                observation_id: observation.id,
+                actions: Vec::new(),
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(acted, ServerMessage::Acted { .. }));
+
+    let stopped = client
+        .request(&ClientMessage::Stop {
+            request_id: RequestId::new(4),
+            request: StopRequest::default(),
+        })
+        .await
+        .unwrap();
+    let ServerMessage::Stopped { result, .. } = stopped else {
+        panic!("Stop did not answer")
+    };
+    assert!(result.released_session.is_some());
+    assert_eq!(
+        result.cleanup_limitation.as_deref(),
+        Some("clipboard restoration failed")
     );
 
     drop(client);

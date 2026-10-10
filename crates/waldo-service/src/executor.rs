@@ -19,7 +19,6 @@ pub(crate) trait PasteClipboard: ActionExecutor {
     fn offer_text_once(&self, text: &str) -> Result<(), ActionExecutionFailure>;
     fn is_empty(&self) -> Result<bool, ProtocolError>;
     fn restore_temporary(&self, snapshot: Self::Snapshot) -> Result<(), ProtocolError>;
-    fn cleanup_preservation(&self);
     fn clipboard_limitation(&self) -> Option<String>;
 }
 
@@ -39,9 +38,6 @@ impl PasteClipboard for ClipboardExecutor {
     }
     fn restore_temporary(&self, snapshot: Self::Snapshot) -> Result<(), ProtocolError> {
         self.restore_temporary(snapshot)
-    }
-    fn cleanup_preservation(&self) {
-        self.cleanup_preservation();
     }
 }
 
@@ -362,7 +358,7 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
         }
     }
 
-    fn release_all(&self) {
+    fn release_all(&self) -> Option<String> {
         if let Ok(pointer) = &self.pointer {
             pointer.release_all();
         }
@@ -373,9 +369,10 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
         {
             keyboard.release_all();
         }
-        if let Ok(clipboard) = &self.clipboard {
-            clipboard.cleanup_preservation();
-        }
+        self.clipboard
+            .as_ref()
+            .ok()
+            .and_then(|clipboard| clipboard.release_all())
     }
 }
 
@@ -462,7 +459,6 @@ mod tests {
         fn restore_temporary(&self, _: ()) -> Result<(), ProtocolError> {
             Ok(())
         }
-        fn cleanup_preservation(&self) {}
         fn clipboard_limitation(&self) -> Option<String> {
             None
         }

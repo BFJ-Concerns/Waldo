@@ -108,6 +108,7 @@ fn additive_result_fields_are_ignored_by_older_readers() {
             request_id: RequestId::new(8),
             result: StopResult {
                 released_session: None,
+                cleanup_limitation: None,
             },
         }
     );

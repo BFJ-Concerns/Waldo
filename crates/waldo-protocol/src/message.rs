@@ -231,17 +231,25 @@ pub struct QueryResult {
 }
 
 /// Result of stopping the caller's driving session.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct StopResult {
     pub released_session: Option<DrivingSessionId>,
+    /// Payload-free reason session cleanup left desktop state unrestored,
+    /// such as the operator's clipboard; absent when cleanup completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_limitation: Option<String>,
 }
 
 /// Result of an explicit lease handover.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct HandoverResult {
     pub previous_session: DrivingSessionId,
     pub driving_session: DrivingSessionId,
     pub owner: ConnectionId,
+    /// Payload-free reason the previous session's cleanup left desktop
+    /// state unrestored; absent when cleanup completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_limitation: Option<String>,
 }
 
 /// Messages returned by the private controller socket.

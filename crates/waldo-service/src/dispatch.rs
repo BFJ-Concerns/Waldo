@@ -85,7 +85,7 @@ pub(crate) async fn dispatch(
                 controller.driving_session().map(|session| session.id())
             };
             state.wait_for_execution(connection_id).await;
-            state.executor.release_all();
+            let cleanup_limitation = state.executor.release_all();
             let mut controller = state.controller.lock().await;
             match controller.handover(connection_id, request.target, state.elapsed()) {
                 Ok(session) => ServerMessage::HandedOver {
@@ -94,6 +94,7 @@ pub(crate) async fn dispatch(
                         previous_session: previous.expect("handover requires an active lease"),
                         driving_session: session.id(),
                         owner: session.owner(),
+                        cleanup_limitation,
                     },
                 },
                 Err(error) => lease_error(request_id, error),
@@ -136,7 +137,7 @@ async fn stop(
     match cleanup_started {
         Ok(()) | Err(LeaseError::NoActiveLease) => {
             state.wait_for_execution(connection_id).await;
-            state.executor.release_all();
+            let cleanup_limitation = state.executor.release_all();
             let stopped = state.controller.lock().await.stop(connection_id);
             if let Err(error) = stopped
                 && error != LeaseError::NoActiveLease
@@ -147,6 +148,7 @@ async fn stop(
                 request_id,
                 result: StopResult {
                     released_session: released,
+                    cleanup_limitation,
                 },
             }
         }

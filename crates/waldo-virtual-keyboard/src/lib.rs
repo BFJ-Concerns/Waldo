@@ -144,10 +144,14 @@ impl ActionExecutor for VirtualKeyboardExecutor {
         route == ActionRoute::VirtualKeyboard
     }
 
-    fn release_all(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.take();
-        }
+    fn release_all(&self) -> Option<String> {
+        // A poisoned lock still holds the device, and dropping it is the
+        // release, so recover the guard rather than leave keys held.
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        None
     }
 }
 

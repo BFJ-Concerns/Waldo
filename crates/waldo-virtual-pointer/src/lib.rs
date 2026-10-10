@@ -88,12 +88,15 @@ impl ActionExecutor for VirtualPointerExecutor {
         route == ActionRoute::VirtualPointer
     }
 
-    fn release_all(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            // Destroying the virtual device is the compositor-owned release-all
-            // boundary, including after an interrupted explicit press.
-            state.take();
-        }
+    fn release_all(&self) -> Option<String> {
+        // Destroying the virtual device is the compositor-owned release-all
+        // boundary, including after an interrupted explicit press; a poisoned
+        // lock still holds the device, so recover the guard to drop it.
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        None
     }
 }
 

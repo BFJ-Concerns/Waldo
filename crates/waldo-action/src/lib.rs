@@ -41,8 +41,13 @@ pub trait ActionExecutor: Send + Sync {
         None
     }
 
-    /// Releases any explicitly held input and tears down its virtual devices.
-    fn release_all(&self) {}
+    /// Releases any explicitly held input, tears down its virtual devices and
+    /// restores preserved desktop state. Returns a payload-free reason when
+    /// cleanup left state unrestored, so the boundary that asked for it can
+    /// report the failure.
+    fn release_all(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A backend failure with an honest statement about whether mutation may have occurred.
