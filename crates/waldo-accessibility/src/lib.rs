@@ -173,64 +173,50 @@ impl AccessibilityBackend {
             .is_some_and(|bounds| points_near(bounds.origin, visible_bounds.origin, 8.0));
         let application = application_id.unwrap_or_else(|| "accessible application".into());
         let window_root = root.clone();
-        let mut queue = VecDeque::from([(root, Some(root_node), true)]);
         let mut nodes = Vec::new();
         let mut focused = None;
-        let mut complete = true;
-        while let Some((key, prefetched, is_root)) = queue.pop_front() {
-            if nodes.len() >= MAX_NODES {
-                complete = false;
-                break;
-            }
-            let raw = match prefetched {
-                Some(raw) => raw,
-                // An element that vanished mid-walk is simply no longer
-                // there; any other failure leaves the tree incomplete.
-                None => match read_node(&connection, &key).or_gone()? {
-                    Some(raw) => raw,
-                    None => continue,
-                },
-            };
-            queue.extend(
-                raw.children
-                    .iter()
-                    .cloned()
-                    .map(|child| (child, None, false)),
-            );
-            let handle =
-                state
-                    .registry
-                    .handle_for(key, window_root.clone(), raw.accessible_id.clone());
-            let children = raw
-                .children
-                .into_iter()
-                .map(|child| state.registry.handle_for(child, window_root.clone(), None))
-                .collect();
-            if raw.focused {
-                focused = Some(handle.clone());
-            }
-            let bounds = if is_root {
-                Some(visible_bounds)
-            } else if screen_coordinates {
-                raw.bounds
-                    .filter(|bounds| rectangles_intersect(*bounds, visible_bounds))
-            } else {
-                None
-            };
-            nodes.push(AccessibilityNode {
-                handle,
-                application: application.clone(),
-                window_id: Some(window_id.clone()),
-                role: raw.role,
-                name: raw.name,
-                value: raw.value,
-                text: raw.text,
-                states: raw.states,
-                bounds,
-                actions: raw.actions,
-                children,
-            });
-        }
+        let complete = bounded_walk(
+            root,
+            root_node,
+            MAX_NODES,
+            |key| read_node(&connection, key).or_gone(),
+            |raw| &raw.children,
+            |key, raw, is_root| {
+                let handle =
+                    state
+                        .registry
+                        .handle_for(key, window_root.clone(), raw.accessible_id.clone());
+                let children = raw
+                    .children
+                    .into_iter()
+                    .map(|child| state.registry.handle_for(child, window_root.clone(), None))
+                    .collect();
+                if raw.focused {
+                    focused = Some(handle.clone());
+                }
+                let bounds = if is_root {
+                    Some(visible_bounds)
+                } else if screen_coordinates {
+                    raw.bounds
+                        .filter(|bounds| rectangles_intersect(*bounds, visible_bounds))
+                } else {
+                    None
+                };
+                nodes.push(AccessibilityNode {
+                    handle,
+                    application: application.clone(),
+                    window_id: Some(window_id.clone()),
+                    role: raw.role,
+                    name: raw.name,
+                    value: raw.value,
+                    text: raw.text,
+                    states: raw.states,
+                    bounds,
+                    actions: raw.actions,
+                    children,
+                });
+            },
+        )?;
 
         state.focused = focused.clone();
         Ok(AccessibilitySnapshot {
@@ -1057,6 +1043,44 @@ fn object_matches_observed_identity(
     Ok(actual.as_ref() == Some(expected))
 }
 
+/// Visits a tree breadth-first from its prefetched root, reading each later
+/// node with `read`, and stops once `limit` nodes have been visited.
+/// Returns whether every reachable node was visited. A node `read` reports
+/// gone is skipped: an element that vanished mid-walk is simply no longer
+/// there. Any other read failure ends the walk as an error.
+fn bounded_walk<K: Clone, N>(
+    root: K,
+    root_node: N,
+    limit: usize,
+    mut read: impl FnMut(&K) -> Result<Option<N>, ProtocolError>,
+    children: impl Fn(&N) -> &[K],
+    mut visit: impl FnMut(K, N, bool),
+) -> Result<bool, ProtocolError> {
+    let mut queue = VecDeque::from([(root, Some(root_node), true)]);
+    let mut visited = 0;
+    while let Some((key, prefetched, is_root)) = queue.pop_front() {
+        if visited >= limit {
+            return Ok(false);
+        }
+        let node = match prefetched {
+            Some(node) => node,
+            None => match read(&key)? {
+                Some(node) => node,
+                None => continue,
+            },
+        };
+        queue.extend(
+            children(&node)
+                .iter()
+                .cloned()
+                .map(|child| (child, None, false)),
+        );
+        visit(key, node, is_root);
+        visited += 1;
+    }
+    Ok(true)
+}
+
 /// The one element below `window_root` carrying `accessible_id`, or `None`
 /// when there is none or more than one. Any branch that could not be read
 /// is an error, since it could hold a second match.
@@ -1374,6 +1398,27 @@ mod tests {
             Err(other) => panic!("focus already moved, so the failure is indeterminate: {other:?}"),
             Ok(_) => panic!("a poisoned cache must be reported"),
         }
+    }
+
+    #[test]
+    fn a_walk_cut_at_the_node_budget_reports_the_tree_incomplete() {
+        // A root whose children are leaves: `leaves + 1` nodes in all.
+        let walk = |leaves: usize| {
+            let mut visited = Vec::new();
+            let complete = super::bounded_walk(
+                0_usize,
+                (1..=leaves).collect::<Vec<_>>(),
+                super::MAX_NODES,
+                |_| Ok(Some(Vec::new())),
+                |children: &Vec<usize>| children.as_slice(),
+                |key, _, _| visited.push(key),
+            )
+            .unwrap();
+            (complete, visited.len())
+        };
+
+        assert_eq!(walk(super::MAX_NODES), (false, super::MAX_NODES));
+        assert_eq!(walk(super::MAX_NODES - 1), (true, super::MAX_NODES));
     }
 
     #[test]
