@@ -1248,7 +1248,6 @@ name = "waldo-accessibility"
 version = "0.1.0"
 dependencies = [
  "atspi-common",
- "serde_json",
  "waldo-action",
  "waldo-controller",
  "waldo-protocol",

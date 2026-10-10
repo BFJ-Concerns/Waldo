@@ -39,10 +39,16 @@ pub struct AccessibilityBackend {
 
 struct BackendState {
     connection: Connection,
+    registry: HandleRegistry,
+    focused: Option<ElementHandle>,
+}
+
+/// The opaque handles issued for AT-SPI objects, each meaning the object
+/// and identity it was issued for.
+struct HandleRegistry {
     next_handle: u64,
     handles: BTreeMap<ElementHandle, ObservedElement>,
     reverse_handles: BTreeMap<ObjectKey, ElementHandle>,
-    focused: Option<ElementHandle>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -89,9 +95,7 @@ impl AccessibilityBackend {
         Ok(Self {
             state: Mutex::new(BackendState {
                 connection,
-                next_handle: 1,
-                handles: BTreeMap::new(),
-                reverse_handles: BTreeMap::new(),
+                registry: HandleRegistry::new(),
                 focused: None,
             }),
         })
@@ -112,6 +116,9 @@ impl AccessibilityBackend {
                 false,
             )
         })?;
+        // Text entry relies on the focus this snapshot finds; until it
+        // finishes, no earlier window's element stands in for it.
+        state.focused = None;
         let connection = state.connection.clone();
         let mut application_roots = Vec::new();
         for reference in registry_children(&connection)? {
@@ -131,11 +138,11 @@ impl AccessibilityBackend {
 
         let mut top_levels = Vec::new();
         for application_root in application_roots {
-            let Ok(application) = read_node(&connection, &application_root) else {
+            let Some(application) = read_node(&connection, &application_root).or_gone()? else {
                 continue;
             };
             for child in application.children {
-                if let Ok(raw) = read_node(&connection, &child) {
+                if let Some(raw) = read_node(&connection, &child).or_gone()? {
                     top_levels.push((child, raw));
                 }
             }
@@ -162,9 +169,14 @@ impl AccessibilityBackend {
             if nodes.len() >= MAX_NODES {
                 break;
             }
-            let raw = match prefetched.map_or_else(|| read_node(&connection, &key), Ok) {
-                Ok(raw) => raw,
-                Err(_) => continue,
+            let raw = match prefetched {
+                Some(raw) => raw,
+                // An element that vanished mid-walk is simply no longer
+                // there; any other failure leaves the tree incomplete.
+                None => match read_node(&connection, &key).or_gone()? {
+                    Some(raw) => raw,
+                    None => continue,
+                },
             };
             queue.extend(
                 raw.children
@@ -172,11 +184,14 @@ impl AccessibilityBackend {
                     .cloned()
                     .map(|child| (child, None, false)),
             );
-            let handle = state.handle_for(key, window_root.clone(), raw.accessible_id.clone());
+            let handle =
+                state
+                    .registry
+                    .handle_for(key, window_root.clone(), raw.accessible_id.clone());
             let children = raw
                 .children
                 .into_iter()
-                .map(|child| state.handle_for(child, window_root.clone(), None))
+                .map(|child| state.registry.handle_for(child, window_root.clone(), None))
                 .collect();
             if raw.focused {
                 focused = Some(handle.clone());
@@ -208,52 +223,56 @@ impl AccessibilityBackend {
         Ok(AccessibilitySnapshot { nodes, focused })
     }
 
-    /// Checks whether a previously issued opaque handle still resolves.
+    /// Checks whether a previously issued opaque handle still resolves to
+    /// the element it was issued for.
     pub fn element_exists(&self, element: &ElementHandle) -> Result<bool, ProtocolError> {
-        let Some((connection, key)) = self.resolved_element(element)? else {
-            return Ok(false);
-        };
-        let accessible = proxy(&connection, &key, ACCESSIBLE)?;
-        Ok(accessible.call::<_, _, String>("GetRoleName", &()).is_ok())
+        Ok(self.resolved_element(element)?.is_some())
     }
 
-    /// Checks a fresh AT-SPI state bit on a previously issued element.
+    /// Checks a fresh AT-SPI state bit on a previously issued element;
+    /// `None` when the element no longer resolves.
     pub fn element_state(
         &self,
         element: &ElementHandle,
         expected: &str,
     ) -> Result<Option<bool>, ProtocolError> {
+        require_known_state(expected)?;
         let Some((connection, key)) = self.resolved_element(element)? else {
             return Ok(None);
         };
         let accessible = proxy(&connection, &key, ACCESSIBLE)?;
-        let states: StateSet = match accessible.call("GetState", &()) {
-            Ok(states) => states,
-            Err(_) => return Ok(None),
+        let Some(states) = read_states(&accessible).or_gone()? else {
+            return Ok(None);
         };
-        Ok(Some(states.into_iter().any(|state| {
-            serde_json::to_value(state)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-                .as_deref()
-                == Some(expected)
-        })))
+        Ok(Some(
+            states
+                .into_iter()
+                .any(|state| state.to_static_str() == expected),
+        ))
     }
 
+    /// The element a handle was issued for, when its object still exists
+    /// and still carries the identity it was observed with.
     fn resolved_element(
         &self,
         element: &ElementHandle,
     ) -> Result<Option<(Connection, ObjectKey)>, ProtocolError> {
-        let state = self.state.lock().map_err(|_| {
-            backend_failure(
-                "accessibility handle registry is poisoned".to_owned(),
-                false,
-            )
-        })?;
-        Ok(state
-            .handles
-            .get(element)
-            .map(|observed| (state.connection.clone(), observed.key.clone())))
+        let (connection, observed) = {
+            let state = self.state.lock().map_err(|_| {
+                backend_failure(
+                    "accessibility handle registry is poisoned".to_owned(),
+                    false,
+                )
+            })?;
+            let Some(observed) = state.registry.handles.get(element).cloned() else {
+                return Ok(None);
+            };
+            (state.connection.clone(), observed)
+        };
+        Ok(
+            object_matches_observed_identity(&connection, &observed.key, &observed.accessible_id)?
+                .then_some((connection, observed.key)),
+        )
     }
 
     /// Sets text on the focused element from the latest semantic observation.
@@ -287,12 +306,54 @@ impl AccessibilityBackend {
                     retryable: true,
                 })
             })?;
+        self.require_still_focused(&element)
+            .map_err(ActionExecutionFailure::not_executed)?;
         self.execute_accessibility(
             &element,
             &AccessibilityOperation::SetText {
                 text: text.to_owned(),
             },
         )
+    }
+
+    /// Refuses text entry into the cached focused element unless it still
+    /// has focus and its window is still the active one: a batch may have
+    /// moved focus since the snapshot that found it.
+    fn require_still_focused(&self, element: &ElementHandle) -> Result<(), ProtocolError> {
+        let (connection, observed) = {
+            let state = self.state.lock().map_err(|_| {
+                backend_failure(
+                    "accessibility handle registry is poisoned".to_owned(),
+                    false,
+                )
+            })?;
+            let observed = state
+                .registry
+                .handles
+                .get(element)
+                .cloned()
+                .ok_or_else(|| stale_target("the focused accessibility element was retired"))?;
+            (state.connection.clone(), observed)
+        };
+        let still_focused =
+            object_matches_observed_identity(&connection, &observed.key, &observed.accessible_id)?
+                && read_states(&proxy(&connection, &observed.key, ACCESSIBLE)?)
+                    .or_gone()?
+                    .is_some_and(|states| states.contains(atspi_common::State::Focused));
+        if !still_focused {
+            return Err(stale_target(
+                "the observed focused element no longer has focus; observe again",
+            ));
+        }
+        let window_active = read_states(&proxy(&connection, &observed.window_root, ACCESSIBLE)?)
+            .or_gone()?
+            .is_some_and(|states| states.contains(atspi_common::State::Active));
+        if !window_active {
+            return Err(stale_target(
+                "the observed focused element's window is no longer active; observe again",
+            ));
+        }
+        Ok(())
     }
 
     fn execute_accessibility(
@@ -306,9 +367,16 @@ impl AccessibilityBackend {
                 false,
             ))
         })?;
-        let observed = state.handles.get(element).cloned().ok_or_else(|| {
-            ActionExecutionFailure::not_executed(stale_target("accessibility handle is unknown"))
-        })?;
+        let observed = state
+            .registry
+            .handles
+            .get(element)
+            .cloned()
+            .ok_or_else(|| {
+                ActionExecutionFailure::not_executed(stale_target(
+                    "accessibility handle is unknown",
+                ))
+            })?;
         let connection = state.connection.clone();
         drop(state);
         let key = self.resolve_action_element(
@@ -426,6 +494,10 @@ impl AccessibilityBackend {
                         },
                     ));
                 }
+                // Later text entry types into the element focus moved to.
+                if let Ok(mut state) = self.state.lock() {
+                    state.focused = Some(element.clone());
+                }
             }
             AccessibilityOperation::Select => {
                 let parent: ObjectRefOwned = accessible
@@ -512,7 +584,9 @@ impl AccessibilityBackend {
             .connection
             .clone();
         let Some(accessible_id) = observed.accessible_id.as_deref() else {
-            if object_matches_observed_identity(&connection, &observed.key, &None) {
+            if object_matches_observed_identity(&connection, &observed.key, &None)
+                .map_err(ActionExecutionFailure::not_executed)?
+            {
                 return Ok(observed.key);
             }
             return Err(ActionExecutionFailure::not_executed(stale_target(
@@ -521,6 +595,7 @@ impl AccessibilityBackend {
         };
         if !allow_identity_refresh {
             if object_matches_observed_identity(&connection, &observed.key, &observed.accessible_id)
+                .map_err(ActionExecutionFailure::not_executed)?
             {
                 return Ok(observed.key);
             }
@@ -543,7 +618,7 @@ impl AccessibilityBackend {
             ))
         })?;
         let previous_key = {
-            let Some(current) = state.handles.get_mut(element) else {
+            let Some(current) = state.registry.handles.get_mut(element) else {
                 return Err(ActionExecutionFailure::not_executed(stale_target(
                     "accessibility handle was retired during refresh",
                 )));
@@ -557,28 +632,50 @@ impl AccessibilityBackend {
             current.key = refreshed.clone();
             previous_key
         };
-        state.reverse_handles.remove(&previous_key);
+        state.registry.reverse_handles.remove(&previous_key);
         state
+            .registry
             .reverse_handles
             .insert(refreshed.clone(), element.clone());
         Ok(refreshed)
     }
 }
 
-impl BackendState {
+impl HandleRegistry {
+    fn new() -> Self {
+        Self {
+            next_handle: 1,
+            handles: BTreeMap::new(),
+            reverse_handles: BTreeMap::new(),
+        }
+    }
+
     fn handle_for(
         &mut self,
         key: ObjectKey,
         window_root: ObjectKey,
         accessible_id: Option<String>,
     ) -> ElementHandle {
-        if let Some(handle) = self.reverse_handles.get(&key) {
-            if let Some(accessible_id) = accessible_id
-                && let Some(observed) = self.handles.get_mut(handle)
-            {
-                observed.accessible_id = Some(accessible_id);
+        if let Some(handle) = self.reverse_handles.get(&key).cloned() {
+            let observed = self
+                .handles
+                .get_mut(&handle)
+                .expect("every reverse handle names an issued handle");
+            let same_identity = match (&observed.accessible_id, &accessible_id) {
+                (Some(previous), Some(current)) => previous == current,
+                _ => true,
+            };
+            if same_identity && observed.window_root == window_root {
+                if accessible_id.is_some() {
+                    observed.accessible_id = accessible_id;
+                }
+                return handle;
             }
-            return handle.clone();
+            // The object path now names a different control. The old handle
+            // keeps meaning the old control, so it is retired rather than
+            // silently redirected.
+            self.handles.remove(&handle);
+            self.reverse_handles.remove(&key);
         }
         let handle = ElementHandle(format!("element-{}", self.next_handle));
         self.next_handle = self
@@ -667,7 +764,22 @@ fn select_window_root(
 
     match candidates.len() {
         0 => Ok(None),
-        1 => Ok(candidates.pop()),
+        // The process's only accessible window is taken unless both what is
+        // known of it contradicts the observed window: a title that differs
+        // from the supplied one and a size that differs from the frame. It
+        // may be another window of the process than the one observed.
+        1 => {
+            let (_, node) = &candidates[0];
+            let title_differs = window_title
+                .zip(node.name.as_deref())
+                .is_some_and(|(wanted, actual)| wanted != actual);
+            let size_differs = node
+                .bounds
+                .is_some_and(|bounds| !sizes_near(bounds, visible_bounds, 8.0));
+            Ok((!(title_differs && size_differs))
+                .then(|| candidates.pop())
+                .flatten())
+        }
         _ => Err(ambiguous_target(
             "multiple AT-SPI windows remain for the focused process".into(),
         )),
@@ -707,82 +819,193 @@ fn peer_pid(connection: &Connection, name: &str) -> Result<u32, ProtocolError> {
     .map_err(|error| backend_failure(format!("resolve AT-SPI peer process: {error}"), true))
 }
 
-fn read_node(connection: &Connection, key: &ObjectKey) -> Result<RawNode, ProtocolError> {
+/// Why reading an AT-SPI object failed.
+enum ReadError {
+    /// The object or its application no longer exists.
+    Gone,
+    /// The bus or the application failed; what was read is incomplete.
+    Failed(ProtocolError),
+}
+
+trait OrGone<T> {
+    /// A read whose object has gone yields nothing; any other failure
+    /// stays an error.
+    fn or_gone(self) -> Result<Option<T>, ProtocolError>;
+}
+
+impl<T> OrGone<T> for Result<T, ReadError> {
+    fn or_gone(self) -> Result<Option<T>, ProtocolError> {
+        match self {
+            Ok(value) => Ok(Some(value)),
+            Err(ReadError::Gone) => Ok(None),
+            Err(ReadError::Failed(error)) => Err(error),
+        }
+    }
+}
+
+/// The D-Bus error name a failed call carries, when it carries one.
+fn dbus_error_name(error: &zbus::Error) -> Option<String> {
+    match error {
+        zbus::Error::MethodError(name, _, _) => Some(name.as_str().to_owned()),
+        zbus::Error::FDO(error) => Some(zbus::DBusError::name(error.as_ref()).as_str().to_owned()),
+        _ => None,
+    }
+}
+
+fn object_gone(error: &zbus::Error) -> bool {
+    matches!(
+        dbus_error_name(error).as_deref(),
+        Some(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+                | "org.freedesktop.DBus.Error.UnknownObject"
+                | "org.freedesktop.DBus.Error.NameHasNoOwner"
+        )
+    )
+}
+
+/// The object exists but does not offer the method or property asked for.
+fn not_offered(error: &zbus::Error) -> bool {
+    is_not_supported(error)
+        || matches!(
+            dbus_error_name(error).as_deref(),
+            Some(
+                "org.freedesktop.DBus.Error.UnknownMethod"
+                    | "org.freedesktop.DBus.Error.UnknownInterface"
+                    | "org.freedesktop.DBus.Error.UnknownProperty"
+                    | "org.freedesktop.DBus.Error.InvalidArgs"
+            )
+        )
+}
+
+/// A value the object must provide.
+fn required<T>(result: Result<T, zbus::Error>, operation: &str) -> Result<T, ReadError> {
+    result.map_err(|error| {
+        if object_gone(&error) {
+            ReadError::Gone
+        } else {
+            ReadError::Failed(backend_failure(format!("{operation}: {error}"), true))
+        }
+    })
+}
+
+/// A value the object may not offer: absent then, rather than an error.
+fn optional<T>(result: Result<T, zbus::Error>, operation: &str) -> Result<Option<T>, ReadError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if not_offered(&error) => Ok(None),
+        Err(error) => required(Err(error), operation),
+    }
+}
+
+impl From<ProtocolError> for ReadError {
+    fn from(error: ProtocolError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+fn read_states(accessible: &Proxy<'_>) -> Result<StateSet, ReadError> {
+    required(
+        accessible.call("GetState", &()),
+        "read accessibility states",
+    )
+}
+
+/// Refuses a state name AT-SPI does not define, so a misspelt name cannot
+/// make a negative state predicate pass.
+pub fn require_known_state(name: &str) -> Result<(), ProtocolError> {
+    let known = (0..u64::BITS)
+        .filter_map(|bit| StateSet::from_bits(1_u64 << bit).ok())
+        .flat_map(StateSet::iter)
+        .any(|state| state.to_static_str() == name);
+    if known {
+        Ok(())
+    } else {
+        Err(ProtocolError {
+            code: ErrorCode::InvalidRequest,
+            message: format!("{name:?} is not an AT-SPI state name"),
+            retryable: false,
+        })
+    }
+}
+
+fn read_node(connection: &Connection, key: &ObjectKey) -> Result<RawNode, ReadError> {
     let accessible = proxy(connection, key, ACCESSIBLE)?;
-    let interfaces: InterfaceSet = accessible.call("GetInterfaces", &()).map_err(|error| {
-        backend_failure(format!("read accessibility interfaces: {error}"), true)
-    })?;
-    let states: StateSet = accessible
-        .call("GetState", &())
-        .map_err(|error| backend_failure(format!("read accessibility states: {error}"), true))?;
+    let interfaces: InterfaceSet = required(
+        accessible.call("GetInterfaces", &()),
+        "read accessibility interfaces",
+    )?;
+    let states = read_states(&accessible)?;
     let focused = states.contains(atspi_common::State::Focused);
     let states = states
         .into_iter()
-        .filter_map(|state| {
-            serde_json::to_value(state)
-                .ok()?
-                .as_str()
-                .map(str::to_owned)
-        })
+        .map(|state| state.to_static_str().to_owned())
         .collect();
-    let children: Vec<ObjectRefOwned> = accessible.call("GetChildren", &()).unwrap_or_default();
+    let children: Vec<ObjectRefOwned> = optional(
+        accessible.call("GetChildren", &()),
+        "read accessibility children",
+    )?
+    .unwrap_or_default();
     let children = children.iter().filter_map(object_key).collect();
-    let role = accessible
-        .call("GetRoleName", &())
-        .unwrap_or_else(|_| "unknown".into());
-    let name = non_empty(accessible.get_property("Name").unwrap_or_default());
-    let accessible_id = non_empty(accessible.get_property("AccessibleId").unwrap_or_default());
-    let bounds = interfaces
-        .contains(Interface::Component)
-        .then(|| {
-            proxy(connection, key, COMPONENT)
-                .ok()?
-                .call::<_, _, (i32, i32, i32, i32)>("GetExtents", &CoordType::Screen)
-                .ok()
+    let role = optional(
+        accessible.call("GetRoleName", &()),
+        "read accessibility role",
+    )?
+    .unwrap_or_else(|| "unknown".into());
+    let name =
+        optional(accessible.get_property("Name"), "read accessibility name")?.and_then(non_empty);
+    let accessible_id = optional(
+        accessible.get_property("AccessibleId"),
+        "read accessibility identity",
+    )?
+    .and_then(non_empty);
+    let bounds = if interfaces.contains(Interface::Component) {
+        optional(
+            proxy(connection, key, COMPONENT)?
+                .call::<_, _, (i32, i32, i32, i32)>("GetExtents", &CoordType::Screen),
+            "read accessibility bounds",
+        )?
+    } else {
+        None
+    }
+    .and_then(|(x, y, width, height)| {
+        (width > 0 && height > 0).then_some(LogicalRect {
+            origin: LogicalPoint {
+                x: f64::from(x),
+                y: f64::from(y),
+            },
+            width: f64::from(width),
+            height: f64::from(height),
         })
-        .flatten()
-        .and_then(|(x, y, width, height)| {
-            (width > 0 && height > 0).then_some(LogicalRect {
-                origin: LogicalPoint {
-                    x: f64::from(x),
-                    y: f64::from(y),
-                },
-                width: f64::from(width),
-                height: f64::from(height),
-            })
-        });
-    let text = interfaces
-        .contains(Interface::Text)
-        .then(|| {
-            proxy(connection, key, TEXT)
-                .ok()?
-                .call::<_, _, String>("GetText", &(0_i32, -1_i32))
-                .ok()
-        })
-        .flatten()
-        .and_then(non_empty)
-        .map(|text| text.chars().take(MAX_TEXT_CHARACTERS).collect());
-    let value = interfaces
-        .contains(Interface::Value)
-        .then(|| {
-            proxy(connection, key, VALUE)
-                .ok()?
-                .get_property::<f64>("CurrentValue")
-                .map(|value| value.to_string())
-                .ok()
-        })
-        .flatten();
-    let actions = interfaces
-        .contains(Interface::Action)
-        .then(|| {
-            proxy(connection, key, ACTION)
-                .ok()?
-                .call::<_, _, Vec<AtspiAction>>("GetActions", &())
-                .map(|actions| actions.into_iter().map(|action| action.name).collect())
-                .ok()
-        })
-        .flatten()
-        .unwrap_or_default();
+    });
+    let text = if interfaces.contains(Interface::Text) {
+        optional(
+            proxy(connection, key, TEXT)?.call::<_, _, String>("GetText", &(0_i32, -1_i32)),
+            "read accessibility text",
+        )?
+    } else {
+        None
+    }
+    .and_then(non_empty)
+    .map(|text| text.chars().take(MAX_TEXT_CHARACTERS).collect());
+    let value = if interfaces.contains(Interface::Value) {
+        optional(
+            proxy(connection, key, VALUE)?.get_property::<f64>("CurrentValue"),
+            "read accessibility value",
+        )?
+        .map(|value| value.to_string())
+    } else {
+        None
+    };
+    let actions = if interfaces.contains(Interface::Action) {
+        optional(
+            proxy(connection, key, ACTION)?.call::<_, _, Vec<AtspiAction>>("GetActions", &()),
+            "read accessibility actions",
+        )?
+        .map(|actions| actions.into_iter().map(|action| action.name).collect())
+    } else {
+        None
+    }
+    .unwrap_or_default();
 
     Ok(RawNode {
         accessible_id,
@@ -798,24 +1021,42 @@ fn read_node(connection: &Connection, key: &ObjectKey) -> Result<RawNode, Protoc
     })
 }
 
+/// Whether the object still exists and, when an identity was observed,
+/// still carries it. A gone object, or one whose identity can no longer
+/// be read, does not match; a failed read is an error.
 fn object_matches_observed_identity(
     connection: &Connection,
     key: &ObjectKey,
     accessible_id: &Option<String>,
-) -> bool {
-    let Ok(accessible) = proxy(connection, key, ACCESSIBLE) else {
-        return false;
-    };
-    if accessible.call::<_, _, String>("GetRoleName", &()).is_err() {
-        return false;
+) -> Result<bool, ProtocolError> {
+    let accessible = proxy(connection, key, ACCESSIBLE)?;
+    if required(
+        accessible.call::<_, _, String>("GetRoleName", &()),
+        "resolve accessibility element",
+    )
+    .or_gone()?
+    .is_none()
+    {
+        return Ok(false);
     }
-    accessible_id.as_ref().is_none_or(|expected| {
-        accessible
-            .get_property::<String>("AccessibleId")
-            .is_ok_and(|actual| actual == *expected)
-    })
+    let Some(expected) = accessible_id else {
+        return Ok(true);
+    };
+    let actual = match optional(
+        accessible.get_property::<String>("AccessibleId"),
+        "read accessibility identity",
+    )
+    .or_gone()?
+    {
+        Some(actual) => actual,
+        None => return Ok(false),
+    };
+    Ok(actual.as_ref() == Some(expected))
 }
 
+/// The one element below `window_root` carrying `accessible_id`, or `None`
+/// when there is none or more than one. Any branch that could not be read
+/// is an error, since it could hold a second match.
 fn find_unique_accessible_id(
     connection: &Connection,
     window_root: &ObjectKey,
@@ -831,21 +1072,31 @@ fn find_unique_accessible_id(
             return Ok(None);
         }
         visited += 1;
-        let accessible = match proxy(connection, &key, ACCESSIBLE) {
-            Ok(accessible) => accessible,
-            Err(_) => continue,
+        let accessible = proxy(connection, &key, ACCESSIBLE)?;
+        // An element that vanished during the walk holds no identity.
+        let Some(candidate) = optional(
+            accessible.get_property::<String>("AccessibleId"),
+            "read accessibility identity",
+        )
+        .or_gone()?
+        else {
+            continue;
         };
-        if accessible
-            .get_property::<String>("AccessibleId")
-            .is_ok_and(|candidate| candidate == accessible_id)
-        {
+        if candidate.as_deref() == Some(accessible_id) {
             if matched.is_some() {
                 return Ok(None);
             }
             matched = Some(key.clone());
         }
-        let children: Vec<ObjectRefOwned> = accessible.call("GetChildren", &()).unwrap_or_default();
-        queue.extend(children.iter().filter_map(object_key));
+        let Some(children) = optional(
+            accessible.call::<_, _, Vec<ObjectRefOwned>>("GetChildren", &()),
+            "read accessibility children",
+        )
+        .or_gone()?
+        else {
+            continue;
+        };
+        queue.extend(children.unwrap_or_default().iter().filter_map(object_key));
     }
     Ok(matched)
 }
@@ -980,6 +1231,73 @@ mod tests {
     use waldo_protocol::{LogicalPoint, LogicalRect};
 
     use super::{ObjectKey, RawNode, rectangles_intersect, select_window_root};
+
+    #[test]
+    fn a_handle_whose_object_now_carries_another_identity_is_retired() {
+        let mut registry = super::HandleRegistry::new();
+        let key = ObjectKey {
+            name: ":1.7".into(),
+            path: "/org/a11y/atspi/accessible/42".into(),
+        };
+        let window = ObjectKey {
+            name: ":1.7".into(),
+            path: "/org/a11y/atspi/accessible/1".into(),
+        };
+
+        let first = registry.handle_for(key.clone(), window.clone(), Some("save".into()));
+        let again = registry.handle_for(key.clone(), window.clone(), Some("save".into()));
+        let unidentified = registry.handle_for(key.clone(), window.clone(), None);
+        let replaced = registry.handle_for(key.clone(), window, Some("delete".into()));
+
+        assert_eq!(again, first);
+        assert_eq!(unidentified, first);
+        assert_ne!(replaced, first);
+        assert!(!registry.handles.contains_key(&first));
+        assert_eq!(
+            registry.handles[&replaced].accessible_id.as_deref(),
+            Some("delete")
+        );
+    }
+
+    #[test]
+    fn state_names_outside_at_spi_are_refused() {
+        assert!(super::require_known_state("focused").is_ok());
+        assert!(super::require_known_state("multi-line").is_ok());
+        assert_eq!(
+            super::require_known_state("focussed").unwrap_err().code,
+            waldo_protocol::ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn a_sole_window_contradicted_by_title_and_size_is_not_taken() {
+        let frame = LogicalRect {
+            origin: LogicalPoint { x: 0.0, y: 0.0 },
+            width: 800.0,
+            height: 600.0,
+        };
+        let other = LogicalRect {
+            origin: LogicalPoint { x: 0.0, y: 0.0 },
+            width: 300.0,
+            height: 200.0,
+        };
+
+        let contradicted = select_window_root(
+            vec![candidate("/2", "Preferences", other)],
+            Some("Editor"),
+            frame,
+        )
+        .unwrap();
+        let unconfirmed = select_window_root(
+            vec![candidate("/2", "Preferences", frame)],
+            Some("Editor"),
+            frame,
+        )
+        .unwrap();
+
+        assert!(contradicted.is_none());
+        assert!(unconfirmed.is_some());
+    }
 
     #[test]
     fn semantic_bounds_are_filtered_to_the_observed_frame() {

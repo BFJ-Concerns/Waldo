@@ -51,6 +51,9 @@ impl VerificationPlan {
                     prior_frames.insert(*from, grounding.application_frame_fingerprint);
                 }
                 Predicate::ElementExists { .. } | Predicate::ElementState { .. } => {
+                    if let Predicate::ElementState { state, .. } = predicate {
+                        waldo_accessibility::require_known_state(state)?;
+                    }
                     if !include_accessibility {
                         return Err(ProtocolError {
                             code: ErrorCode::InvalidRequest,

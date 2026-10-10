@@ -37,7 +37,9 @@ pub(crate) async fn act(
         actions,
         verification,
     } = request;
-    if let Err(error) = validate_action_order(&actions) {
+    if let Err(error) =
+        validate_action_order(&actions).and_then(|()| validate_wait_states(&actions))
+    {
         return ServerMessage::Error {
             request_id: Some(request_id),
             error,
@@ -402,6 +404,21 @@ fn error_response(
             retryable,
         },
     }
+}
+
+/// Refuses a wait on an AT-SPI state name that does not exist before any
+/// action runs, rather than when the batch reaches the wait.
+fn validate_wait_states(actions: &[waldo_protocol::Action]) -> Result<(), ProtocolError> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            waldo_protocol::Action::Wait {
+                predicate: waldo_protocol::Predicate::ElementState { state, .. },
+                ..
+            } => Some(state),
+            _ => None,
+        })
+        .try_for_each(|state| waldo_accessibility::require_known_state(state))
 }
 
 fn validate_action_order(actions: &[waldo_protocol::Action]) -> Result<(), ProtocolError> {

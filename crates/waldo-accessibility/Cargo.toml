@@ -10,7 +10,6 @@ description = "AT-SPI accessibility observation and element actions for Waldo."
 
 [dependencies]
 atspi-common.workspace = true
-serde_json.workspace = true
 waldo-action = { path = "../waldo-action" }
 waldo-controller = { path = "../waldo-controller" }
 waldo-protocol = { path = "../waldo-protocol" }
