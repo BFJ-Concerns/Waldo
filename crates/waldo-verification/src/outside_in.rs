@@ -42,6 +42,55 @@ pub struct OutsideInSummary {
     sensitive_payloads_retained: bool,
 }
 
+impl OutsideInSummary {
+    /// Every check this run did not pass, including circuits it skipped; an
+    /// empty list is the run's acceptance.
+    pub fn failures(&self) -> Vec<String> {
+        let mut failures = Vec::new();
+        let mut require = |passed: bool, check: &str| {
+            if !passed {
+                failures.push(check.to_owned());
+            }
+        };
+        require(
+            self.coordinate.event_coordinate_outcome == "passed",
+            "event coordinate",
+        );
+        require(
+            self.coordinate.delivered_pixel_provenance_outcome == "passed",
+            "delivered pixel provenance",
+        );
+        require(
+            self.delayed_completion.outcome == "passed",
+            "delayed completion",
+        );
+        require(
+            self.continuous_completion.outcome == "passed",
+            "continuous completion",
+        );
+        match &self.transparent_interception {
+            Some(result) => require(result.outcome == "passed", "transparent interception"),
+            None => require(
+                false,
+                "transparent interception (not run: continuous completion did not pass)",
+            ),
+        }
+        match &self.contradictory_state {
+            Some(result) => require(result.outcome == "passed", "contradictory state"),
+            None => require(
+                false,
+                "contradictory state (not run: an earlier circuit did not pass)",
+            ),
+        }
+        require(self.controller_socket_removed, "controller socket removed");
+        require(
+            !self.sensitive_payloads_retained,
+            "no sensitive payloads retained",
+        );
+        failures
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AccessibilitySummary {
     identity: IdentityEvidence,
@@ -56,6 +105,42 @@ pub struct AccessibilitySummary {
     controller_socket_removed: bool,
     privacy_scan: PrivacyScan,
     sensitive_payloads_retained: bool,
+}
+
+impl AccessibilitySummary {
+    /// Every check this run did not pass; an empty list is its acceptance.
+    pub fn failures(&self) -> Vec<String> {
+        [
+            (
+                self.invoke_reached_application,
+                "invoke reached the application",
+            ),
+            (
+                self.set_text_reached_application,
+                "set text reached the application",
+            ),
+            (self.focus_truthful, "focus reported truthfully"),
+            (
+                self.set_value_identity_refresh_reached_application,
+                "set value after identity refresh reached the application",
+            ),
+            (
+                self.selection_reached_application,
+                "selection reached the application",
+            ),
+            (self.stale_replacement_refused, "stale replacement refused"),
+            (self.ambiguity_propagated, "ambiguity propagated"),
+            (self.controller_socket_removed, "controller socket removed"),
+            (
+                !self.sensitive_payloads_retained,
+                "no sensitive payloads retained",
+            ),
+        ]
+        .into_iter()
+        .filter(|(passed, _)| !passed)
+        .map(|(_, check)| check.to_owned())
+        .collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1049,7 +1134,7 @@ fn run_delayed(
         },
         completion: DelayedCompletionResult {
             outcome: if false_completion {
-                "failed_as_expected_on_baseline"
+                "failed"
             } else if truthful_completion {
                 "passed"
             } else {
@@ -1148,7 +1233,7 @@ fn run_continuous(
         fixture.terminate_checked()?;
         return Ok(ContinuousCompletionResult {
             outcome: if still_changing {
-                "failed_as_expected_on_baseline"
+                "failed"
             } else {
                 "inconclusive"
             },

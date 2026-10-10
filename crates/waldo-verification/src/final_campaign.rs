@@ -481,19 +481,29 @@ fn run_legacy_circuits(
             python: options.python.clone(),
             seed,
         };
+        // A run returns its summary even when checks inside it failed, so
+        // the summary's own acceptance decides the cell.
         let result = if clipboard {
-            clipboard_outside_in::run(run_options).map(|_| ())
+            clipboard_outside_in::run(run_options).map(|_| Vec::new())
         } else if name == "accessibility" {
-            outside_in::run_accessibility(run_options).map(|_| ())
+            outside_in::run_accessibility(run_options).map(|summary| summary.failures())
         } else {
-            outside_in::run(run_options).map(|_| ())
+            outside_in::run(run_options).map(|summary| summary.failures())
         };
         match result {
-            Ok(()) => cells.push(CampaignCell {
+            Ok(failures) if failures.is_empty() => cells.push(CampaignCell {
                 id: format!("legacy-{name}"),
                 action_families: vec![name.to_owned()],
                 outcome: CampaignOutcome::Passed,
                 reason: None,
+                final_consumers: vec!["independent outside-in application oracle".to_owned()],
+                evidence: vec![format!("{relative}/summary.json")],
+            }),
+            Ok(failures) => cells.push(CampaignCell {
+                id: format!("legacy-{name}"),
+                action_families: vec![name.to_owned()],
+                outcome: CampaignOutcome::Failed,
+                reason: Some(format!("checks not passed: {}", failures.join("; "))),
                 final_consumers: vec!["independent outside-in application oracle".to_owned()],
                 evidence: vec![format!("{relative}/summary.json")],
             }),

@@ -208,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 seed,
             })?;
             emit_json(&summary, None)?;
+            require_accepted(summary.failures())?;
         }
         Command::AccessibilityOutsideIn {
             evidence_directory,
@@ -226,6 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 seed,
             })?;
             emit_json(&summary, None)?;
+            require_accepted(summary.failures())?;
         }
         Command::ClipboardOutsideIn {
             evidence_directory,
@@ -312,3 +314,13 @@ fn emit_json(
 #[cfg(test)]
 #[path = "tests/electron_defaults.rs"]
 mod electron_defaults;
+
+/// Fails the command, after its summary is printed, when any check in it
+/// did not pass.
+fn require_accepted(failures: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("checks not passed: {}", failures.join("; ")).into())
+    }
+}
