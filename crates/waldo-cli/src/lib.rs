@@ -24,10 +24,6 @@ pub struct Arguments {
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
 
-    /// Logical client identity sent in the controller handshake.
-    #[arg(long, global = true, default_value = "waldo-cli")]
-    pub client_id: String,
-
     #[command(subcommand)]
     pub command: Command,
 }
@@ -76,7 +72,6 @@ pub enum CliError {
     Io(io::Error),
     Json(serde_json::Error),
     Transport(TransportError),
-    InvalidClientId(waldo_protocol::InvalidClientId),
     HelloDocument,
     SharedStdin,
 }
@@ -87,7 +82,6 @@ impl fmt::Display for CliError {
             Self::Io(error) => write!(formatter, "could not read request document: {error}"),
             Self::Json(error) => write!(formatter, "could not encode the result: {error}"),
             Self::Transport(error) => error.fmt(formatter),
-            Self::InvalidClientId(error) => error.fmt(formatter),
             Self::HelloDocument => formatter.write_str(
                 "send documents cannot contain hello; the CLI performs the authenticated handshake",
             ),
@@ -104,7 +98,6 @@ impl Error for CliError {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Transport(error) => Some(error),
-            Self::InvalidClientId(error) => Some(error),
             Self::HelloDocument | Self::SharedStdin => None,
         }
     }
@@ -139,7 +132,7 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
         Some(path) => path,
         None => default_socket_path()?,
     };
-    let client_id = ClientId::new(arguments.client_id).map_err(CliError::InvalidClientId)?;
+    let client_id = ClientId::new("waldo-cli").expect("the fixed CLI identity is not blank");
     let client = PipelinedControllerClient::connect(&socket, client_id).await?;
     let request_id = RequestId::new(2);
     if let Command::Act {
@@ -241,12 +234,16 @@ pub async fn execute(arguments: Arguments) -> Result<Value, CliError> {
 pub fn reports_failure(value: &Value) -> bool {
     match value["type"].as_str() {
         Some("error") => true,
-        Some("acted") => value["result"]["stop_reason"] != "completed",
+        Some("acted") => {
+            value["result"]["stop_reason"] != "completed"
+                || !value["result"]["completion_error"].is_null()
+        }
         Some("act_stop") => {
             // Stop exists to cut the batch short, so a cancelled batch is the
             // expected outcome rather than a failure.
             let act = &value["act"];
-            reports_failure(&value["stop"])
+            !act["result"]["completion_error"].is_null()
+                || reports_failure(&value["stop"])
                 || (act["type"] == "acted"
                     && !matches!(
                         act["result"]["stop_reason"].as_str(),
@@ -421,6 +418,25 @@ mod tests {
         assert!(super::reports_failure(
             &json!({"type": "act_handover", "act": acted("completed"), "handover": lost})
         ));
+    }
+
+    #[test]
+    fn cancellation_does_not_hide_independent_completion_errors() {
+        use serde_json::json;
+        for code in ["backend_failure", "verification_failed"] {
+            let act = json!({"type":"acted", "result": {
+                "stop_reason":"cancelled",
+                "completion_error":{"code":code,"message":"completion failed","retryable":false}
+            }});
+            assert!(super::reports_failure(&act));
+            assert!(
+                super::reports_failure(&json!({
+                    "type":"act_stop", "act":act,
+                    "stop":{"type":"stopped","result":{"released_session":1}}
+                })),
+                "{code} must survive expected cancellation"
+            );
+        }
     }
 
     #[test]

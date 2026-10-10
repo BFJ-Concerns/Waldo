@@ -2,8 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CoordinateMapping, ElementHandle, LogicalPoint, LogicalRect, ObservationId, OutputId,
-    SourceSelector, WindowId,
+    CoordinateMapping, ElementHandle, LogicalRect, ObservationId, OutputId, SourceSelector,
+    WindowId,
 };
 
 /// How the compositor pixels behind a requested observation were obtained.
@@ -40,13 +40,6 @@ pub struct ImageData {
     pub data_base64: String,
 }
 
-/// Cursor evidence associated with an observation.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-pub struct CursorState {
-    pub visible: bool,
-    pub position: Option<LogicalPoint>,
-}
-
 /// Session-scoped focus and target identity captured with a frame.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct FocusState {
@@ -80,7 +73,6 @@ pub struct Observation {
     pub capture: CaptureProvenance,
     pub image: ImageData,
     pub coordinates: CoordinateMapping,
-    pub cursor: Option<CursorState>,
     pub focus: FocusState,
     pub accessibility: Vec<AccessibilityNode>,
     pub accessibility_available: bool,

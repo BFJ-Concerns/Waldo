@@ -17,6 +17,8 @@ waldo-protocol = { path = "../waldo-protocol" }
 waldo-socket = { path = "../waldo-socket" }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["process"] }
+waldo-controller = { path = "../waldo-controller" }
 waldo-action = { path = "../waldo-action" }
 waldo-niri = { path = "../waldo-niri" }
 waldo-screencopy = { path = "../waldo-screencopy" }

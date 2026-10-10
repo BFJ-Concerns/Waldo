@@ -203,7 +203,6 @@ pub(crate) async fn capture_observation(
             scale: output.scale,
             transform: output.transform,
         },
-        cursor: None,
         focus: FocusState {
             window_id: focused_window,
             element: focused_element,

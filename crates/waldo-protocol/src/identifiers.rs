@@ -3,11 +3,10 @@ use std::{error::Error, fmt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// Stable identity supplied by a logical controller client.
+/// Reserved client-supplied value retained for wire compatibility.
 ///
-/// A client may reconnect with the same identity, but each connection receives
-/// a new [`ConnectionId`]. This distinction prevents a dropped connection from
-/// silently recovering its former driving authority.
+/// The controller does not read this value; driving authority belongs to
+/// the independently assigned [`ConnectionId`].
 #[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]

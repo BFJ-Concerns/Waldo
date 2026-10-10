@@ -51,6 +51,7 @@ pub enum ClientMessage {
     Hello {
         request_id: RequestId,
         schema_major: u16,
+        /// Reserved for wire compatibility; unread by the controller.
         client_id: ClientId,
     },
     Observe {
@@ -193,7 +194,7 @@ pub struct ActionReceipt {
     pub output: Option<ActionOutput>,
 }
 
-/// Result of an ordered action batch and its automatic settled observation.
+/// Result of an ordered action batch and bounded post-action sampling.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct ActResult {
     pub driving_session: DrivingSessionId,
@@ -201,7 +202,8 @@ pub struct ActResult {
     /// First action known not to have run; skips an earlier indeterminate dispatch.
     pub first_not_executed: Option<usize>,
     pub stop_reason: StopReason,
-    /// Fresh settled evidence, absent only when post-action capture itself failed.
+    /// Fresh post-action observation from bounded sampling, absent when capture failed.
+    /// Consult `completion_evidence` to determine whether the application settled.
     #[serde(default)]
     pub observation: Option<Observation>,
     /// Failure after ordered execution which could not be attached to one action receipt.

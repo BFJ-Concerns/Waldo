@@ -33,9 +33,14 @@ pub enum TransportError {
         maximum: usize,
     },
     ConnectionClosed,
+    /// EOF after at least one byte of the four-byte frame prefix.
+    TruncatedFrame,
+    /// The request may have executed, but its response was lost.
+    OutcomeUnknown {
+        reason: String,
+    },
     Handshake(String),
-    /// An established connection failed; every request on it, queued or
-    /// later, fails with this reason.
+    /// A request was not dispatched on a failed connection.
     ConnectionFailed(String),
     ResponseMismatch {
         expected: RequestId,
@@ -62,6 +67,13 @@ impl fmt::Display for TransportError {
                 )
             }
             Self::ConnectionClosed => formatter.write_str("controller socket closed"),
+            Self::TruncatedFrame => {
+                formatter.write_str("controller frame length prefix was truncated")
+            }
+            Self::OutcomeUnknown { reason } => write!(
+                formatter,
+                "the controller connection failed after the request was sent: {reason}"
+            ),
             Self::Handshake(message) => write!(formatter, "controller handshake failed: {message}"),
             Self::ConnectionFailed(message) => {
                 write!(formatter, "controller connection failed: {message}")
@@ -116,17 +128,54 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let payload = serde_json::to_vec(message)?;
+    write_message_with_progress(writer, message)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// Whether the peer could have decoded the frame when writing failed.
+struct FrameWriteFailure {
+    error: TransportError,
+    frame_complete: bool,
+}
+
+impl From<TransportError> for FrameWriteFailure {
+    fn from(error: TransportError) -> Self {
+        Self {
+            error,
+            frame_complete: false,
+        }
+    }
+}
+
+impl From<io::Error> for FrameWriteFailure {
+    fn from(error: io::Error) -> Self {
+        TransportError::Io(error).into()
+    }
+}
+
+async fn write_message_with_progress<W, T>(
+    writer: &mut W,
+    message: &T,
+) -> Result<(), FrameWriteFailure>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(message).map_err(TransportError::Json)?;
     if payload.len() > MAX_FRAME_BYTES {
         return Err(TransportError::FrameTooLarge {
             size: payload.len(),
             maximum: MAX_FRAME_BYTES,
-        });
+        }
+        .into());
     }
-
     writer.write_u32(payload.len() as u32).await?;
     writer.write_all(&payload).await?;
-    writer.flush().await?;
+    writer.flush().await.map_err(|error| FrameWriteFailure {
+        error: TransportError::Io(error),
+        frame_complete: true,
+    })?;
     Ok(())
 }
 
@@ -149,13 +198,18 @@ pub async fn read_frame<R>(reader: &mut R) -> Result<Vec<u8>, TransportError>
 where
     R: AsyncRead + Unpin,
 {
-    let size = match reader.read_u32().await {
-        Ok(size) => size as usize,
+    let mut prefix = [0; 4];
+    if reader.read(&mut prefix[..1]).await? == 0 {
+        return Err(TransportError::ConnectionClosed);
+    }
+    match reader.read_exact(&mut prefix[1..]).await {
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(TransportError::ConnectionClosed);
+            return Err(TransportError::TruncatedFrame);
         }
         Err(error) => return Err(TransportError::Io(error)),
-    };
+    }
+    let size = u32::from_be_bytes(prefix) as usize;
     if size > MAX_FRAME_BYTES {
         return Err(TransportError::FrameTooLarge {
             size,
@@ -192,11 +246,13 @@ struct ConnectionState {
 type SharedConnection = std::sync::Arc<Mutex<ConnectionState>>;
 
 impl ConnectionState {
-    /// Records the first failure and answers every waiting caller with it.
+    /// A reader failure cannot prove any pending request was not dispatched.
     fn fail(&mut self, reason: String) {
         let reason = self.failure.get_or_insert(reason).clone();
         for (_, sender) in self.pending.drain() {
-            let _ = sender.send(Err(TransportError::ConnectionFailed(reason.clone())));
+            let _ = sender.send(Err(TransportError::OutcomeUnknown {
+                reason: reason.clone(),
+            }));
         }
     }
 }
@@ -251,8 +307,8 @@ impl PipelinedControllerClient {
     }
 }
 
-async fn write_requests(
-    mut writer: tokio::net::unix::OwnedWriteHalf,
+async fn write_requests<W: AsyncWrite + Unpin>(
+    mut writer: W,
     mut requests: mpsc::Receiver<PendingRequest>,
     connection: SharedConnection,
 ) {
@@ -280,8 +336,15 @@ async fn write_requests(
                 }
             }
         }
-        if let Err(error) = write_message(&mut writer, &request.message).await {
-            connection.lock().await.fail(error.to_string());
+        if let Err(failure) = write_message_with_progress(&mut writer, &request.message).await {
+            let mut state = connection.lock().await;
+            let reason = failure.error.to_string();
+            if !failure.frame_complete
+                && let Some(sender) = state.pending.remove(&request_id)
+            {
+                let _ = sender.send(Err(TransportError::ConnectionFailed(reason.clone())));
+            }
+            state.fail(reason);
         }
     }
 }
@@ -497,8 +560,10 @@ mod tests {
                 .await
                 .expect("a request on a failed connection must not wait forever")
                 .unwrap_err();
-            let TransportError::ConnectionFailed(reason) = error else {
-                panic!("request {id} failed without the connection's reason: {error}")
+            let reason = match error {
+                TransportError::OutcomeUnknown { reason } if id == 2 => reason,
+                TransportError::ConnectionFailed(reason) if id == 3 => reason,
+                error => panic!("request {id} had the wrong dispatch certainty: {error}"),
             };
             assert!(reason.contains("lost track of the connection"), "{reason}");
         }
@@ -534,6 +599,145 @@ mod tests {
         assert!(!first.is_finished());
         first.abort();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn partial_length_prefixes_are_framing_errors() {
+        for length in 1..=3 {
+            let mut bytes = &b"\0\0\0"[..length];
+            let error = read_frame(&mut bytes).await.unwrap_err();
+            assert!(
+                matches!(error, TransportError::TruncatedFrame),
+                "{length}: {error}"
+            );
+        }
+    }
+
+    /// A byte sink that fails at a chosen byte boundary or at flush. It never
+    /// fabricates a transport classification: the real writer decides that.
+    struct FailingWriter {
+        bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        limit: usize,
+        fail_flush: bool,
+    }
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let mut written = self.bytes.lock().unwrap();
+            let count = bytes.len().min(self.limit.saturating_sub(written.len()));
+            if count == 0 {
+                return std::task::Poll::Ready(Err(std::io::Error::from(
+                    std::io::ErrorKind::BrokenPipe,
+                )));
+            }
+            written.extend_from_slice(&bytes[..count]);
+            std::task::Poll::Ready(Ok(count))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(if self.fail_flush {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            } else {
+                Ok(())
+            })
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn failed_write(
+        limit: usize,
+        fail_flush: bool,
+    ) -> (TransportError, TransportError, Vec<u8>) {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        tx.send(super::PendingRequest {
+            message: query(2),
+            response: first_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(super::PendingRequest {
+            message: query(3),
+            response: queued_tx,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        super::write_requests(
+            FailingWriter {
+                bytes: bytes.clone(),
+                limit,
+                fail_flush,
+            },
+            rx,
+            super::SharedConnection::default(),
+        )
+        .await;
+        let first = first_rx.await.unwrap().unwrap_err();
+        let queued = queued_rx.await.unwrap().unwrap_err();
+        let written = bytes.lock().unwrap().clone();
+        (first, queued, written)
+    }
+
+    #[tokio::test]
+    async fn incomplete_prefix_and_body_writes_are_not_dispatched() {
+        for limit in [2, 5] {
+            let (first, queued, bytes) = failed_write(limit, false).await;
+            assert!(
+                read_message::<_, super::ClientMessage>(&mut bytes.as_slice())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                matches!(first, TransportError::ConnectionFailed(_)),
+                "{first}"
+            );
+            assert!(
+                matches!(queued, TransportError::ConnectionFailed(_)),
+                "{queued}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flush_failure_after_a_complete_frame_has_an_unknown_outcome() {
+        let (first, queued, bytes) = failed_write(usize::MAX, true).await;
+        let decoded: super::ClientMessage = read_message(&mut bytes.as_slice()).await.unwrap();
+        assert_eq!(decoded, query(2));
+        assert!(
+            matches!(first, TransportError::OutcomeUnknown { .. }),
+            "{first}"
+        );
+        assert!(
+            matches!(queued, TransportError::ConnectionFailed(_)),
+            "{queued}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_failure_treats_even_unwritten_pending_requests_as_unknown() {
+        let mut state = super::ConnectionState::default();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.pending.insert(waldo_protocol::RequestId::new(2), tx);
+        state.fail("reader lost the connection".into());
+        let error = rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, TransportError::OutcomeUnknown { .. }),
+            "{error}"
+        );
     }
 
     #[test]

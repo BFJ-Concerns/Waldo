@@ -706,3 +706,193 @@ async fn binary_resolves_image_edge_settings_and_reports_delivered_dimensions() 
     service_task.await.unwrap().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
+
+async fn start_test_mcp(
+    path: PathBuf,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::io::Lines<BufReader<tokio::io::DuplexStream>>,
+    tokio::task::JoinHandle<Result<(), waldo_mcp::McpError>>,
+) {
+    let (mut writer, server_reader) = tokio::io::duplex(64 * 1024);
+    let (server_writer, reader) = tokio::io::duplex(512 * 1024);
+    let server = McpServer::new(path);
+    let task = tokio::spawn(async move { server.run(server_reader, server_writer).await });
+    let mut reader = BufReader::new(reader).lines();
+    send(&mut writer, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), receive(&mut reader))
+            .await
+            .unwrap()["id"],
+        1
+    );
+    send(
+        &mut writer,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), receive(&mut reader))
+            .await
+            .unwrap()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    (writer, reader, task)
+}
+
+fn act_call() -> Value {
+    json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+        "name":"act","arguments":{"observation_id":1,"actions":[{"type":"key_chord","keys":["Return"]}],"verification":[]}
+    }})
+}
+
+#[tokio::test]
+async fn stdio_lost_act_reply_requires_observation_before_replay() {
+    let path = test_socket();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let hello: waldo_protocol::ClientMessage =
+            waldo_socket::read_message(&mut stream).await.unwrap();
+        waldo_socket::write_message(
+            &mut stream,
+            &waldo_protocol::ServerMessage::Connected {
+                request_id: hello.request_id(),
+                connection_id: waldo_protocol::ConnectionId::new(1),
+                capabilities: waldo_protocol::Capabilities::unavailable(),
+            },
+        )
+        .await
+        .unwrap();
+        // The peer consumes an entire Act frame before dropping its reply.
+        waldo_socket::read_message::<_, waldo_protocol::ClientMessage>(&mut stream)
+            .await
+            .unwrap()
+    });
+    let (mut writer, mut reader, task) = start_test_mcp(path.clone()).await;
+    send(&mut writer, act_call()).await;
+    let response = tokio::time::timeout(Duration::from_secs(5), receive(&mut reader))
+        .await
+        .unwrap();
+    let request = peer.await.unwrap();
+    assert!(matches!(request, waldo_protocol::ClientMessage::Act { .. }));
+    drop(writer);
+    task.await.unwrap().unwrap();
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    let result = &response["result"];
+    assert_eq!(result["isError"], true);
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["retryable"], false, "{response}");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("action may have executed"), "{message}");
+    assert!(message.contains("fresh Observe is required"), "{message}");
+}
+
+#[tokio::test]
+async fn stdio_act_that_never_connected_remains_retryable() {
+    let path = test_socket();
+    let (mut writer, mut reader, task) = start_test_mcp(path).await;
+    send(&mut writer, act_call()).await;
+    let response = tokio::time::timeout(Duration::from_secs(5), receive(&mut reader))
+        .await
+        .unwrap();
+    drop(writer);
+    task.await.unwrap().unwrap();
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["retryable"],
+        true
+    );
+    assert!(!response.to_string().contains("may have executed"));
+}
+
+struct UnrestoredExecutor;
+impl ActionExecutor for UnrestoredExecutor {
+    fn execute(
+        &self,
+        _action: &Action,
+        _cancellation: &ExecutionToken,
+    ) -> Result<ActionExecution, ActionExecutionFailure> {
+        Ok(waldo_protocol::ActionRoute::VirtualKeyboard.into())
+    }
+    fn supports(&self, route: waldo_protocol::ActionRoute) -> bool {
+        route == waldo_protocol::ActionRoute::VirtualKeyboard
+    }
+    fn release_all(&self) -> Option<String> {
+        Some("clipboard restoration failed".into())
+    }
+}
+
+#[tokio::test]
+async fn stdio_stop_with_failed_cleanup_retains_release_and_reports_error() {
+    let path = test_socket();
+    let service = ControllerService::bind_with_all_backends(
+        &path,
+        Duration::from_secs(30),
+        Arc::new(FixedInspector),
+        Arc::new(FixedCapturer),
+        Arc::new(UnrestoredExecutor),
+    )
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let service_task = tokio::spawn(service.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let (mut writer, mut reader, task) = start_test_mcp(path.clone()).await;
+    send(&mut writer, json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+        "name":"observe","arguments":{"source":{"type":"output","output_id":"DP-1"},"include_accessibility":false}
+    }})).await;
+    let observed = tokio::time::timeout(Duration::from_secs(5), receive(&mut reader))
+        .await
+        .unwrap();
+    let mut act = act_call();
+    act["params"]["arguments"]["observation_id"] =
+        observed["result"]["structuredContent"]["observation"]["id"].clone();
+    send(&mut writer, act).await;
+    let acted = tokio::time::timeout(Duration::from_secs(5), receive(&mut reader))
+        .await
+        .unwrap();
+    let session = acted["result"]["structuredContent"]["result"]["driving_session"].clone();
+    assert!(session.is_number(), "{acted}");
+    send(&mut writer, json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"stop","arguments":{}}})).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), receive(&mut reader))
+        .await
+        .unwrap();
+    drop(writer);
+    task.await.unwrap().unwrap();
+    shutdown_tx.send(()).unwrap();
+    service_task.await.unwrap().unwrap();
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    assert_eq!(
+        stopped["result"]["structuredContent"]["result"]["released_session"],
+        session
+    );
+    assert_eq!(
+        stopped["result"]["structuredContent"]["result"]["cleanup_limitation"],
+        "clipboard restoration failed"
+    );
+    assert_eq!(stopped["result"]["isError"], true, "{stopped}");
+}
+
+#[tokio::test]
+async fn stdio_decode_errors_do_not_repeat_client_values() {
+    let (mut writer, mut reader, task) = start_test_mcp(test_socket()).await;
+    for arguments in [
+        json!({"observation_id":"secret\"escaped secret","actions":[],"verification":[]}),
+        json!({"observation_id":1,"actions":[{"type":"secret`variant"}],"verification":[]}),
+        json!({"observation_id":1,"actions":[],"verification":[],"secret`field":true}),
+    ] {
+        send(&mut writer, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"act","arguments":arguments}})).await;
+        let response = tokio::time::timeout(Duration::from_secs(5), receive(&mut reader))
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(!response.to_string().contains("secret"), "{response}");
+    }
+    drop(writer);
+    task.await.unwrap().unwrap();
+}

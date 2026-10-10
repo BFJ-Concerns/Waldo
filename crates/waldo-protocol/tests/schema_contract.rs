@@ -184,4 +184,17 @@ fn published_schema_names_every_top_level_operation() {
     ] {
         assert!(encoded.contains(evidence), "schema omitted {evidence}");
     }
+    let schema = serde_json::to_value(schema).unwrap();
+    for removed in ["\"cursor\"", "CursorState"] {
+        assert!(!encoded.contains(removed), "schema advertises {removed}");
+    }
+    let client = schema["client_messages"].to_string();
+    assert!(client.contains("Reserved for wire compatibility; unread by the controller"));
+    let result = &schema["server_messages"]["$defs"]["ActResult"];
+    let description = result["properties"]["observation"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains("bounded sampling"), "{description}");
+    assert!(description.contains("completion_evidence"), "{description}");
+    assert_eq!(schema["schema_major"], 2);
 }

@@ -15,7 +15,3 @@ path = "src/lib.rs"
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[[bin]]
-name = "waldo-schema"
-path = "src/bin/waldo-schema.rs"

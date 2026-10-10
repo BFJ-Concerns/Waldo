@@ -14,7 +14,7 @@ use tokio::{
     task::JoinSet,
 };
 use waldo_protocol::{ClientId, ClientMessage, RequestId};
-use waldo_socket::PipelinedControllerClient;
+use waldo_socket::{PipelinedControllerClient, TransportError};
 
 use crate::{
     McpError,
@@ -145,18 +145,18 @@ impl McpServer {
 
         let response = match self.controller().await {
             Ok(controller) => controller.request(message).await,
-            Err(error) => return Ok(crate::result::transport_failure(error.to_string())),
+            Err(error) => Err(error),
         };
         match response {
             Ok(response) => Ok(tool_response(response, self.model_image_max_edge)),
             Err(error) => {
                 *self.controller.lock().await = None;
-                Ok(crate::result::transport_failure(error.to_string()))
+                Ok(crate::result::transport_failure(error))
             }
         }
     }
 
-    async fn controller(&self) -> Result<PipelinedControllerClient, McpError> {
+    async fn controller(&self) -> Result<PipelinedControllerClient, TransportError> {
         let mut controller = self.controller.lock().await;
         if controller.is_none() {
             *controller = Some(

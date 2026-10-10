@@ -328,7 +328,6 @@ async fn saved_v2_corpus_has_stable_cli_mcp_semantics_and_final_consumers() {
         let cli_harness = Harness::start().await;
         let cli_result = execute(Arguments {
             socket: Some(cli_harness.path.clone()),
-            client_id: format!("parity-cli-{}", document.name),
             command: Command::Act {
                 document: root.join(&document.file),
                 observe: root.join("observe.json"),

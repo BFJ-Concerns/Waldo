@@ -2,10 +2,11 @@ use std::{io::Cursor, num::NonZeroU32};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::{GenericImageView, ImageFormat, imageops::FilterType};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use waldo_protocol::{ErrorCode, Observation, PixelSize, ProtocolError, ServerMessage, StopReason};
 
 use crate::tools::ToolResult;
+use waldo_socket::TransportError;
 
 /// Renders a controller response as an MCP tool result. `isError` is set for
 /// a protocol error, a batch that did not complete, a Stop whose clean-up
@@ -59,17 +60,7 @@ pub(crate) fn tool_response(mut response: ServerMessage, max_edge: NonZeroU32) -
 /// Removes an observation image that could not be presented, so neither the
 /// structured result nor the content carries it.
 fn withhold_image(response: &mut Value) {
-    let observation = if response.get("observation").is_some() {
-        response.get_mut("observation")
-    } else {
-        response
-            .get_mut("result")
-            .and_then(|result| result.get_mut("observation"))
-    };
-    if let Some(image) = observation
-        .and_then(|observation| observation.get_mut("image"))
-        .and_then(Value::as_object_mut)
-    {
+    if let Some(image) = observation_image(response) {
         image.remove("data_base64");
         image.insert("withheld".into(), Value::Bool(true));
     }
@@ -141,7 +132,7 @@ fn present_observation_image(
     Ok(())
 }
 
-fn separate_image(mut response: Value) -> (Value, Option<(String, String)>) {
+fn observation_image(response: &mut Value) -> Option<&mut Map<String, Value>> {
     let observation = if response.get("observation").is_some() {
         response.get_mut("observation")
     } else {
@@ -149,15 +140,18 @@ fn separate_image(mut response: Value) -> (Value, Option<(String, String)>) {
             .get_mut("result")
             .and_then(|result| result.get_mut("observation"))
     };
-    let image = observation
+    observation
         .and_then(|observation| observation.get_mut("image"))
         .and_then(Value::as_object_mut)
-        .and_then(|image| {
-            let mime_type = image.remove("mime_type")?.as_str()?.to_owned();
-            let data = image.remove("data_base64")?.as_str()?.to_owned();
-            image.insert("delivered_as_content".into(), Value::Bool(true));
-            Some((mime_type, data))
-        });
+}
+
+fn separate_image(mut response: Value) -> (Value, Option<(String, String)>) {
+    let image = observation_image(&mut response).and_then(|image| {
+        let mime_type = image.remove("mime_type")?.as_str()?.to_owned();
+        let data = image.remove("data_base64")?.as_str()?.to_owned();
+        image.insert("delivered_as_content".into(), Value::Bool(true));
+        Some((mime_type, data))
+    });
     (response, image)
 }
 
@@ -181,12 +175,17 @@ pub(crate) fn tool_failure(error: ProtocolError) -> Value {
     .expect("tool failure serialises")
 }
 
-pub(crate) fn transport_failure(message: String) -> Value {
-    tool_failure(ProtocolError {
-        code: ErrorCode::BackendFailure,
-        message,
-        retryable: true,
-    })
+pub(crate) fn transport_failure(error: TransportError) -> Value {
+    let (message, retryable) = match error {
+        TransportError::OutcomeUnknown { reason } => (
+            format!(
+                "the action may have executed; a fresh Observe is required before deciding what to do next: {reason}"
+            ),
+            false,
+        ),
+        error => (error.to_string(), true),
+    };
+    tool_failure(ProtocolError::backend_failure(message, retryable))
 }
 
 #[cfg(test)]
@@ -327,7 +326,6 @@ mod tests {
                 "scale": 1.0,
                 "transform": "normal"
             },
-            "cursor": null,
             "focus": {"window_id": null, "element": null},
             "accessibility": [],
             "accessibility_available": false
@@ -398,7 +396,6 @@ mod tests {
                 scale: 1.0,
                 transform: OutputTransform::Normal,
             },
-            cursor: None,
             focus: FocusState {
                 window_id: None,
                 element: None,
