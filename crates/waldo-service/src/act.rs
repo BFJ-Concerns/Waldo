@@ -437,9 +437,10 @@ fn validate_action_order(actions: &[waldo_protocol::Action]) -> Result<(), Proto
             waited = true;
         } else if waited && is_pointer_action(action) {
             return Err(ProtocolError {
-                code: ErrorCode::InvalidRequest,
-                message: "a pointer action cannot follow a wait in the same batch; observe again before replanning visual coordinates".into(),
                 retryable: true,
+                ..ProtocolError::invalid_request(
+                    "a pointer action cannot follow a wait in the same batch; observe again before replanning visual coordinates",
+                )
             });
         }
     }

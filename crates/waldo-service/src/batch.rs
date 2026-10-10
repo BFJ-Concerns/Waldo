@@ -377,11 +377,9 @@ mod tests {
             let attempt = actions.len();
             actions.push(action.clone());
             if self.fail_on_attempt == Some(attempt) {
-                return Err(ActionExecutionFailure::not_executed(ProtocolError {
-                    code: ErrorCode::BackendFailure,
-                    message: "deliberate pointer dispatch failure".into(),
-                    retryable: true,
-                }));
+                return Err(ActionExecutionFailure::not_executed(
+                    ProtocolError::backend_failure("deliberate pointer dispatch failure", true),
+                ));
             }
             Ok(ActionRoute::VirtualPointer.into())
         }

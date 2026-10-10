@@ -521,9 +521,8 @@ impl ActionExecutor for BlockingExecutor {
         }
         self.finished.store(true, Ordering::Release);
         Err(ActionExecutionFailure::not_executed(ProtocolError {
-            code: ErrorCode::Cancelled,
-            message: "cancelled by test Stop request".into(),
             retryable: true,
+            ..ProtocolError::cancelled("cancelled by test Stop request")
         }))
     }
 }
