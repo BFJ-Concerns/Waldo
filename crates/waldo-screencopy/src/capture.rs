@@ -150,12 +150,13 @@ impl Screencopy {
     }
 }
 
-/// Dispatch available Wayland events without allowing a silent compositor to
-/// retain one of the service's blocking workers forever.
+/// Converts the remaining budget to a bounded, non-zero polling timeout.
 fn poll_timeout_ms(remaining: Duration) -> u16 {
     remaining.as_millis().clamp(1, u128::from(u16::MAX)) as u16
 }
 
+/// Dispatch available Wayland events without allowing a silent compositor to
+/// retain one of the service's blocking workers forever.
 fn dispatch_until(
     queue: &mut wayland_client::EventQueue<State>,
     state: &mut State,

@@ -50,10 +50,9 @@ impl Drop for Restore {
 }
 
 #[test]
+#[ignore = "requires an empty live clipboard and temporarily takes ownership"]
 fn an_owner_that_never_closes_its_pipe_hits_the_read_deadline() {
-    if !live_session() {
-        return;
-    }
+    assert!(live_session(), "requires a live Niri session");
     let _serial = CLIPBOARD.lock().unwrap();
     let restore = Restore::new();
     let owner = owner::Owner::start(None);
@@ -97,10 +96,9 @@ fn an_owner_that_never_closes_its_pipe_hits_the_read_deadline() {
 }
 
 #[test]
+#[ignore = "requires an empty live clipboard and temporarily takes ownership"]
 fn cancelling_a_read_waiting_on_an_owner_returns_promptly() {
-    if !live_session() {
-        return;
-    }
+    assert!(live_session(), "requires a live Niri session");
     let _serial = CLIPBOARD.lock().unwrap();
     let restore = Restore::new();
     let owner = owner::Owner::start(None);
@@ -141,10 +139,9 @@ fn cancelling_a_read_waiting_on_an_owner_returns_promptly() {
 }
 
 #[test]
+#[ignore = "requires an empty live clipboard and temporarily takes ownership"]
 fn a_completed_read_returns_the_owners_exact_bytes() {
-    if !live_session() {
-        return;
-    }
+    assert!(live_session(), "requires a live Niri session");
     let _serial = CLIPBOARD.lock().unwrap();
     let restore = Restore::new();
     let expected = b"complete\0representation";

@@ -333,7 +333,10 @@ impl KeyboardState {
                         "requested text route {route:?} is not initialised"
                     )));
                 }
-                Ok(PreparedKeyboardAction::Text(self.resolve_text(text)?))
+                Ok(PreparedKeyboardAction::Text(Self::resolve_text(
+                    text,
+                    self.group_table(),
+                )?))
             }
             _ => Err(ProtocolError::unsupported_capability(
                 "this action has no virtual-keyboard route",
@@ -360,19 +363,7 @@ impl KeyboardState {
             })
     }
 
-    fn resolve_character(&self, character: char) -> Result<KeySequence, ProtocolError> {
-        let table = self.group_table();
-        table
-            .sequences
-            .get(&text_keysym(character).raw())
-            .cloned()
-            .ok_or_else(|| ProtocolError::unsupported_capability(format!(
-                    "character {character:?} cannot be typed exactly on the active keyboard layout {:?}",
-                    table.name
-                )))
-    }
-
-    fn resolve_text(&self, text: &str) -> Result<Vec<KeySequence>, ProtocolError> {
+    fn resolve_text(text: &str, table: &GroupTable) -> Result<Vec<KeySequence>, ProtocolError> {
         require_typeable_length(text)?;
         require_text_controls(text)?;
         let mut characters = text.chars().peekable();
@@ -382,7 +373,12 @@ impl KeyboardState {
                 characters.next();
                 character = '\n';
             }
-            sequences.push(self.resolve_character(character)?);
+            sequences.push(table.sequences.get(&text_keysym(character).raw()).cloned().ok_or_else(|| {
+                ProtocolError::unsupported_capability(format!(
+                    "character {character:?} cannot be typed exactly on the active keyboard layout {:?}",
+                    table.name
+                ))
+            })?);
         }
         Ok(sequences)
     }
@@ -496,9 +492,11 @@ mod text_limit_tests {
 
     #[test]
     fn destructive_text_controls_are_invalid_requests_naming_the_codepoint() {
+        let keymap = super::CompiledKeymap::from_names("evdev", "pc105", "us", "", None).unwrap();
         for character in ['\u{8}', '\u{1b}', '\u{7f}', '\u{85}'] {
             let text = format!("a{character}");
-            let error = require_text_controls(&text).unwrap_err();
+            let error =
+                super::KeyboardState::resolve_text(&text, keymap.group(0).unwrap()).unwrap_err();
             assert_eq!(error.code, waldo_protocol::ErrorCode::InvalidRequest);
             assert!(
                 error

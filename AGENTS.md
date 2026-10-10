@@ -20,11 +20,12 @@ expected to pass it. The guarded live-session tests return early, and count
 as passed, when the session variables they check are missing —
 `NIRI_SOCKET`, `WAYLAND_DISPLAY` or the D-Bus session bus, depending on the
 test — so a run where those are missing, as on CI, does not exercise them;
-run the gate inside the Niri session. Four clipboard tests need the live
+run the gate inside the Niri session. Seven clipboard tests need the live
 clipboard and are `#[ignore]`d instead of guarded, so they fail rather than
 pass without the session; run them inside the session, with an empty
 clipboard, using `cargo test --workspace -- --ignored`, since some publish
-to the clipboard and replace its owner. One of them launches a GTK fixture
+to the clipboard and replace its owner, while others read from test owners
+that temporarily take the clipboard. One of them launches a GTK fixture
 that needs Python 3 with PyGObject and GTK 4, and the ordered-publication
 test returns early, and passes, unless the clipboard is empty. Live tests
 never touch an installed service or its lease; those that need a controller

@@ -773,24 +773,28 @@ mod tests {
 
     #[test]
     fn string_offers_have_latin1_bytes_and_utf8_aliases_keep_utf8() {
-        let representations = super::temporary_text_representations("é").unwrap();
-        for (mime, bytes) in representations {
-            assert_eq!(
-                bytes,
-                if mime == "STRING" {
+        for text in ["é", "λ"] {
+            let representations = super::temporary_text_representations(text).unwrap();
+            let string = representations.iter().find(|(mime, _)| mime == "STRING");
+            if text == "é" {
+                assert_eq!(
+                    string.expect("Latin-1 text must offer STRING").1,
                     vec![0xe9]
-                } else {
-                    "é".as_bytes().to_vec()
-                },
-                "{mime}"
-            );
-        }
-        let representations = super::temporary_text_representations("λ").unwrap();
-        assert!(
-            representations
+                );
+            } else {
+                assert!(string.is_none(), "non-Latin-1 text must not offer STRING");
+            }
+            for mime in super::TEXT_MIME_TYPES
                 .iter()
-                .all(|(mime, bytes)| mime != "STRING" && bytes == "λ".as_bytes())
-        );
+                .filter(|mime| **mime != "STRING")
+            {
+                let (_, bytes) = representations
+                    .iter()
+                    .find(|(name, _)| name == mime)
+                    .expect("every UTF-8 alias must be offered");
+                assert_eq!(bytes, text.as_bytes(), "{mime}");
+            }
+        }
     }
 
     #[test]

@@ -34,7 +34,7 @@ early, counting as passed, when those are missing. A run without them, such
 as CI's, has not exercised those tests, so run the gate inside a Niri
 session.
 
-Four clipboard tests are ignored by default instead, and fail rather than
+Seven clipboard tests are ignored by default instead, and fail rather than
 pass without a session. Run them inside the session with an empty
 clipboard:
 
@@ -42,7 +42,8 @@ clipboard:
 cargo test --workspace -- --ignored
 ```
 
-Some of them publish to the clipboard and replace its owner. The
+These include reads against test owners that temporarily take the clipboard.
+Some publish to the clipboard and replace its owner. The
 ordered-publication test returns early, and passes, unless the clipboard is
 empty, and one launches a GTK fixture that needs Python 3 with PyGObject and
 GTK 4.

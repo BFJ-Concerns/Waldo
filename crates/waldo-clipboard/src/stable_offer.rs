@@ -522,12 +522,16 @@ fn serve_owned_publication(
     }
 }
 
+fn poll_timeout_ms(remaining: Duration) -> u16 {
+    remaining.as_millis().clamp(1, u128::from(u16::MAX)) as u16
+}
+
 fn wait_for_publication_readable(
     descriptor: std::os::fd::BorrowedFd<'_>,
     timeout: Duration,
 ) -> Result<bool, ProtocolError> {
     let mut descriptors = [PollFd::new(descriptor, PollFlags::POLLIN)];
-    let timeout_ms = timeout.as_millis().clamp(1, u128::from(u16::MAX)) as u16;
+    let timeout_ms = poll_timeout_ms(timeout);
     let ready = poll(&mut descriptors, timeout_ms).map_err(|error| {
         ProtocolError::backend_failure(
             format!("serve ordered clipboard publication: wait for events: {error}"),
@@ -1088,11 +1092,7 @@ fn wait_for_readable(
             remaining
         };
         let mut descriptors = [PollFd::new(descriptor, PollFlags::POLLIN)];
-        let ready = poll(
-            &mut descriptors,
-            timeout.as_millis().clamp(1, u128::from(u16::MAX)) as u16,
-        )
-        .map_err(|error| {
+        let ready = poll(&mut descriptors, poll_timeout_ms(timeout)).map_err(|error| {
             ProtocolError::backend_failure(
                 format!("{operation}: wait for Wayland events: {error}"),
                 true,
@@ -1152,11 +1152,7 @@ fn read_representation(
             remaining_time
         };
         let mut descriptors = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
-        let ready = poll(
-            &mut descriptors,
-            timeout.as_millis().clamp(1, u128::from(u16::MAX)) as u16,
-        )
-        .map_err(|error| {
+        let ready = poll(&mut descriptors, poll_timeout_ms(timeout)).map_err(|error| {
             ProtocolError::backend_failure(format!("wait for clipboard transfer: {error}"), true)
         })?;
         if ready == 0 {
