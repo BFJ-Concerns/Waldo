@@ -217,15 +217,46 @@ impl ClipboardRecovery {
 }
 
 impl Drop for ClipboardRecovery {
+    /// The last resort when neither the run nor its error path restored
+    /// the clipboard; a failure here can only be printed.
     fn drop(&mut self) {
-        if let Some(snapshot) = self.snapshot.take() {
-            let _ = self.executor.restore_temporary(snapshot);
+        if let Some(snapshot) = self.snapshot.take()
+            && let Err(error) = self.executor.restore_temporary(snapshot)
+        {
+            eprintln!(
+                "waldo-verification: the operator's clipboard could not be restored: {}",
+                error.message
+            );
         }
     }
 }
 
 pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Error>> {
     let mut recovery = ClipboardRecovery::capture()?;
+    match run_recoverable(options, &mut recovery) {
+        Ok(summary) => Ok(summary),
+        // The operator's clipboard is restored on every failure, and a
+        // failed restoration is reported beside the failure that caused it.
+        Err(error) => match recovery.restore() {
+            Ok(()) => {
+                recovery.discharge();
+                Err(error)
+            }
+            Err(restoration) => {
+                recovery.discharge();
+                Err(format!(
+                    "{error}; restoring the operator's clipboard also failed: {restoration}"
+                )
+                .into())
+            }
+        },
+    }
+}
+
+fn run_recoverable(
+    options: Options,
+    recovery: &mut ClipboardRecovery,
+) -> Result<ClipboardSummary, Box<dyn std::error::Error>> {
     let mut harness = RuntimeHarness::start(&options)?;
     let mut transient = TransientDirectory::create(options.seed)?;
     let state_path = transient.0.join("fixture-state.json");
@@ -587,12 +618,12 @@ pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Err
         });
     }
     for evidence in text_routes.iter().filter(|case| case.scenario != "accept") {
-        if evidence.successful_application_outcome {
-            return Err(format!(
-                "{} destination incorrectly returned successful application outcome",
-                evidence.scenario
-            )
-            .into());
+        if let Some(contradiction) = negative_case_contradiction(
+            &evidence.receipt_status,
+            &evidence.application_outcome,
+            evidence.destination_digest_matched,
+        ) {
+            return Err(format!("{} destination: {contradiction}", evidence.scenario).into());
         }
     }
     write_stage(&options.evidence_directory, "text_routes_verified")?;
@@ -670,10 +701,12 @@ pub fn run(options: Options) -> Result<ClipboardSummary, Box<dyn std::error::Err
     let cancellation_state = wait_for_fixture(&state_path, |state| state.control_sequence == 10)?;
     let cancellation_after = clipboard_inventory(&seat)?;
     let cancellation_outcome = application_outcome(&cancelled);
-    if cancellation_outcome == "completed" {
-        return Err(
-            "cancelled destination incorrectly returned successful application outcome".into(),
-        );
+    if let Some(contradiction) = negative_case_contradiction(
+        first_status(&cancelled),
+        &cancellation_outcome,
+        cancellation_state.digest_matches,
+    ) {
+        return Err(format!("cancelled destination: {contradiction}").into());
     }
     write_stage(&options.evidence_directory, "cancellation_cleanup_verified")?;
 
@@ -1172,7 +1205,13 @@ fn clipboard_inventory(
         .args(["--seat", seat, "--list-types"])
         .output()?;
     if !listed.status.success() {
-        return Ok(Vec::new());
+        // wl-paste exits unsuccessfully both for an empty selection and for
+        // a failure to read one; only its empty-selection message is empty.
+        let stderr = String::from_utf8_lossy(&listed.stderr);
+        if stderr.contains("Nothing is copied") {
+            return Ok(Vec::new());
+        }
+        return Err(format!("wl-paste --list-types failed: {}", stderr.trim()).into());
     }
     let mut evidence = Vec::new();
     for mime_type in String::from_utf8(listed.stdout)?.lines() {
@@ -1251,6 +1290,29 @@ fn application_outcome(response: &Value) -> String {
 
 fn accepted_application_outcome(outcome: &str) -> bool {
     matches!(outcome, "completed" | "inconclusive")
+}
+
+/// What is wrong with a case whose destination must not receive the text:
+/// a malformed response, a claimed completion, or a destination that did
+/// receive the expected text after all.
+fn negative_case_contradiction(
+    receipt_status: &str,
+    application_outcome: &str,
+    destination_digest_matched: bool,
+) -> Option<&'static str> {
+    if !matches!(
+        receipt_status,
+        "executed" | "failed" | "indeterminate" | "not_executed"
+    ) {
+        return Some("the response carried no receipt status");
+    }
+    if !matches!(application_outcome, "inconclusive" | "failed") {
+        return Some("the application outcome was completed or missing");
+    }
+    if destination_digest_matched {
+        return Some("the destination received the expected text");
+    }
+    None
 }
 
 fn require_receipt(response: &Value, expected: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1352,7 +1414,10 @@ fn path_text(path: &Path) -> Result<&str, Box<dyn std::error::Error>> {
 mod tests {
     use serde_json::json;
 
-    use super::{accepted_application_outcome, is_pre_dispatch_focus_changed, require_receipt};
+    use super::{
+        accepted_application_outcome, is_pre_dispatch_focus_changed, negative_case_contradiction,
+        require_receipt,
+    };
 
     #[test]
     fn accepted_consumer_truth_allows_conservative_completion_but_never_failure() {
@@ -1360,6 +1425,19 @@ mod tests {
         assert!(accepted_application_outcome("inconclusive"));
         assert!(!accepted_application_outcome("failed"));
         assert!(!accepted_application_outcome("missing"));
+    }
+
+    #[test]
+    fn a_negative_case_must_be_well_formed_unfinished_and_undelivered() {
+        assert_eq!(
+            negative_case_contradiction("executed", "inconclusive", false),
+            None
+        );
+        assert_eq!(negative_case_contradiction("failed", "failed", false), None);
+        assert!(negative_case_contradiction("missing", "inconclusive", false).is_some());
+        assert!(negative_case_contradiction("executed", "missing", false).is_some());
+        assert!(negative_case_contradiction("executed", "completed", false).is_some());
+        assert!(negative_case_contradiction("executed", "inconclusive", true).is_some());
     }
 
     #[test]
