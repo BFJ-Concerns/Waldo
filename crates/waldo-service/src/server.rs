@@ -375,7 +375,9 @@ async fn handle_connection(
     if *shutdown.borrow() {
         return Ok(());
     }
-    let (request_id, client_id) = loop {
+    // The handshake's client identity is validated on decoding; the
+    // controller tracks connections, not their logical names.
+    let request_id = loop {
         let first = tokio::select! {
             _ = shutdown.changed() => return Ok(()),
             message = read_client_message(&mut stream) => message?,
@@ -384,8 +386,8 @@ async fn handle_connection(
             IncomingMessage::Valid(ClientMessage::Hello {
                 request_id,
                 schema_major,
-                client_id,
-            }) if schema_major == SCHEMA_MAJOR_VERSION => break (request_id, client_id),
+                ..
+            }) if schema_major == SCHEMA_MAJOR_VERSION => break request_id,
             IncomingMessage::Valid(ClientMessage::Hello {
                 request_id,
                 schema_major,
@@ -420,7 +422,7 @@ async fn handle_connection(
         }
     };
 
-    let connection_id = state.controller.lock().await.connect(client_id);
+    let connection_id = state.controller.lock().await.connect();
     write_message(
         &mut stream,
         &ServerMessage::Connected {

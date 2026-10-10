@@ -1,7 +1,7 @@
 //! The single controller authority shared by Waldo's MCP and CLI bindings.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     sync::{
@@ -12,8 +12,8 @@ use std::{
 };
 
 use waldo_protocol::{
-    ClientId, ConnectionId, DrivingSessionId, LogicalRect, ObservationId, OutputId,
-    OutputTransform, SourceSelector, WindowId,
+    ConnectionId, DrivingSessionId, LogicalRect, ObservationId, OutputId, OutputTransform,
+    SourceSelector, WindowId,
 };
 
 const MAX_RETAINED_OBSERVATIONS: usize = 256;
@@ -185,7 +185,7 @@ pub struct Controller {
     next_connection: u64,
     next_driving_session: u64,
     next_observation: u64,
-    connections: BTreeMap<ConnectionId, ClientId>,
+    connections: BTreeSet<ConnectionId>,
     driving_session: Option<DrivingSession>,
     active_execution: Option<(ConnectionId, ExecutionToken)>,
     cleanup_in_progress: Option<ConnectionId>,
@@ -200,7 +200,7 @@ impl Controller {
             next_connection: 1,
             next_driving_session: 1,
             next_observation: 1,
-            connections: BTreeMap::new(),
+            connections: BTreeSet::new(),
             driving_session: None,
             active_execution: None,
             cleanup_in_progress: None,
@@ -208,26 +208,21 @@ impl Controller {
         }
     }
 
-    /// Attaches a logical client and returns a fresh connection identity.
-    pub fn connect(&mut self, client: ClientId) -> ConnectionId {
+    /// Attaches a client and returns a fresh connection identity.
+    pub fn connect(&mut self) -> ConnectionId {
         let connection = ConnectionId::new(self.take_connection_sequence());
-        self.connections.insert(connection, client);
+        self.connections.insert(connection);
         connection
     }
 
     /// Reports whether the connection is still attached to this controller.
     pub fn is_connected(&self, connection: ConnectionId) -> bool {
-        self.connections.contains_key(&connection)
-    }
-
-    /// Returns the logical identity supplied by a connected client.
-    pub fn client(&self, connection: ConnectionId) -> Option<&ClientId> {
-        self.connections.get(&connection)
+        self.connections.contains(&connection)
     }
 
     /// Disconnects a client and releases any driving authority bound to it.
     pub fn disconnect(&mut self, connection: ConnectionId) -> Result<(), LeaseError> {
-        if self.connections.remove(&connection).is_none() {
+        if !self.connections.remove(&connection) {
             return Err(LeaseError::UnknownConnection(connection));
         }
 
@@ -397,31 +392,6 @@ impl Controller {
         self.connections.clear();
     }
 
-    /// Releases the driving lease when its idle timeout has elapsed.
-    ///
-    /// The caller supplies time from one monotonic clock. A backwards value is
-    /// treated as no elapsed time rather than expiring authority spuriously.
-    pub fn expire_idle_lease(&mut self, now: Duration) -> bool {
-        // A batch actively touching backends is not idle. Its cancellation
-        // boundary is Stop/disconnect; the lease becomes expirable once the
-        // batch clears its in-flight marker.
-        if self.active_execution.is_some() {
-            return false;
-        }
-        let Some(session) = self.driving_session else {
-            return false;
-        };
-
-        if now.saturating_sub(session.last_activity) < self.idle_timeout {
-            return false;
-        }
-
-        self.cancel_active_execution();
-        self.driving_session = None;
-        self.cleanup_in_progress = None;
-        true
-    }
-
     /// Reports expiry without releasing the lease which excludes cleanup races.
     pub fn idle_lease_expired(&self, now: Duration) -> bool {
         if self.active_execution.is_some() || self.cleanup_in_progress.is_some() {
@@ -463,23 +433,17 @@ impl Controller {
     /// Explicitly transfers driving authority to another connected client.
     ///
     /// Handover starts a new session. The previous session identity must never
-    /// authorise later actions, even when the target has the same logical
-    /// [`ClientId`].
+    /// authorise later actions, even when the target connected with the same
+    /// logical client identity.
     pub fn handover(
         &mut self,
         owner: ConnectionId,
         target: ConnectionId,
         now: Duration,
     ) -> Result<DrivingSession, LeaseError> {
-        self.require_connection(owner)?;
-        self.require_connection(target)?;
-
-        let current = self.driving_session.ok_or(LeaseError::NoActiveLease)?;
-        if current.owner != owner {
-            return Err(LeaseError::NotOwner {
-                owner: current.owner,
-            });
-        }
+        // Validated again here because the target can disconnect while the
+        // old session's backend cleanup runs.
+        self.validate_handover(owner, target)?;
 
         self.cancel_active_execution();
         let transferred = DrivingSession {
@@ -546,7 +510,7 @@ impl Controller {
 mod tests {
     use std::time::Duration;
 
-    use waldo_protocol::{ClientId, ConnectionId};
+    use waldo_protocol::ConnectionId;
 
     use super::{Controller, LeaseError, MAX_RETAINED_OBSERVATIONS, ObservationGrounding};
 
@@ -578,16 +542,12 @@ mod tests {
         }
     }
 
-    fn client(name: &str) -> ClientId {
-        ClientId::new(name).expect("test client identifiers are non-empty")
-    }
-
     #[test]
     fn read_only_connections_coexist_without_a_driving_lease() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
 
-        let first = controller.connect(client("mcp"));
-        let second = controller.connect(client("cli"));
+        let first = controller.connect();
+        let second = controller.connect();
 
         assert!(controller.is_connected(first));
         assert!(controller.is_connected(second));
@@ -597,8 +557,8 @@ mod tests {
     #[test]
     fn first_mutating_connection_acquires_the_exclusive_lease() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let mcp = controller.connect(client("mcp"));
-        let cli = controller.connect(client("cli"));
+        let mcp = controller.connect();
+        let cli = controller.connect();
 
         let session = controller
             .acquire_driving_lease(mcp, Duration::ZERO)
@@ -615,7 +575,7 @@ mod tests {
     #[test]
     fn disconnect_releases_the_driving_lease() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let mcp = controller.connect(client("mcp"));
+        let mcp = controller.connect();
         controller
             .acquire_driving_lease(mcp, Duration::ZERO)
             .unwrap();
@@ -628,13 +588,13 @@ mod tests {
     #[test]
     fn reconnecting_the_same_client_does_not_restore_its_lease() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let original = controller.connect(client("mcp"));
+        let original = controller.connect();
         controller
             .acquire_driving_lease(original, Duration::ZERO)
             .unwrap();
         controller.disconnect(original).unwrap();
 
-        let replacement = controller.connect(client("mcp"));
+        let replacement = controller.connect();
 
         assert_ne!(replacement, original);
         assert_eq!(controller.driving_session(), None);
@@ -643,21 +603,25 @@ mod tests {
     #[test]
     fn idle_expiry_releases_the_lease_at_the_timeout_boundary() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let mcp = controller.connect(client("mcp"));
+        let mcp = controller.connect();
         controller
             .acquire_driving_lease(mcp, Duration::from_secs(5))
             .unwrap();
 
-        assert!(!controller.expire_idle_lease(Duration::from_secs(34)));
-        assert!(controller.expire_idle_lease(Duration::from_secs(35)));
+        assert_eq!(controller.begin_idle_cleanup(Duration::from_secs(34)), None);
+        assert_eq!(
+            controller.begin_idle_cleanup(Duration::from_secs(35)),
+            Some(mcp)
+        );
+        assert!(controller.stop(mcp).is_ok());
         assert_eq!(controller.driving_session(), None);
     }
 
     #[test]
     fn only_the_owner_can_stop_the_driving_session() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let mcp = controller.connect(client("mcp"));
-        let observer = controller.connect(client("cli"));
+        let mcp = controller.connect();
+        let observer = controller.connect();
         controller
             .acquire_driving_lease(mcp, Duration::ZERO)
             .unwrap();
@@ -674,8 +638,8 @@ mod tests {
     #[test]
     fn explicit_handover_transfers_the_lease_to_a_connected_client() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let mcp = controller.connect(client("mcp"));
-        let cli = controller.connect(client("cli"));
+        let mcp = controller.connect();
+        let cli = controller.connect();
         let original = controller
             .acquire_driving_lease(mcp, Duration::ZERO)
             .unwrap();
@@ -692,7 +656,7 @@ mod tests {
     #[test]
     fn repeated_actions_refresh_the_existing_session() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let mcp = controller.connect(client("mcp"));
+        let mcp = controller.connect();
         let original = controller
             .acquire_driving_lease(mcp, Duration::ZERO)
             .unwrap();
@@ -702,14 +666,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(refreshed.id(), original.id());
-        assert!(!controller.expire_idle_lease(Duration::from_secs(49)));
-        assert!(controller.expire_idle_lease(Duration::from_secs(50)));
+        assert_eq!(controller.begin_idle_cleanup(Duration::from_secs(49)), None);
+        assert_eq!(
+            controller.begin_idle_cleanup(Duration::from_secs(50)),
+            Some(mcp)
+        );
     }
 
     #[test]
     fn stop_cancels_the_owners_in_flight_execution() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let owner = controller.connect(client("driver"));
+        let owner = controller.connect();
         let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
         let token = authority.cancellation().clone();
 
@@ -722,8 +689,8 @@ mod tests {
     #[test]
     fn session_cleanup_retains_exclusion_until_backend_restoration_finishes() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let owner = controller.connect(client("owner"));
-        let competitor = controller.connect(client("competitor"));
+        let owner = controller.connect();
+        let competitor = controller.connect();
         let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
 
         controller.begin_session_cleanup(owner).unwrap();
@@ -753,8 +720,8 @@ mod tests {
     #[test]
     fn idle_expiry_can_be_detected_without_releasing_cleanup_exclusion() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let owner = controller.connect(client("owner"));
-        let competitor = controller.connect(client("competitor"));
+        let owner = controller.connect();
+        let competitor = controller.connect();
         controller
             .acquire_driving_lease(owner, Duration::ZERO)
             .unwrap();
@@ -779,8 +746,8 @@ mod tests {
     #[test]
     fn handover_cannot_authorise_the_target_until_old_session_cleanup_finishes() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let owner = controller.connect(client("owner"));
-        let target = controller.connect(client("target"));
+        let owner = controller.connect();
+        let target = controller.connect();
         controller
             .acquire_driving_lease(owner, Duration::ZERO)
             .unwrap();
@@ -809,8 +776,8 @@ mod tests {
     #[test]
     fn cancelled_execution_must_quiesce_before_another_batch_begins() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let owner = controller.connect(client("driver"));
-        let next = controller.connect(client("next"));
+        let owner = controller.connect();
+        let next = controller.connect();
         controller.begin_execution(owner, Duration::ZERO).unwrap();
         controller.stop(owner).unwrap();
 
@@ -830,7 +797,7 @@ mod tests {
     #[test]
     fn termination_cancels_execution_and_forgets_all_connections() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let owner = controller.connect(client("driver"));
+        let owner = controller.connect();
         let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
         let token = authority.cancellation().clone();
 
@@ -844,7 +811,7 @@ mod tests {
     #[test]
     fn a_second_batch_cannot_interleave_with_the_first() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let owner = controller.connect(client("driver"));
+        let owner = controller.connect();
         controller.begin_execution(owner, Duration::ZERO).unwrap();
 
         assert!(matches!(
@@ -856,7 +823,7 @@ mod tests {
     #[test]
     fn failed_validation_rolls_back_only_a_newly_acquired_lease() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let owner = controller.connect(client("driver"));
+        let owner = controller.connect();
         let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
         assert!(authority.acquired_lease());
 
@@ -896,8 +863,8 @@ mod tests {
     #[test]
     fn handover_requires_an_owner_an_active_lease_and_a_connected_target() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let mcp = controller.connect(client("mcp"));
-        let cli = controller.connect(client("cli"));
+        let mcp = controller.connect();
+        let cli = controller.connect();
         let missing = ConnectionId::new(99);
 
         assert_eq!(
@@ -920,7 +887,7 @@ mod tests {
     #[test]
     fn observation_identifiers_are_unique_within_the_controller_session() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let owner = controller.connect(client("observer"));
+        let owner = controller.connect();
 
         let first = controller.record_observation(owner, grounding("DP-1"));
         let second = controller.record_observation(owner, grounding("DP-2"));
@@ -941,8 +908,8 @@ mod tests {
     #[test]
     fn another_connection_cannot_authorise_actions_from_a_guessed_observation_id() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let observer = controller.connect(client("observer"));
-        let other = controller.connect(client("other"));
+        let observer = controller.connect();
+        let other = controller.connect();
         let id = controller.record_observation(observer, grounding("DP-1"));
 
         assert_eq!(controller.observation(other, id), None);
@@ -955,7 +922,7 @@ mod tests {
     #[test]
     fn observation_ledger_evicts_oldest_grounding_at_its_fixed_bound() {
         let mut controller = Controller::new(IDLE_TIMEOUT);
-        let owner = controller.connect(client("observer"));
+        let owner = controller.connect();
         let oldest = controller.record_observation(owner, grounding("oldest"));
         for sequence in 1..=MAX_RETAINED_OBSERVATIONS {
             controller.record_observation(owner, grounding(&format!("output-{sequence}")));

@@ -339,8 +339,7 @@ mod tests {
     use niri_ipc::{Action as NiriAction, Request, Response, SizeChange, WorkspaceReferenceArg};
     use waldo_action::ActionExecutionFailure;
     use waldo_protocol::{
-        Action, ActionRoute, ClientId, ErrorCode, WindowId, WindowOperation, WorkspaceId,
-        WorkspaceOperation,
+        Action, ActionRoute, ErrorCode, WindowId, WindowOperation, WorkspaceId, WorkspaceOperation,
     };
 
     use super::{execute_with, translate};
@@ -575,7 +574,7 @@ mod tests {
 
     fn test_token() -> ExecutionToken {
         let mut controller = Controller::new(std::time::Duration::from_secs(30));
-        let connection = controller.connect(ClientId::new("niri-action-test").unwrap());
+        let connection = controller.connect();
         controller
             .begin_execution(connection, std::time::Duration::ZERO)
             .unwrap()

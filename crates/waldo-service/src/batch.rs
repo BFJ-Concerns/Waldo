@@ -352,7 +352,7 @@ mod tests {
     use waldo_action::execute_batch;
     use waldo_niri::{InspectionError, NiriSnapshot};
     use waldo_protocol::{
-        ClientId, InputState, LogicalDelta, LogicalPoint, LogicalRect, OutputId, OutputState,
+        InputState, LogicalDelta, LogicalPoint, LogicalRect, OutputId, OutputState,
         OutputTransform, PointerButton, ReceiptStatus, WindowId, WindowState,
     };
     use waldo_screencopy::UnavailableCapturer;
@@ -583,7 +583,7 @@ mod tests {
 
     fn test_token() -> ExecutionToken {
         let mut controller = waldo_controller::Controller::new(Duration::from_secs(30));
-        let connection = controller.connect(ClientId::new("test").unwrap());
+        let connection = controller.connect();
         controller
             .begin_execution(connection, Duration::ZERO)
             .unwrap()

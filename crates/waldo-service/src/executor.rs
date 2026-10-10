@@ -524,7 +524,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = waldo_controller::Controller::new(std::time::Duration::from_secs(30));
-        let connection = controller.connect(waldo_protocol::ClientId::new("paste-test").unwrap());
+        let connection = controller.connect();
         let authority = controller
             .begin_execution(connection, std::time::Duration::ZERO)
             .unwrap();
@@ -579,7 +579,7 @@ mod tests {
         use waldo_action::ActionExecutor;
         let settings = waldo_settings::Settings::from_sources(None, [], None).unwrap();
         let mut controller = waldo_controller::Controller::new(std::time::Duration::from_secs(30));
-        let connection = controller.connect(waldo_protocol::ClientId::new("paste-test").unwrap());
+        let connection = controller.connect();
         let authority = controller
             .begin_execution(connection, std::time::Duration::ZERO)
             .unwrap();

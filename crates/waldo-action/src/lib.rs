@@ -852,7 +852,7 @@ mod tests {
 
     fn test_token() -> ExecutionToken {
         let mut controller = waldo_controller::Controller::new(std::time::Duration::from_secs(30));
-        let connection = controller.connect(waldo_protocol::ClientId::new("test").unwrap());
+        let connection = controller.connect();
         controller
             .begin_execution(connection, std::time::Duration::ZERO)
             .unwrap()

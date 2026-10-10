@@ -701,8 +701,8 @@ mod tests {
     use waldo_action::{ActionExecutionFailure, ActionExecutor};
     use waldo_controller::Controller;
     use waldo_protocol::{
-        Action, ClientId, ClipboardPreservationId, ClipboardRepresentation, ConnectionId,
-        DrivingSessionId, ErrorCode,
+        Action, ClipboardPreservationId, ClipboardRepresentation, ConnectionId, DrivingSessionId,
+        ErrorCode,
     };
 
     use super::{
@@ -945,7 +945,7 @@ mod tests {
     fn a_live_guard_refuses_a_second_guard_before_wayland_access() {
         let executor = guarded_executor(ConnectionId::new(1), DrivingSessionId::new(1));
         let mut controller = Controller::new(Duration::from_secs(30));
-        let owner = controller.connect(ClientId::new("owner").unwrap());
+        let owner = controller.connect();
         let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
 
         let result = executor.execute(&Action::ClipboardPreserve, authority.cancellation());
@@ -961,7 +961,7 @@ mod tests {
     fn restoration_is_scoped_to_the_guard_owner_and_driving_session() {
         let executor = guarded_executor(ConnectionId::new(9), DrivingSessionId::new(9));
         let mut controller = Controller::new(Duration::from_secs(30));
-        let owner = controller.connect(ClientId::new("other").unwrap());
+        let owner = controller.connect();
         let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
 
         let result = executor.execute(
@@ -982,7 +982,7 @@ mod tests {
     fn keeping_is_scoped_to_the_guard_owner_and_driving_session() {
         let executor = guarded_executor(ConnectionId::new(9), DrivingSessionId::new(9));
         let mut controller = Controller::new(Duration::from_secs(30));
-        let owner = controller.connect(ClientId::new("other").unwrap());
+        let owner = controller.connect();
         let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
 
         let result = executor.execute(
@@ -1004,7 +1004,7 @@ mod tests {
     fn keep_consumes_the_guard_without_restoring_and_consumed_actions_fail_closed() {
         let executor = guarded_executor(ConnectionId::new(1), DrivingSessionId::new(1));
         let mut controller = Controller::new(Duration::from_secs(30));
-        let owner = controller.connect(ClientId::new("owner").unwrap());
+        let owner = controller.connect();
         let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
         let keep = Action::ClipboardKeep {
             preservation_id: ClipboardPreservationId::new(1),
@@ -1035,7 +1035,7 @@ mod tests {
     fn restore_consumes_the_guard_and_consumed_actions_fail_closed() {
         let executor = guarded_executor(ConnectionId::new(1), DrivingSessionId::new(1));
         let mut controller = Controller::new(Duration::from_secs(30));
-        let owner = controller.connect(ClientId::new("owner").unwrap());
+        let owner = controller.connect();
         let authority = controller.begin_execution(owner, Duration::ZERO).unwrap();
 
         executor
