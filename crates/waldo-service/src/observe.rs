@@ -33,11 +33,9 @@ pub(crate) async fn observe(
         if previous.source != source {
             return ServerMessage::Error {
                 request_id: Some(request_id),
-                error: ProtocolError {
-                    code: ErrorCode::InvalidRequest,
-                    message: "continue_from must reference the same observation source".into(),
-                    retryable: false,
-                },
+                error: ProtocolError::invalid_request(
+                    "continue_from must reference the same observation source",
+                ),
             };
         }
         Some((previous_id, previous))
@@ -343,13 +341,11 @@ fn resolve_capture_source(
                     target_error(format!("Niri window is unavailable: {}", window_id.0))
                 })?;
             if !window.capture.available {
-                return Err(ProtocolError {
-                    code: ErrorCode::UnsupportedCapability,
-                    message: window.capture.limitation.clone().unwrap_or_else(|| {
+                return Err(ProtocolError::unsupported_capability(
+                    window.capture.limitation.clone().unwrap_or_else(|| {
                         format!("Niri window {} cannot be captured directly", window_id.0)
                     }),
-                    retryable: false,
-                });
+                ));
             }
             if !window.focused {
                 return Err(ProtocolError {
@@ -380,13 +376,11 @@ fn resolve_capture_source(
                     window_id.0
                 )));
             }
-            let bounds = window.logical_bounds.ok_or_else(|| ProtocolError {
-                code: ErrorCode::UnsupportedCapability,
-                message: format!(
+            let bounds = window.logical_bounds.ok_or_else(|| {
+                ProtocolError::unsupported_capability(format!(
                     "Niri does not expose screen bounds for window {}; observe its output instead",
                     window_id.0
-                ),
-                retryable: false,
+                ))
             })?;
             Ok(ResolvedCaptureSource {
                 output_id,

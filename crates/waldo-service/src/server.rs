@@ -19,8 +19,7 @@ use waldo_action::{ActionExecutor, UnavailableActionExecutor};
 use waldo_controller::Controller;
 use waldo_niri::{NiriInspector, SessionInspector};
 use waldo_protocol::{
-    Capabilities, ClientMessage, ErrorCode, ProtocolError, RequestId, SCHEMA_MAJOR_VERSION,
-    ServerMessage,
+    Capabilities, ClientMessage, ProtocolError, RequestId, SCHEMA_MAJOR_VERSION, ServerMessage,
 };
 use waldo_screencopy::{ScreenCapturer, Screencopy, UnavailableCapturer};
 use waldo_socket::{TransportError, read_frame, write_message};
@@ -166,10 +165,11 @@ impl ControllerService {
                     index: layout.index,
                     name: layout.name,
                 })
-                .map_err(|error| ProtocolError {
-                    code: ErrorCode::BackendFailure,
-                    message: format!("read the active keyboard layout from Niri: {error}"),
-                    retryable: true,
+                .map_err(|error| {
+                    ProtocolError::backend_failure(
+                        format!("read the active keyboard layout from Niri: {error}"),
+                        true,
+                    )
                 })
         });
         let executor: Arc<dyn ActionExecutor> = Arc::new(DesktopActionExecutor::initialise(

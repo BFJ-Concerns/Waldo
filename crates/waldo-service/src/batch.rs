@@ -68,7 +68,11 @@ impl BatchActionExecutor {
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
             if cancellation.is_cancelled() {
-                return Err(ActionExecutionFailure::not_executed(cancelled()));
+                return Err(ActionExecutionFailure::not_executed(
+                    ProtocolError::cancelled(
+                        "the action batch was cancelled before this controller-owned wait or capture completed",
+                    ),
+                ));
             }
             if self
                 .predicate(predicate)
@@ -130,18 +134,19 @@ impl BatchActionExecutor {
     }
 
     fn accessibility(&self) -> Result<&AccessibilityBackend, ProtocolError> {
-        self.accessibility.as_deref().ok_or_else(|| ProtocolError {
-            code: ErrorCode::UnsupportedCapability,
-            message: "AT-SPI backend is unavailable for accessibility predicates".into(),
-            retryable: false,
+        self.accessibility.as_deref().ok_or_else(|| {
+            ProtocolError::unsupported_capability(
+                "AT-SPI backend is unavailable for accessibility predicates",
+            )
         })
     }
 
     fn snapshot_windows(&self) -> Result<waldo_niri::NiriSnapshot, ProtocolError> {
-        self.inspector.inspect(true).map_err(|error| ProtocolError {
-            code: ErrorCode::BackendFailure,
-            message: format!("could not inspect Niri while evaluating a wait: {error}"),
-            retryable: true,
+        self.inspector.inspect(true).map_err(|error| {
+            ProtocolError::backend_failure(
+                format!("could not inspect Niri while evaluating a wait: {error}"),
+                true,
+            )
         })
     }
 
@@ -160,9 +165,8 @@ impl BatchActionExecutor {
         if action_requires_stable_grounding(action) {
             let invalidated = *self.invalidated_grounding.lock().map_err(|_| {
                 ActionExecutionFailure::not_executed(ProtocolError {
-                    code: ErrorCode::Internal,
-                    message: "batch grounding state is unavailable".into(),
                     retryable: true,
+                    ..ProtocolError::internal("batch grounding state is unavailable")
                 })
             })?;
             if let Some(failure) = invalidated {
@@ -174,18 +178,16 @@ impl BatchActionExecutor {
         let include_windows = matches!(action, Action::Window { .. } | Action::Workspace { .. })
             || matches!(&self.grounding.source, SourceSelector::Window { .. });
         let snapshot = self.inspector.inspect(include_windows).map_err(|error| {
-            ActionExecutionFailure::not_executed(ProtocolError {
-                code: ErrorCode::BackendFailure,
-                message: format!("could not revalidate desktop state before action: {error}"),
-                retryable: true,
-            })
+            ActionExecutionFailure::not_executed(ProtocolError::backend_failure(
+                format!("could not revalidate desktop state before action: {error}"),
+                true,
+            ))
         })?;
         let mut current_grounding = self.grounding.clone();
         current_grounding.cursor_position = *self.cursor_position.lock().map_err(|_| {
             ActionExecutionFailure::not_executed(ProtocolError {
-                code: ErrorCode::Internal,
-                message: "batch cursor grounding state is unavailable".into(),
                 retryable: true,
+                ..ProtocolError::internal("batch cursor grounding state is unavailable")
             })
         })?;
         validate_grounding(
@@ -214,10 +216,10 @@ impl BatchActionExecutor {
             ActionExecutionFailure::indeterminate(
                 ActionRoute::VirtualPointer,
                 ProtocolError {
-                    code: ErrorCode::Internal,
-                    message: "batch cursor grounding state is unavailable after pointer dispatch"
-                        .into(),
                     retryable: true,
+                    ..ProtocolError::internal(
+                        "batch cursor grounding state is unavailable after pointer dispatch",
+                    )
                 },
             )
         })?;
@@ -233,9 +235,10 @@ impl BatchActionExecutor {
             ActionExecutionFailure::indeterminate(
                 ActionRoute::NiriIpc,
                 ProtocolError {
-                    code: ErrorCode::Internal,
-                    message: "batch grounding state is unavailable after desktop mutation".into(),
                     retryable: true,
+                    ..ProtocolError::internal(
+                        "batch grounding state is unavailable after desktop mutation",
+                    )
                 },
             )
         })? = Some(failure);
@@ -256,7 +259,11 @@ impl ActionExecutor for BatchActionExecutor {
             } => self.wait(predicate, *timeout_ms, cancellation),
             Action::Capture { source } => {
                 if cancellation.is_cancelled() {
-                    Err(ActionExecutionFailure::not_executed(cancelled()))
+                    Err(ActionExecutionFailure::not_executed(
+                        ProtocolError::cancelled(
+                            "the action batch was cancelled before this controller-owned wait or capture completed",
+                        ),
+                    ))
                 } else {
                     self.capture(source)
                 }
@@ -315,16 +322,6 @@ fn action_grounding_invalidation(action: &Action) -> Option<GroundingFailure> {
             ..
         } => Some(GroundingFailure::GeometryChanged),
         _ => None,
-    }
-}
-
-fn cancelled() -> ProtocolError {
-    ProtocolError {
-        code: ErrorCode::Cancelled,
-        message:
-            "the action batch was cancelled before this controller-owned wait or capture completed"
-                .into(),
-        retryable: false,
     }
 }
 
