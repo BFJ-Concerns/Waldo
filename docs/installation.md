@@ -57,10 +57,15 @@ configuration alone, loads the candidate plugin for the proof turn only (with
 `claude --plugin-dir`), and removes its temporary controller on exit. The
 private socket is used only when `WALDO_SOCKET_PATH` is not already set: a
 value inherited from your environment is used as given, so unset it first if
-it names your live controller's socket. Keep runtime and socket-parent paths separate from binary and plugin
-installation destinations. Existing runtime and socket-parent directories must belong to your user and have mode 0700; unsuitable ones are
-refused before the service file is written. Their permissions are never
-changed, and cleanup removes only directories the rehearsal created.
+it names your live controller's socket.
+
+Existing runtime and socket-parent directories that are separate from the
+binary and plugin installation destinations keep their permissions. They
+must belong to your user and have mode 0700; unsuitable ones are refused
+before the service file is written. A directory shared with a binary
+installation destination is made private by the binary installation stage,
+so keep these paths separate. Cleanup removes only directories the
+rehearsal created.
 
 ## Codex
 
