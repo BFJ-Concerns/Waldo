@@ -133,12 +133,13 @@ impl<C: PasteClipboard, K: PasteKeyboard> DesktopActionExecutor<C, K> {
     ) -> Result<ActionExecution, ActionExecutionFailure> {
         self.with_keyboard(|keyboard| keyboard.execute(action, cancellation))
             .map_err(|unavailable| {
-                ActionExecutionFailure::not_executed(ProtocolError::unsupported_capability(
-                    format!(
+                ActionExecutionFailure::not_executed(ProtocolError {
+                    retryable: unavailable.error.retryable,
+                    ..ProtocolError::unsupported_capability(format!(
                         "Wayland virtual-keyboard backend is unavailable: {}",
                         unavailable.limitation
-                    ),
-                ))
+                    ))
+                })
             })?
     }
 
@@ -311,9 +312,10 @@ impl<C: PasteClipboard, K: PasteKeyboard> ActionExecutor for DesktopActionExecut
                 .accessibility
                 .as_ref()
                 .ok_or_else(|| {
-                    ActionExecutionFailure::not_executed(ProtocolError::unsupported_capability(
-                        "AT-SPI backend is unavailable",
-                    ))
+                    ActionExecutionFailure::not_executed(ProtocolError {
+                        retryable: true,
+                        ..ProtocolError::unsupported_capability("AT-SPI backend is unavailable")
+                    })
                 })?
                 .execute(action, cancellation),
             _ => self.niri.execute(action, cancellation),

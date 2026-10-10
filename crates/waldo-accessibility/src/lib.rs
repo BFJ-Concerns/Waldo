@@ -315,9 +315,12 @@ impl AccessibilityBackend {
             .focused
             .clone()
             .ok_or_else(|| {
-                ActionExecutionFailure::not_executed(ProtocolError::unsupported_capability(
-                    "the latest accessibility snapshot has no focused element",
-                ))
+                ActionExecutionFailure::not_executed(ProtocolError {
+                    retryable: true,
+                    ..ProtocolError::unsupported_capability(
+                        "the latest accessibility snapshot has no focused element",
+                    )
+                })
             })?;
         self.require_still_focused(&element)
             .map_err(ActionExecutionFailure::not_executed)?;
