@@ -659,13 +659,9 @@ pub fn run(options: Options) -> Result<OutsideInSummary, Box<dyn std::error::Err
     )?;
 
     let delayed = run_delayed(&options, &mut harness.mcp)?;
-    let _ = harness
-        .mcp
-        .call("tools/call", json!({"name": "stop", "arguments": {}}));
+    require_stop(&mut harness.mcp)?;
     let continuous = run_continuous(&options, &mut harness.mcp)?;
-    let _ = harness
-        .mcp
-        .call("tools/call", json!({"name": "stop", "arguments": {}}));
+    require_stop(&mut harness.mcp)?;
     let (transparent_interception, contradictory_state) = if continuous.outcome == "passed" {
         {
             let interception = run_transparent_interception(&options, &mut harness.mcp)?;
@@ -893,9 +889,7 @@ pub fn run_accessibility(
             .as_str()
             .is_some_and(|text| text.starts_with("ambiguous_target:"));
 
-    let _ = harness
-        .mcp
-        .call("tools/call", json!({"name": "stop", "arguments": {}}));
+    require_stop(&mut harness.mcp)?;
     fixture.terminate_checked()?;
     let (identity, controller_socket_removed) = harness.shutdown()?;
     redact_sensitive_evidence(
@@ -1246,7 +1240,9 @@ fn run_continuous(
             frames_after_probe: after_probe.frame_count,
             independent_oracle_still_changing: still_changing,
             later_image_digest_changed: None,
-            stop_completed_within_limit: stop.is_some(),
+            stop_completed_within_limit: stop
+                .as_ref()
+                .is_some_and(|stop| tool_succeeded(stop, "stopped")),
         });
     };
     let acted = parse_observation(&acted_response, &directory, "act")?;
@@ -1286,7 +1282,9 @@ fn run_continuous(
         frames_after_probe: after_probe.frame_count,
         independent_oracle_still_changing: still_changing,
         later_image_digest_changed: None,
-        stop_completed_within_limit: stop.is_some(),
+        stop_completed_within_limit: stop
+            .as_ref()
+            .is_some_and(|stop| tool_succeeded(stop, "stopped")),
     })
 }
 
@@ -1531,7 +1529,7 @@ fn stop_and_record(
     if let Some(response) = &stop {
         write_json(directory.join("stop-response.json"), response)?;
     }
-    Ok(stop.is_some())
+    Ok(stop.is_some_and(|stop| tool_succeeded(&stop, "stopped")))
 }
 
 fn service_health_check(
@@ -1548,7 +1546,27 @@ fn service_health_check(
     }
     Ok(response
         .as_ref()
-        .is_some_and(|response| response["result"]["isError"].as_bool() != Some(true)))
+        .is_some_and(|response| tool_succeeded(response, "queried")))
+}
+
+/// Whether an MCP tool call succeeded with the expected controller
+/// response: neither a JSON-RPC error nor a tool error.
+fn tool_succeeded(response: &Value, expected_type: &str) -> bool {
+    response.get("error").is_none()
+        && response["result"]["isError"].as_bool() != Some(true)
+        && response["result"]["structuredContent"]["type"] == expected_type
+}
+
+/// Stops the driving session between circuits, failing the run when Stop
+/// does not succeed, since a later circuit would start on an uncancelled
+/// batch.
+fn require_stop(mcp: &mut McpClient) -> Result<(), Box<dyn std::error::Error>> {
+    let response = mcp.call("tools/call", json!({"name": "stop", "arguments": {}}))?;
+    if tool_succeeded(&response, "stopped") {
+        Ok(())
+    } else {
+        Err(format!("Stop between circuits failed: {response}").into())
+    }
 }
 
 fn start_fixture(
@@ -2387,6 +2405,20 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn only_the_expected_successful_response_counts_as_success() {
+        use serde_json::json;
+
+        let stopped = json!({"result": {"structuredContent": {"type": "stopped"}}});
+        let tool_error =
+            json!({"result": {"isError": true, "structuredContent": {"type": "error"}}});
+        let rpc_error = json!({"error": {"code": -32603, "message": "internal"}});
+
+        assert!(super::tool_succeeded(&stopped, "stopped"));
+        assert!(!super::tool_succeeded(&stopped, "queried"));
+        assert!(!super::tool_succeeded(&tool_error, "stopped"));
+        assert!(!super::tool_succeeded(&rpc_error, "queried"));
+    }
     #[test]
     fn selected_seeded_target_stays_well_inside_its_expected_cell() {
         let grid = TargetGrid::generate(
