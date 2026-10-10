@@ -45,8 +45,9 @@ holds an exclusive driving lease until it stops, disconnects or goes idle.
   changed, the action is refused rather than landing somewhere else.
 - **Results are evidence, not assumptions.** A receipt says whether an
   action was dispatched, which is not the same as the application acting on
-  it. After visual actions, Waldo samples frames until the output settles
-  and returns that observation, so the agent checks what actually happened.
+  it. After visual actions, Waldo returns a fresh observation from bounded
+  sampling; `completion_evidence` says whether the application settled, so
+  the agent checks what actually happened.
 - **One protocol, two clients.** The CLI and the MCP server speak one
   versioned wire schema, which `waldo schema` prints. The tests decode
   every JSON example in the shipped skill against it, so the agent's

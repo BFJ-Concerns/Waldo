@@ -25,27 +25,7 @@ pub fn decode_error_detail(error: &serde_json::Error) -> String {
         }
     }
 
-    let mut detail = String::with_capacity(reason.len());
-    let mut quoted = false;
-    let mut escaped = false;
-    for character in reason.chars() {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                quoted = false;
-                detail.push('"');
-            }
-        } else if character == '"' {
-            quoted = true;
-            detail.push_str("\"<redacted>");
-        } else {
-            detail.push(character);
-        }
-    }
-    detail
+    reason
 }
 
 #[cfg(test)]
@@ -99,5 +79,45 @@ mod tests {
                 .unwrap_err();
         let detail = decode_error_detail(&error);
         assert!(detail.contains("missing field `actions`"), "{detail}");
+    }
+
+    #[test]
+    fn decode_details_elide_variant_text_after_embedded_backticks() {
+        let error = serde_json::from_str::<crate::ActRequest>(
+            r#"{"observation_id":1,"actions":[{"type":"pre`secret"}],"verification":[]}"#,
+        )
+        .unwrap_err();
+        let detail = decode_error_detail(&error);
+        assert!(!detail.contains("secret"), "{detail}");
+    }
+
+    #[test]
+    fn decode_details_elide_field_text_after_embedded_backticks() {
+        let error = serde_json::from_str::<crate::ActRequest>(
+            r#"{"observation_id":1,"actions":[],"verification":[],"pre`secret":true}"#,
+        )
+        .unwrap_err();
+        let detail = decode_error_detail(&error);
+        assert!(!detail.contains("secret"), "{detail}");
+    }
+
+    #[test]
+    fn decode_details_elide_unquoted_invalid_type_values() {
+        let error = serde_json::from_str::<crate::ActRequest>(
+            r#"{"observation_id":1,"actions":[{"type":8675309}],"verification":[]}"#,
+        )
+        .unwrap_err();
+        let detail = decode_error_detail(&error);
+        assert!(!detail.contains("8675309"), "{detail}");
+    }
+
+    #[test]
+    fn decode_details_elide_unquoted_invalid_values() {
+        let error = serde_json::from_str::<crate::ActRequest>(
+            r#"{"observation_id":-8675309,"actions":[],"verification":[]}"#,
+        )
+        .unwrap_err();
+        let detail = decode_error_detail(&error);
+        assert!(!detail.contains("8675309"), "{detail}");
     }
 }
