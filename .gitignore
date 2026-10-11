@@ -8,14 +8,12 @@
 # Environment files
 .env
 .env.*
-!.env.example
 
 # Editors and operating systems
 *~
 *.swp
 .DS_Store
 Thumbs.db
-
 
 # Python bytecode
 __pycache__/
