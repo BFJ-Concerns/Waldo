@@ -101,7 +101,11 @@ class InstallerTests(unittest.TestCase):
         return result.stdout
 
     def rehearsal_entry(self, failure="", runtime=None, socket_parent=None, service_file=None, profile_file=None):
-        """Run the real entry point; external builds and agent turns are isolated."""
+        """Run the real entry point; external builds and agent turns are isolated.
+
+        No rehearsal step reaches the desktop session, so the entry point's
+        session check is given stand-in paths and the cases run without one.
+        """
         root = self.root / "entry"
         if root.exists():
             shutil.rmtree(root)
@@ -160,11 +164,14 @@ class InstallerTests(unittest.TestCase):
         result = subprocess.run([BASH, str(REPO / "install-local")], text=True,
                                 capture_output=True, timeout=30, env=self.env | {
                                     "PATH": str(commands), "ENTRY": str(root), "FAIL_PROBE": failure,
+                                    "WAYLAND_DISPLAY": str(root / "stand-in-wayland"),
+                                    "NIRI_SOCKET": str(root / "stand-in-niri.sock"),
                                     "WALDO_INSTALL_ROOT": str(install_root),
                                     "WALDO_PROFILE_FILE": str(profile_file),
                                     "WALDO_RUNTIME_DIR": str(runtime),
                                     "WALDO_SERVICE_FILE": str(service_file or install_root / "home/.config/systemd/user/waldod.service"),
                                     "WALDO_SOCKET_PATH": str(socket_parent / "controller.sock")})
+        self.assertTrue(profile_file.is_file(), f"the installer recorded no profile:\n{result.stderr}")
         profile = json.loads(profile_file.read_text())
         return result, profile, install_root
 
