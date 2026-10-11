@@ -50,8 +50,9 @@ holds an exclusive driving lease until it stops, disconnects or goes idle.
   the agent checks what actually happened.
 - **One protocol, two clients.** The CLI and the MCP server speak one
   versioned wire schema, which `waldo schema` prints. The tests decode
-  every JSON example in the shipped skill against it, so the agent's
-  instructions cannot drift from the code.
+  every JSON example in the shipped skill against it and require an
+  example of every action, so the skill's examples cannot drift from the
+  code.
 - **Tested from the outside in.** Beyond unit and live-session tests,
   `waldo-verification` drives the real binaries against disposable GTK, Qt
   and Electron applications and checks what each application received.
