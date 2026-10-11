@@ -94,7 +94,7 @@ impl ActionExecutionFailure {
     }
 }
 
-/// Explicit fail-closed executor used until a live action route passes its gate.
+/// Executor that refuses every action, for controllers bound without desktop input backends.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnavailableActionExecutor;
 
