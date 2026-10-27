@@ -145,9 +145,13 @@ the `/hooks` step in the plugin's install notes, or users will see the hook do n
 ## Skill-scoped hooks on Claude Code
 
 A Claude Code skill may carry a `hooks:` frontmatter key with the same event map. The hooks
-register when the skill is invoked and stay for the rest of the session, which makes them the
-lever for behaviour a skill must enforce deterministically: a `PreToolUse` guard on a
-forbidden command, a `PostToolUse` check on output, a `SessionStart` setup step.
+register when the skill is invoked and stay for the rest of the process's life — every later
+turn in the same running session, unrelated or not — which makes them the lever for behaviour
+a skill must enforce deterministically: a `PreToolUse` guard on a forbidden command, a
+`PostToolUse` check on output, a `SessionStart` setup step. They live in the process, not in
+the session's record: a new process that resumes the session (`claude --resume <id>`) starts
+without them, so a session resumed that way invokes the skill again before relying on its
+guard.
 
 ```yaml
 hooks:
